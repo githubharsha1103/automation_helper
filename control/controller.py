@@ -1101,7 +1101,14 @@ _controller_started = False
 
 
 def run_controller():
+    import os
     global _controller_started
+    
+    mode = os.getenv("SERVICE_MODE", "all")
+    if mode not in ("bot", "all"):
+        logger.warning(f"SERVICE_MODE={mode}, skipping control bot...")
+        print(f"⚠️ SERVICE_MODE={mode}, skipping control bot")
+        return
     
     if _controller_started:
         logger.warning("Control bot already started, skipping...")
