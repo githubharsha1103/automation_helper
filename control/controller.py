@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("CONTROL_BOT_TOKEN", "")
 allowed_id = os.getenv("ALLOWED_USER_ID")
 
+print("DEBUG CONTROL_BOT_TOKEN:", TOKEN)
+print("DEBUG ALLOWED_USER_ID:", allowed_id)
+
 if not TOKEN:
     logger.error("CONTROL_BOT_TOKEN not set in environment variables")
     raise ValueError("CONTROL_BOT_TOKEN is required")
@@ -31,8 +34,13 @@ if not allowed_id:
     logger.error("ALLOWED_USER_ID missing from environment variables")
     raise ValueError("ALLOWED_USER_ID missing")
 
+if not allowed_id.isdigit():
+    logger.error(f"ALLOWED_USER_ID must be numeric, got: {allowed_id}")
+    raise ValueError(f"ALLOWED_USER_ID must be numeric, got: {allowed_id}")
+
 ALLOWED_USER_ID = int(allowed_id)
 
+print("🤖 Control bot configured for user ID:", ALLOWED_USER_ID)
 logger.info(f"Control bot configured for user ID: {ALLOWED_USER_ID}")
 
 SET_LIMIT = range(1)

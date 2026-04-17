@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+print("🔥 MAIN STARTED")
+
 import os
 import sys
 import asyncio
@@ -11,15 +13,35 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+print("ENV API_ID:", os.getenv("API_ID"))
+print("ENV API_HASH:", os.getenv("API_HASH"))
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-from web.server import run_in_background as run_flask
-from control.controller import run_in_background as run_controller
-from automation.worker import run_in_background as run_automation, send_group_messages
+try:
+    from web.server import run_in_background as run_flask
+    print("✅ web.server imported")
+except Exception as e:
+    print("❌ web.server import failed:", e)
+    raise
+
+try:
+    from control.controller import run_in_background as run_controller
+    print("✅ controller imported")
+except Exception as e:
+    print("❌ controller import failed:", e)
+    raise
+
+try:
+    from automation.worker import run_in_background as run_automation, send_group_messages
+    print("✅ worker imported")
+except Exception as e:
+    print("❌ worker import failed:", e)
+    raise
 
 
 def run_group_worker():
@@ -38,9 +60,17 @@ def main():
     logger.info(f"Waiting {startup_delay}s before starting automation...")
     threading.Event().wait(startup_delay)
 
+    print("▶️ Starting Flask server...")
     run_flask()
+    print("✅ Flask server started")
+
+    print("🤖 Starting control bot...")
     run_controller()
+    print("✅ Control bot started")
+
+    print("⚙️ Starting automation worker...")
     run_automation()
+    print("✅ Automation worker started")
     
     group_thread = threading.Thread(target=run_group_worker, daemon=True)
     group_thread.start()

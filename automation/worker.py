@@ -63,6 +63,8 @@ if not api_hash:
 
 logger.info("Environment variables validated successfully")
 
+print("🚀 Initializing Telethon client...")
+
 client = None
 
 
@@ -74,6 +76,7 @@ def get_client():
 
 
 client = get_client()
+print("✅ Telethon client initialized")
 
 
 @client.on(events.NewMessage)
