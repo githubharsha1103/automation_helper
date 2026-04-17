@@ -95,8 +95,17 @@ async def manage_bots_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     keyboard = []
-    from db.mongo import get_bots
-    all_bots = get_bots()
+    
+    try:
+        from db.mongo import get_bots
+        mongo_bots = get_bots()
+        logger.info(f"MongoDB bots: {list(mongo_bots.keys())}")
+    except Exception as e:
+        logger.error(f"Error getting MongoDB bots: {e}")
+        mongo_bots = {}
+    
+    state_bots = state_manager.get_all_bots()
+    all_bots = {**mongo_bots, **state_bots}
     
     if not all_bots:
         keyboard.append([InlineKeyboardButton("⚠️ No bots added yet", callback_data="ignore")])
@@ -721,19 +730,39 @@ async def add_restart_delay_handler(update: Update, context: ContextTypes.DEFAUL
         "restart_delay": restart_delay
     }
     
+    logger.info(f"Adding bot: {bot_name}")
+    logger.info(f"Config: {config}")
+    
+    try:
+        from db.mongo import add_bot as mongo_add_bot
+        mongo_add_bot(bot_name, config)
+        logger.info(f"MongoDB: Saved bot {bot_name}")
+    except Exception as e:
+        logger.error(f"MongoDB save error: {e}")
+    
     if state_manager.add_bot(bot_name, config):
         state_manager.enable_bot(bot_name)
-        await update.message.reply_text(f"✅ Bot '{bot_name}' added and enabled!")
-        logger.info(f"Added dynamic bot: {bot_name}")
+        keyboard = [
+            [InlineKeyboardButton("🤖 Manage Bots", callback_data="manage_bots")],
+            [InlineKeyboardButton("➕ Add Another", callback_data="add_bot")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
-        try:
-            from automation.worker import send_command
-            await send_command(bot_name, config["start_cmd"])
-            await update.message.reply_text(f"🚀 Started automation for {bot_name}")
-        except Exception as e:
-            logger.warning(f"Could not send start command: {e}")
+        await update.message.reply_text(
+            f"✅ Bot <b>{bot_name}</b> added and enabled!",
+            reply_markup=reply_markup,
+            parse_mode="HTML"
+        )
+        logger.info(f"Added dynamic bot: {bot_name}")
     else:
-        await update.message.reply_text("❌ Failed to add bot")
+        keyboard = [
+            [InlineKeyboardButton("🔙 Back", callback_data="manage_bots")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "❌ Failed to add bot",
+            reply_markup=reply_markup
+        )
     
     context.user_data.clear()
     return ConversationHandler.END
