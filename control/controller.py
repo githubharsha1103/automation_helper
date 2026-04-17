@@ -614,7 +614,12 @@ async def add_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⛔ Access denied")
         return
     
-    await query.edit_message_text("➕ Enter bot username (without @):")
+    await query.edit_message_text(
+        "➕ <b>Add Bot Flow</b>\n\n"
+        "⚠️ Please complete ALL steps. Do NOT press /start or send other commands until done.\n\n"
+        "Enter bot username (without @):",
+        parse_mode="HTML"
+    )
     return ADD_BOT_NAME
 
 
