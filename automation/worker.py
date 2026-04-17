@@ -54,6 +54,10 @@ if not api_hash:
     logger.error("API_HASH missing from environment variables")
     raise ValueError("API_HASH missing")
 
+if not api_id or not api_id.isdigit():
+    logger.error(f"Invalid API_ID: {api_id}. It must be a numeric value.")
+    raise ValueError(f"Invalid API_ID: {api_id}. It must be a numeric value from my.telegram.org")
+
 api_id = int(api_id)
 logger.info(f"Initializing Telethon client with session: {session_name}")
 
