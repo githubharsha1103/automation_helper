@@ -1077,7 +1077,7 @@ def run_controller():
         await application.initialize()
         await application.start()
         await application.bot.initialize()
-        await application.updater.start_polling()
+        await application.updater.start_polling(drop_pending_updates=True)
 
     loop.run_until_complete(start_bot())
     loop.run_forever()

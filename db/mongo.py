@@ -16,34 +16,52 @@ logger = logging.getLogger(__name__)
 MONGO_URI = os.getenv("MONGO_URI")
 print("📦 MONGO_URI:", MONGO_URI)
 
-client = None
-db = None
+_client = None
+_db = None
 
-if not MONGO_URI:
-    logger.warning("MONGO_URI not set, MongoDB will not be used")
-else:
+
+def get_db():
+    global _client, _db
+    if _db is not None:
+        return _db
+    
+    if not MONGO_URI:
+        logger.warning("MONGO_URI not set, MongoDB will not be used")
+        return None
+    
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        db = client["telegram_automation"]
-        client.admin.command('ping')
+        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        _db = _client["telegram_automation"]
+        _client.admin.command('ping')
         logger.info("Connected to MongoDB")
         print("📦 MongoDB Connected!")
+        return _db
     except Exception as e:
         logger.error(f"MongoDB connection failed: {e}")
         print(f"📦 MongoDB connection error: {e}")
-        client = None
-        db = None
+        _client = None
+        _db = None
+        return None
 
-bots_collection = db["bots"] if db else None
-groups_collection = db["groups"] if db else None
-settings_collection = db["settings"] if db else None
+
+def get_collections():
+    database = get_db()
+    if database is None:
+        return {"bots": None, "groups": None, "settings": None}
+    return {
+        "bots": database["bots"],
+        "groups": database["groups"],
+        "settings": database["settings"]
+    }
 
 
 def add_bot(bot_name: str, config: dict) -> bool:
-    if not bots_collection:
+    cols = get_collections()
+    bots_coll = cols.get("bots")
+    if bots_coll is None:
         return False
     try:
-        bots_collection.update_one(
+        bots_coll.update_one(
             {"_id": bot_name},
             {"$set": config},
             upsert=True
@@ -56,20 +74,24 @@ def add_bot(bot_name: str, config: dict) -> bool:
 
 
 def get_bots() -> dict:
-    if not bots_collection:
+    cols = get_collections()
+    bots_coll = cols.get("bots")
+    if bots_coll is None:
         return {}
     try:
-        return {bot["_id"]: bot for bot in bots_collection.find()}
+        return {bot["_id"]: bot for bot in bots_coll.find()}
     except PyMongoError as e:
         logger.error(f"MongoDB get_bots error: {e}")
         return {}
 
 
 def delete_bot(bot_name: str) -> bool:
-    if not bots_collection:
+    cols = get_collections()
+    bots_coll = cols.get("bots")
+    if bots_coll is None:
         return False
     try:
-        bots_collection.delete_one({"_id": bot_name})
+        bots_coll.delete_one({"_id": bot_name})
         logger.info(f"MongoDB: Deleted bot: {bot_name}")
         return True
     except PyMongoError as e:
@@ -78,10 +100,12 @@ def delete_bot(bot_name: str) -> bool:
 
 
 def add_group(group_id: str) -> bool:
-    if not groups_collection:
+    cols = get_collections()
+    groups_coll = cols.get("groups")
+    if groups_coll is None:
         return False
     try:
-        groups_collection.update_one(
+        groups_coll.update_one(
             {"_id": group_id},
             {"$set": {"group_id": group_id}},
             upsert=True
@@ -94,20 +118,24 @@ def add_group(group_id: str) -> bool:
 
 
 def get_groups() -> list:
-    if not groups_collection:
+    cols = get_collections()
+    groups_coll = cols.get("groups")
+    if groups_coll is None:
         return []
     try:
-        return [g["_id"] for g in groups_collection.find()]
+        return [g["_id"] for g in groups_coll.find()]
     except PyMongoError as e:
         logger.error(f"MongoDB get_groups error: {e}")
         return []
 
 
 def delete_group(group_id: str) -> bool:
-    if not groups_collection:
+    cols = get_collections()
+    groups_coll = cols.get("groups")
+    if groups_coll is None:
         return False
     try:
-        groups_collection.delete_one({"_id": group_id})
+        groups_coll.delete_one({"_id": group_id})
         logger.info(f"MongoDB: Deleted group: {group_id}")
         return True
     except PyMongoError as e:
@@ -116,10 +144,12 @@ def delete_group(group_id: str) -> bool:
 
 
 def set_setting(key: str, value) -> bool:
-    if not settings_collection:
+    cols = get_collections()
+    settings_coll = cols.get("settings")
+    if settings_coll is None:
         return False
     try:
-        settings_collection.update_one(
+        settings_coll.update_one(
             {"_id": key},
             {"$set": {"value": value}},
             upsert=True
@@ -132,10 +162,12 @@ def set_setting(key: str, value) -> bool:
 
 
 def get_setting(key: str, default=None):
-    if not settings_collection:
+    cols = get_collections()
+    settings_coll = cols.get("settings")
+    if settings_coll is None:
         return default
     try:
-        doc = settings_collection.find_one({"_id": key})
+        doc = settings_coll.find_one({"_id": key})
         return doc["value"] if doc else default
     except PyMongoError as e:
         logger.error(f"MongoDB get_setting error: {e}")
