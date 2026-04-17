@@ -50,37 +50,55 @@ def run_group_worker():
 
 def main():
     import os
-    print(f"🚀 Starting Telegram Automation System... (PID: {os.getpid()})")
+    mode = os.getenv("SERVICE_MODE", "all")
+    print(f"🚀 Starting Telegram Automation System... (PID: {os.getpid()}, MODE: {mode})")
     print("Environment loaded")
     
     logger.info("=" * 50)
-    logger.info("Starting Telegram Automation System")
+    logger.info(f"Starting Telegram Automation System (MODE: {mode})")
     logger.info("=" * 50)
 
-    startup_delay = random.randint(10, 60)
-    logger.info(f"Waiting {startup_delay}s before starting automation...")
-    threading.Event().wait(startup_delay)
+    if mode == "web":
+        print("🌐 Running Flask server only...")
+        run_flask()
+        print("✅ Flask server started")
+    elif mode == "bot":
+        print("🤖 Running control bot only...")
+        run_controller()
+    elif mode == "worker":
+        startup_delay = random.randint(10, 60)
+        logger.info(f"Waiting {startup_delay}s before starting automation...")
+        threading.Event().wait(startup_delay)
+        
+        print("⚙️ Starting automation worker...")
+        run_automation()
+        print("✅ Automation worker started")
+        
+        group_thread = threading.Thread(target=run_group_worker, daemon=True)
+        group_thread.start()
+        logger.info("Group messaging worker started")
+    else:
+        startup_delay = random.randint(10, 60)
+        logger.info(f"Waiting {startup_delay}s before starting automation...")
+        threading.Event().wait(startup_delay)
 
-    print("▶️ Starting Flask server...")
-    run_flask()
-    print("✅ Flask server started")
+        print("▶️ Starting Flask server...")
+        run_flask()
+        print("✅ Flask server started")
 
-    print("🤖 Starting control bot...")
-    run_controller()
-    print("✅ Control bot started")
+        print("🤖 Starting control bot...")
+        run_controller()
+        print("✅ Control bot started")
 
-    print("⚙️ Starting automation worker...")
-    run_automation()
-    print("✅ Automation worker started")
-    
-    group_thread = threading.Thread(target=run_group_worker, daemon=True)
-    group_thread.start()
-    logger.info("Group messaging worker started")
+        print("⚙️ Starting automation worker...")
+        run_automation()
+        print("✅ Automation worker started")
+        
+        group_thread = threading.Thread(target=run_group_worker, daemon=True)
+        group_thread.start()
+        logger.info("Group messaging worker started")
 
     logger.info("All services started successfully")
-    logger.info("  - Flask server: http://localhost:5000")
-    logger.info("  - Control bot: Send /start command")
-    logger.info("  - Automation: Running in background")
     logger.info("Press Ctrl+C to stop")
 
     try:
