@@ -49,7 +49,8 @@ def run_group_worker():
 
 
 def main():
-    print("🚀 Starting Telegram Automation System...")
+    import os
+    print(f"🚀 Starting Telegram Automation System... (PID: {os.getpid()})")
     print("Environment loaded")
     
     logger.info("=" * 50)
