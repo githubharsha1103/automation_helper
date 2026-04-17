@@ -5,6 +5,19 @@ import os
 import time
 from config.bots_config import bots, default_limit
 
+try:
+    from db.mongo import add_bot as mongo_add_bot, get_bots as mongo_get_bots, delete_bot as mongo_delete_bot
+    from db.mongo import add_group as mongo_add_group, get_groups as mongo_get_groups, delete_group as mongo_delete_group
+    MONGO_AVAILABLE = True
+except ImportError:
+    MONGO_AVAILABLE = False
+    mongo_add_bot = None
+    mongo_get_bots = None
+    mongo_delete_bot = None
+    mongo_add_group = None
+    mongo_get_groups = None
+    mongo_delete_group = None
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -35,10 +48,24 @@ class StateManager:
         logger.info("StateManager initialized")
 
     def load_bots(self):
+        if MONGO_AVAILABLE and mongo_get_bots:
+            mongo_bots = mongo_get_bots()
+            if mongo_bots:
+                self._dynamic_bots = {k: v for k, v in mongo_bots.items() if not k.startswith('_')}
+                logger.info(f"MongoDB: Loaded {len(self._dynamic_bots)} dynamic bots")
+                for bot_name in self._dynamic_bots.keys():
+                    if bot_name not in self._state:
+                        self._state[bot_name] = {
+                            "enabled": False,
+                            "limit": default_limit,
+                            "count": 0,
+                            "security_pause": False
+                        }
+                return
         try:
             with open("dynamic_bots.json", "r") as f:
                 self._dynamic_bots = json.load(f)
-                logger.info(f"Loaded {len(self._dynamic_bots)} dynamic bots")
+                logger.info(f"Loaded {len(self._dynamic_bots)} dynamic bots from file")
                 for bot_name in self._dynamic_bots.keys():
                     if bot_name not in self._state:
                         self._state[bot_name] = {
@@ -51,11 +78,16 @@ class StateManager:
             self._dynamic_bots = {}
 
     def save_bots(self):
-        temp_file = "dynamic_bots.tmp"
-        with open(temp_file, "w") as f:
-            json.dump(self._dynamic_bots, f)
-        os.replace(temp_file, "dynamic_bots.json")
-        logger.info("Saved dynamic bots")
+        if MONGO_AVAILABLE and mongo_add_bot:
+            for bot_name, config in self._dynamic_bots.items():
+                mongo_add_bot(bot_name, config)
+            logger.info("MongoDB: Saved dynamic bots")
+        else:
+            temp_file = "dynamic_bots.tmp"
+            with open(temp_file, "w") as f:
+                json.dump(self._dynamic_bots, f)
+            os.replace(temp_file, "dynamic_bots.json")
+            logger.info("Saved dynamic bots to file")
 
     def _initialize_state(self):
         for bot_name in bots.keys():
@@ -150,6 +182,8 @@ class StateManager:
         with self._lock:
             if group_id not in self._groups:
                 self._groups.append(group_id)
+                if MONGO_AVAILABLE and mongo_add_group:
+                    mongo_add_group(group_id)
                 logger.info(f"Added group: {group_id}")
                 return True
             return False
@@ -158,6 +192,8 @@ class StateManager:
         with self._lock:
             if group_id in self._groups:
                 self._groups.remove(group_id)
+                if MONGO_AVAILABLE and mongo_delete_group:
+                    mongo_delete_group(group_id)
                 logger.info(f"Removed group: {group_id}")
                 return True
             return False
@@ -275,6 +311,8 @@ class StateManager:
             }
             logger.info(f"Added dynamic bot: {bot_name}")
             self.save_bots()
+            if MONGO_AVAILABLE and mongo_add_bot:
+                mongo_add_bot(bot_name, config)
             return True
 
     def get_dynamic_bots(self) -> dict:
@@ -294,6 +332,8 @@ class StateManager:
                     del self._state[bot_name]
                 logger.info(f"Removed dynamic bot: {bot_name}")
                 self.save_bots()
+                if MONGO_AVAILABLE and mongo_delete_bot:
+                    mongo_delete_bot(bot_name)
                 return True
             return False
 
