@@ -84,18 +84,26 @@ def get_client():
 
 
 def ensure_connected():
-    global client
-    client = get_client()
+    loop = asyncio.get_event_loop()
     
-    if not client.is_connected() or not client.isconnected():
-        print("🔌 Connecting to Telegram...")
-        try:
-            client.connect()
-            print("✅ Client connected")
-        except Exception as e:
-            print(f"❌ Connect error: {e}")
+    async def async_connect():
+        global client
+        client = get_client()
+        
+        if not client.is_connected():
+            print("🔌 Connecting to Telegram...")
+            try:
+                await client.connect()
+                print("✅ Client connected")
+            except Exception as e:
+                print(f"❌ Connect error: {e}")
+        
+        print("Client connected:", client.is_connected())
     
-    print("Client connected:", client.is_connected())
+    if loop.is_running():
+        asyncio.ensure_future(async_connect())
+    else:
+        loop.run_until_complete(async_connect())
 
 
 client = get_client()

@@ -1014,10 +1014,10 @@ def run_controller():
     async def start_bot():
         print("🚀 Starting control bot polling...")
         
+        application = Application.builder().token(TOKEN).build()
+        
         await application.bot.delete_webhook()
         print("✅ Webhook cleared")
-        
-        application = Application.builder().token(TOKEN).build()
         
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CallbackQueryHandler(manage_bots_callback, pattern="manage_bots"))
