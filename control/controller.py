@@ -95,14 +95,20 @@ async def manage_bots_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     
     keyboard = []
-    from config.bots_config import get_all_bots
-    all_bots = get_all_bots()
-    for bot_name in all_bots.keys():
-        state = state_manager.get_state(bot_name)
-        status = "✅" if state.get("enabled") else "❌"
-        keyboard.append([
-            InlineKeyboardButton(f"{status} {bot_name}", callback_data=f"bot_{bot_name}")
-        ])
+    from db.mongo import get_bots
+    all_bots = get_bots()
+    
+    if not all_bots:
+        keyboard.append([InlineKeyboardButton("⚠️ No bots added yet", callback_data="ignore")])
+    else:
+        for bot_name in all_bots.keys():
+            if bot_name.startswith('_'):
+                continue
+            state = state_manager.get_state(bot_name)
+            status = "✅" if state.get("enabled") else "❌"
+            keyboard.append([
+                InlineKeyboardButton(f"{status} {bot_name}", callback_data=f"bot_{bot_name}")
+            ])
     
     keyboard.append([InlineKeyboardButton("➕ Add Bot", callback_data="add_bot")])
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_main")])
@@ -796,9 +802,25 @@ async def delete_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     bot_name = query.data.replace("delete_", "")
     
+    from db.mongo import delete_bot as mongo_delete_bot
+    try:
+        mongo_delete_bot(bot_name)
+    except Exception as e:
+        logger.error(f"MongoDB delete error: {e}")
+    
     state_manager.remove_bot(bot_name)
     
-    await query.edit_message_text(f"🗑 Deleted {bot_name}")
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Bot", callback_data="add_bot")],
+        [InlineKeyboardButton("🔙 Back", callback_data="manage_bots")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"🗑 Bot <b>{bot_name}</b> deleted successfully",
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
 
 
 EDIT_TRIGGERS = 20

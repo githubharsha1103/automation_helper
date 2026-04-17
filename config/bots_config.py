@@ -1,42 +1,9 @@
-bots = {
-    "flirty_robot": {
-        "start_cmd": "/match",
-        "stop_cmd": "/stop",
-        "triggers": ["match", "found"],
-        "speed": (0.8, 2),
-        "stop_delay": (5, 8),
-        "restart_delay": (3, 6)
-    },
-    "AnonDatingENbot": {
-        "start_cmd": "/next",
-        "stop_cmd": "/stop",
-        "triggers": ["found", "Partner"],
-        "speed": (0.5, 1.5),
-        "stop_delay": (4, 7),
-        "restart_delay": (2, 5)
-    },
-    "chatai_bot": {
-        "start_cmd": "/start",
-        "stop_cmd": "/stop",
-        "triggers": ["connected", "match"],
-        "speed": (1, 2),
-        "stop_delay": (5, 10),
-        "restart_delay": (3, 5)
-    },
-    "anonymous_chatusbot": {
-        "start_cmd": "/next",
-        "stop_cmd": "/stop",
-        "triggers": ["found", "someone"],
-        "speed": (0.5, 1.5),
-        "stop_delay": (4, 7),
-        "restart_delay": (2, 5)
-    }
-}
+bots = {}
 
 
 def get_all_bots():
     from state.state_manager import state_manager
-    return {**bots, **state_manager.get_dynamic_bots()}
+    return state_manager.get_all_bots()
 
 
 default_limit = 100
