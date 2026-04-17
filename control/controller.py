@@ -96,21 +96,14 @@ async def manage_bots_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     
     keyboard = []
     
-    try:
-        from db.mongo import get_bots
-        mongo_bots = get_bots()
-        logger.info(f"MongoDB bots: {list(mongo_bots.keys())}")
-    except Exception as e:
-        logger.error(f"Error getting MongoDB bots: {e}")
-        mongo_bots = {}
+    from db.mongo import get_bots
+    bots = get_bots()
+    logger.info(f"Fetched bots from DB: {list(bots.keys())}")
     
-    state_bots = state_manager.get_all_bots()
-    all_bots = {**mongo_bots, **state_bots}
-    
-    if not all_bots:
+    if not bots:
         keyboard.append([InlineKeyboardButton("⚠️ No bots added yet", callback_data="ignore")])
     else:
-        for bot_name in all_bots.keys():
+        for bot_name in bots.keys():
             if bot_name.startswith('_'):
                 continue
             state = state_manager.get_state(bot_name)
