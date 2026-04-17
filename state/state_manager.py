@@ -5,11 +5,15 @@ import os
 import time
 from config.bots_config import bots, default_limit
 
+print("📦 StateManager: Starting import...")
+
 try:
     from db.mongo import add_bot as mongo_add_bot, get_bots as mongo_get_bots, delete_bot as mongo_delete_bot
     from db.mongo import add_group as mongo_add_group, get_groups as mongo_get_groups, delete_group as mongo_delete_group
+    print("📦 StateManager: db.mongo imported")
     MONGO_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    print(f"📦 StateManager: db.mongo import failed: {e}")
     MONGO_AVAILABLE = False
     mongo_add_bot = None
     mongo_get_bots = None

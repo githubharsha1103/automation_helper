@@ -3,22 +3,34 @@ import logging
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
+print("📦 Loading db module...")
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except:
+    pass
+
 logger = logging.getLogger(__name__)
 
 MONGO_URI = os.getenv("MONGO_URI")
+print("📦 MONGO_URI:", MONGO_URI)
+
+client = None
+db = None
 
 if not MONGO_URI:
     logger.warning("MONGO_URI not set, MongoDB will not be used")
-    client = None
-    db = None
 else:
     try:
-        client = MongoClient(MONGO_URI)
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
         db = client["telegram_automation"]
         client.admin.command('ping')
         logger.info("Connected to MongoDB")
-    except PyMongoError as e:
+        print("📦 MongoDB Connected!")
+    except Exception as e:
         logger.error(f"MongoDB connection failed: {e}")
+        print(f"📦 MongoDB connection error: {e}")
         client = None
         db = None
 
