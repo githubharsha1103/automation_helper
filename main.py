@@ -1,72 +1,60 @@
 #!/usr/bin/env python3
-# A simple script to print some messages.
-import time
-import re
-import json
-import random
-import os
-from pprint import pprint
 
-from telethon import TelegramClient, events, utils
+import os
+import sys
+import asyncio
+import threading
+import logging
+import random
 from dotenv import load_dotenv
 
-load_dotenv() # get .env variable
+load_dotenv()
 
-session = os.environ.get('TG_SESSION', 'printer')
-api_id = os.getenv("API_ID")
-api_hash = os.getenv("API_HASH")
-debug_mode = os.getenv("DEBUG_MODE").upper() == "TRUE"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-proxy = None  # https://github.com/Anorov/PySocks
+from web.server import run_in_background as run_flask
+from control.controller import run_in_background as run_controller
+from automation.worker import run_in_background as run_automation, send_group_messages
 
-# Create and start the client so we can make requests (we don't here)
-client = TelegramClient(session, api_id, api_hash, proxy=proxy).start()
 
-# create a sender list to check if user already send private message or mention
-senderList = [] 
+def run_group_worker():
+    asyncio.run(send_group_messages())
 
-#read json file and prepare quiz to send later
-with open('quizzes.json') as json_file:
-    quizzes = json.load(json_file)
 
-@client.on(events.NewMessage)
-async def handle_new_message(event):
+def main():
+    logger.info("=" * 50)
+    logger.info("Starting Telegram Automation System")
+    logger.info("=" * 50)
+
+    startup_delay = random.randint(10, 60)
+    logger.info(f"Waiting {startup_delay}s before starting automation...")
+    threading.Event().wait(startup_delay)
+
+    run_flask()
+    run_controller()
+    run_automation()
     
-    me = await client.get_me().username
-    from_ = await event.client.get_entity(event.from_id)  # this lookup will be cached by telethon
-    to_ = await event.client.get_entity(event.message.to_id)
+    group_thread = threading.Thread(target=run_group_worker, daemon=True)
+    group_thread.start()
+    logger.info("Group messaging worker started")
 
-    needToProceed = from_.is_self if debug_mode else not from_.is_self and (event.is_private or re.search("@"+me.username,event.raw_text))
-    if needToProceed:  # only auto-reply to private chats:  # only auto-reply to private chats   
-        if not from_.bot and event:  # don't auto-reply to bots
-            print(time.asctime(), '-', event.message)  # optionally log time and message
-            time.sleep(1)  # pause for 1 second to rate-limit automatic replies   
-            message = ""
-            senderList.append(to_.id)
-            if senderList.count(to_.id) < 2:
-                message =   f"""**AUTO REPLY**
-                \nHi @{from_.username},
-                \n\nMohon maaf boss saya sedang offline, mohon tunggu sebentar.
-                \nSilahkan lihat-lihat [imacakes](https://www.instagram.com/ima_cake_cirebon) dulu untuk cuci mata.
-                \n\n**AUTO REPLY**"""
-            elif senderList.count(to_.id) < 3:
-                message =   f"""**AUTO REPLY**
-                \nMohon bersabar @{from_.username}, boss saya masih offline 😒"""
-            elif senderList.count(to_.id) < 4:
-                message = f"""**AUTO REPLY** 
-                \n@{from_.username} Tolong bersabar yaa 😅"""
-            else:
-                random_number = random.randint(0,len(quizzes) - 1)
-                question = quizzes[random_number]['question']
-                answer = quizzes[random_number]['answer']
-                message = f"""**AUTO REPLY**
-                \n @{from_.username}, Main tebak-tebakan aja yuk 😁
-                \n {question}
-                \n {answer}
-                \n """
-            
-            if message != "":
-                await event.reply(message)
+    logger.info("All services started successfully")
+    logger.info("  - Flask server: http://localhost:5000")
+    logger.info("  - Control bot: Send /start command")
+    logger.info("  - Automation: Running in background")
+    logger.info("Press Ctrl+C to stop")
 
-client.start()
-client.run_until_disconnected()
+    try:
+        while True:
+            threading.Event().wait(3600)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
