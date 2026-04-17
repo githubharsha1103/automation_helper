@@ -1101,8 +1101,17 @@ _controller_started = False
 
 
 def run_controller():
+    global _controller_started
+    
+    if _controller_started:
+        logger.warning("Control bot already started, skipping...")
+        print("⚠️ CONTROL BOT ALREADY STARTED")
+        return
+    
+    _controller_started = True
     logger.info("Starting control bot...")
-    print("📦 Running control bot...")
+    print("🚀 CONTROL BOT STARTED")
+    
     application = Application.builder().token(TOKEN).build()
     
     application.add_handler(CommandHandler("start", start_command))
