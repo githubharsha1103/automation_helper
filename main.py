@@ -30,7 +30,7 @@ except Exception as e:
     raise
 
 try:
-    from control.controller import run_in_background as run_controller
+    from control.controller import run_controller
     print("✅ controller imported")
 except Exception as e:
     print("❌ controller import failed:", e)
