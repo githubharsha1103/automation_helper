@@ -1012,6 +1012,11 @@ def run_controller():
     asyncio.set_event_loop(loop)
 
     async def start_bot():
+        print("🚀 Starting control bot polling...")
+        
+        await application.bot.delete_webhook()
+        print("✅ Webhook cleared")
+        
         application = Application.builder().token(TOKEN).build()
         
         application.add_handler(CommandHandler("start", start_command))
@@ -1078,11 +1083,24 @@ def run_controller():
         await application.start()
         await application.bot.initialize()
         await application.updater.start_polling(drop_pending_updates=True)
+        
+        print("✅ Control bot polling started")
 
     loop.run_until_complete(start_bot())
     loop.run_forever()
 
+
+_controller_started = False
+
 def run_in_background():
+    global _controller_started
+    if _controller_started:
+        logger.warning("Control bot already running, skipping...")
+        print("⚠️ Control bot already running")
+        return
+    
+    _controller_started = True
+    print("📦 Starting controller thread...")
     controller_thread = threading.Thread(target=run_controller, daemon=True)
     controller_thread.start()
     logger.info("Control bot started in background thread")
