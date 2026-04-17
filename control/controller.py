@@ -1038,59 +1038,111 @@ async def start_bot():
     application.add_handler(CallbackQueryHandler(view_safe_limits_callback, pattern="view_safe_limits"))
     application.add_handler(CallbackQueryHandler(add_bot_callback, pattern="add_bot"))
 
-        conv_handler = ConversationHandler(
-            entry_points=[
-                CallbackQueryHandler(limit_button_callback, pattern="^limit_"),
-                CallbackQueryHandler(add_group_btn_callback, pattern="add_group_btn"),
-                CallbackQueryHandler(add_bot_callback, pattern="add_bot"),
-                CallbackQueryHandler(edit_triggers_callback, pattern="^edit_triggers_"),
-                CallbackQueryHandler(edit_speed_callback, pattern="^edit_speed_"),
-                CallbackQueryHandler(edit_stop_delay_callback, pattern="^edit_stop_delay_"),
-                CallbackQueryHandler(edit_restart_delay_callback, pattern="^edit_restart_delay_")
-            ],
-            states={
-                SET_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, limit_input_handler)],
-                ADD_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_input_handler)],
-                ADD_BOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_bot_name_handler)],
-                ADD_START_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_start_cmd_handler)],
-                ADD_STOP_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_stop_cmd_handler)],
-                ADD_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_triggers_handler)],
-                ADD_SPEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_speed_handler)],
-                ADD_STOP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_stop_delay_handler)],
-                ADD_RESTART_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_restart_delay_handler)],
-                EDIT_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_triggers_handler)],
-                EDIT_SPEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_speed_handler)],
-                EDIT_STOP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_stop_delay_handler)],
-                EDIT_RESTART_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_restart_delay_handler)],
-                SET_MAX_GROUPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_max_groups_handler)],
-                SET_GROUP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_group_delay_handler)],
-            },
-            fallbacks=[],
-        )
-        application.add_handler(conv_handler)
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(limit_button_callback, pattern="^limit_"),
+            CallbackQueryHandler(add_group_btn_callback, pattern="add_group_btn"),
+            CallbackQueryHandler(add_bot_callback, pattern="add_bot"),
+            CallbackQueryHandler(edit_triggers_callback, pattern="^edit_triggers_"),
+            CallbackQueryHandler(edit_speed_callback, pattern="^edit_speed_"),
+            CallbackQueryHandler(edit_stop_delay_callback, pattern="^edit_stop_delay_"),
+            CallbackQueryHandler(edit_restart_delay_callback, pattern="^edit_restart_delay_")
+        ],
+        states={
+            SET_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, limit_input_handler)],
+            ADD_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_input_handler)],
+            ADD_BOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_bot_name_handler)],
+            ADD_START_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_start_cmd_handler)],
+            ADD_STOP_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_stop_cmd_handler)],
+            ADD_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_triggers_handler)],
+            ADD_SPEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_speed_handler)],
+            ADD_STOP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_stop_delay_handler)],
+            ADD_RESTART_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_restart_delay_handler)],
+            EDIT_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_triggers_handler)],
+            EDIT_SPEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_speed_handler)],
+            EDIT_STOP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_stop_delay_handler)],
+            EDIT_RESTART_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_restart_delay_handler)],
+            SET_MAX_GROUPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_max_groups_handler)],
+            SET_GROUP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_group_delay_handler)],
+        },
+        fallbacks=[],
+    )
+    application.add_handler(conv_handler)
 
-        logger.info("Control bot is running...")
-
-        await application.initialize()
-        await application.start()
-        await application.bot.initialize()
-        await application.updater.start_polling(drop_pending_updates=True)
-        
-        print("✅ Control bot polling started")
+    logger.info("Control bot is running...")
+    
+    application.run_polling(drop_pending_updates=True)
+    print("✅ Control bot polling started")
 
 
 _controller_started = False
 
 
 def run_controller():
-    import asyncio
-    
     logger.info("Starting control bot...")
+    print("📦 Running control bot...")
+    application = Application.builder().token(TOKEN).build()
     
-    async def run():
-        await start_bot()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CallbackQueryHandler(manage_bots_callback, pattern="manage_bots"))
+    application.add_handler(CallbackQueryHandler(bot_details_callback, pattern="^bot_"))
+    application.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^toggle_"))
+    application.add_handler(CallbackQueryHandler(limit_button_callback, pattern="^limit_"))
+    application.add_handler(CallbackQueryHandler(reset_count_callback, pattern="^reset_"))
+    application.add_handler(CallbackQueryHandler(settings_callback, pattern="settings"))
+    application.add_handler(CallbackQueryHandler(back_main_callback, pattern="back_main"))
+    application.add_handler(CallbackQueryHandler(bypass_callback, pattern="^bypass_"))
+    application.add_handler(CallbackQueryHandler(delete_bot_callback, pattern="^delete_"))
+    application.add_handler(CallbackQueryHandler(edit_bot_callback, pattern="^edit_"))
+    application.add_handler(CallbackQueryHandler(edit_triggers_callback, pattern="^edit_triggers_"))
+    application.add_handler(CallbackQueryHandler(edit_speed_callback, pattern="^edit_speed_"))
+    application.add_handler(CallbackQueryHandler(edit_stop_delay_callback, pattern="^edit_stop_delay_"))
+    application.add_handler(CallbackQueryHandler(edit_restart_delay_callback, pattern="^edit_restart_delay_"))
+    application.add_handler(CallbackQueryHandler(manage_groups_callback, pattern="manage_groups"))
+    application.add_handler(CallbackQueryHandler(add_group_btn_callback, pattern="add_group_btn"))
+    application.add_handler(CallbackQueryHandler(view_groups_callback, pattern="view_groups"))
+    application.add_handler(CallbackQueryHandler(enable_groups_callback, pattern="enable_groups"))
+    application.add_handler(CallbackQueryHandler(disable_groups_callback, pattern="disable_groups"))
+    application.add_handler(CallbackQueryHandler(group_settings_callback, pattern="group_settings"))
+    application.add_handler(CallbackQueryHandler(set_max_groups_callback, pattern="set_max_groups"))
+    application.add_handler(CallbackQueryHandler(set_group_delay_callback, pattern="set_group_delay"))
+    application.add_handler(CallbackQueryHandler(toggle_safe_mode_callback, pattern="toggle_safe_mode"))
+    application.add_handler(CallbackQueryHandler(view_safe_limits_callback, pattern="view_safe_limits"))
+    application.add_handler(CallbackQueryHandler(add_bot_callback, pattern="add_bot"))
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(limit_button_callback, pattern="^limit_"),
+            CallbackQueryHandler(add_group_btn_callback, pattern="add_group_btn"),
+            CallbackQueryHandler(add_bot_callback, pattern="add_bot"),
+            CallbackQueryHandler(edit_triggers_callback, pattern="^edit_triggers_"),
+            CallbackQueryHandler(edit_speed_callback, pattern="^edit_speed_"),
+            CallbackQueryHandler(edit_stop_delay_callback, pattern="^edit_stop_delay_"),
+            CallbackQueryHandler(edit_restart_delay_callback, pattern="^edit_restart_delay_")
+        ],
+        states={
+            SET_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, limit_input_handler)],
+            ADD_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_input_handler)],
+            ADD_BOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_bot_name_handler)],
+            ADD_START_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_start_cmd_handler)],
+            ADD_STOP_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_stop_cmd_handler)],
+            ADD_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_triggers_handler)],
+            ADD_SPEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_speed_handler)],
+            ADD_STOP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_stop_delay_handler)],
+            ADD_RESTART_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_restart_delay_handler)],
+            EDIT_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_triggers_handler)],
+            EDIT_SPEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_speed_handler)],
+            EDIT_STOP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_stop_delay_handler)],
+            EDIT_RESTART_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_restart_delay_handler)],
+            SET_MAX_GROUPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_max_groups_handler)],
+            SET_GROUP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_group_delay_handler)],
+        },
+        fallbacks=[],
+    )
+    application.add_handler(conv_handler)
     
-    asyncio.run(run())
+    print("🚀 Starting control bot polling...")
+    application.run_polling(drop_pending_updates=True)
 
 
 def run_in_background():
