@@ -1003,48 +1003,40 @@ async def edit_restart_delay_handler(update: Update, context: ContextTypes.DEFAU
     return ConversationHandler.END
 
 
-def run_controller():
-    import asyncio
-
-    logger.info("Starting control bot...")
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    async def start_bot():
-        print("🚀 Starting control bot polling...")
-        
-        application = Application.builder().token(TOKEN).build()
-        
-        await application.bot.delete_webhook()
-        print("✅ Webhook cleared")
-        
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CallbackQueryHandler(manage_bots_callback, pattern="manage_bots"))
-        application.add_handler(CallbackQueryHandler(bot_details_callback, pattern="^bot_"))
-        application.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^toggle_"))
-        application.add_handler(CallbackQueryHandler(limit_button_callback, pattern="^limit_"))
-        application.add_handler(CallbackQueryHandler(reset_count_callback, pattern="^reset_"))
-        application.add_handler(CallbackQueryHandler(settings_callback, pattern="settings"))
-        application.add_handler(CallbackQueryHandler(back_main_callback, pattern="back_main"))
-        application.add_handler(CallbackQueryHandler(bypass_callback, pattern="^bypass_"))
-        application.add_handler(CallbackQueryHandler(delete_bot_callback, pattern="^delete_"))
-        application.add_handler(CallbackQueryHandler(edit_bot_callback, pattern="^edit_"))
-        application.add_handler(CallbackQueryHandler(edit_triggers_callback, pattern="^edit_triggers_"))
-        application.add_handler(CallbackQueryHandler(edit_speed_callback, pattern="^edit_speed_"))
-        application.add_handler(CallbackQueryHandler(edit_stop_delay_callback, pattern="^edit_stop_delay_"))
-        application.add_handler(CallbackQueryHandler(edit_restart_delay_callback, pattern="^edit_restart_delay_"))
-        application.add_handler(CallbackQueryHandler(manage_groups_callback, pattern="manage_groups"))
-        application.add_handler(CallbackQueryHandler(add_group_btn_callback, pattern="add_group_btn"))
-        application.add_handler(CallbackQueryHandler(view_groups_callback, pattern="view_groups"))
-        application.add_handler(CallbackQueryHandler(enable_groups_callback, pattern="enable_groups"))
-        application.add_handler(CallbackQueryHandler(disable_groups_callback, pattern="disable_groups"))
-        application.add_handler(CallbackQueryHandler(group_settings_callback, pattern="group_settings"))
-        application.add_handler(CallbackQueryHandler(set_max_groups_callback, pattern="set_max_groups"))
-        application.add_handler(CallbackQueryHandler(set_group_delay_callback, pattern="set_group_delay"))
-        application.add_handler(CallbackQueryHandler(toggle_safe_mode_callback, pattern="toggle_safe_mode"))
-        application.add_handler(CallbackQueryHandler(view_safe_limits_callback, pattern="view_safe_limits"))
-        application.add_handler(CallbackQueryHandler(add_bot_callback, pattern="add_bot"))
+async def start_bot():
+    print("🚀 Starting control bot polling...")
+    
+    application = Application.builder().token(TOKEN).build()
+    
+    await application.bot.delete_webhook()
+    print("✅ Webhook cleared")
+    
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CallbackQueryHandler(manage_bots_callback, pattern="manage_bots"))
+    application.add_handler(CallbackQueryHandler(bot_details_callback, pattern="^bot_"))
+    application.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^toggle_"))
+    application.add_handler(CallbackQueryHandler(limit_button_callback, pattern="^limit_"))
+    application.add_handler(CallbackQueryHandler(reset_count_callback, pattern="^reset_"))
+    application.add_handler(CallbackQueryHandler(settings_callback, pattern="settings"))
+    application.add_handler(CallbackQueryHandler(back_main_callback, pattern="back_main"))
+    application.add_handler(CallbackQueryHandler(bypass_callback, pattern="^bypass_"))
+    application.add_handler(CallbackQueryHandler(delete_bot_callback, pattern="^delete_"))
+    application.add_handler(CallbackQueryHandler(edit_bot_callback, pattern="^edit_"))
+    application.add_handler(CallbackQueryHandler(edit_triggers_callback, pattern="^edit_triggers_"))
+    application.add_handler(CallbackQueryHandler(edit_speed_callback, pattern="^edit_speed_"))
+    application.add_handler(CallbackQueryHandler(edit_stop_delay_callback, pattern="^edit_stop_delay_"))
+    application.add_handler(CallbackQueryHandler(edit_restart_delay_callback, pattern="^edit_restart_delay_"))
+    application.add_handler(CallbackQueryHandler(manage_groups_callback, pattern="manage_groups"))
+    application.add_handler(CallbackQueryHandler(add_group_btn_callback, pattern="add_group_btn"))
+    application.add_handler(CallbackQueryHandler(view_groups_callback, pattern="view_groups"))
+    application.add_handler(CallbackQueryHandler(enable_groups_callback, pattern="enable_groups"))
+    application.add_handler(CallbackQueryHandler(disable_groups_callback, pattern="disable_groups"))
+    application.add_handler(CallbackQueryHandler(group_settings_callback, pattern="group_settings"))
+    application.add_handler(CallbackQueryHandler(set_max_groups_callback, pattern="set_max_groups"))
+    application.add_handler(CallbackQueryHandler(set_group_delay_callback, pattern="set_group_delay"))
+    application.add_handler(CallbackQueryHandler(toggle_safe_mode_callback, pattern="toggle_safe_mode"))
+    application.add_handler(CallbackQueryHandler(view_safe_limits_callback, pattern="view_safe_limits"))
+    application.add_handler(CallbackQueryHandler(add_bot_callback, pattern="add_bot"))
 
         conv_handler = ConversationHandler(
             entry_points=[
@@ -1086,11 +1078,20 @@ def run_controller():
         
         print("✅ Control bot polling started")
 
-    loop.run_until_complete(start_bot())
-    loop.run_forever()
-
 
 _controller_started = False
+
+
+def run_controller():
+    import asyncio
+    
+    logger.info("Starting control bot...")
+    
+    async def run():
+        await start_bot()
+    
+    asyncio.run(run())
+
 
 def run_in_background():
     global _controller_started
