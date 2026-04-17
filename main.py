@@ -6,6 +6,7 @@ import asyncio
 import threading
 import logging
 import random
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,6 +27,9 @@ def run_group_worker():
 
 
 def main():
+    print("🚀 Starting Telegram Automation System...")
+    print("Environment loaded")
+    
     logger.info("=" * 50)
     logger.info("Starting Telegram Automation System")
     logger.info("=" * 50)
@@ -50,11 +54,17 @@ def main():
 
     try:
         while True:
-            threading.Event().wait(3600)
+            time.sleep(10)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
         sys.exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("Startup Error:", e)
+        import traceback
+        traceback.print_exc()
+        raise

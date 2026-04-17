@@ -47,19 +47,21 @@ session_name = os.getenv("TG_SESSION", "session")
 api_id = os.getenv("API_ID")
 api_hash = os.getenv("API_HASH")
 
-if not api_id:
-    logger.error("API_ID missing from environment variables")
-    raise ValueError("API_ID missing")
-if not api_hash:
-    logger.error("API_HASH missing from environment variables")
-    raise ValueError("API_HASH missing")
+print("DEBUG API_ID:", api_id)
+print("DEBUG API_HASH:", api_hash)
+print("DEBUG TG_SESSION:", session_name)
 
 if not api_id or not api_id.isdigit():
     logger.error(f"Invalid API_ID: {api_id}. It must be a numeric value.")
     raise ValueError(f"Invalid API_ID: {api_id}. It must be a numeric value from my.telegram.org")
 
 api_id = int(api_id)
-logger.info(f"Initializing Telethon client with session: {session_name}")
+
+if not api_hash:
+    logger.error("API_HASH missing from environment variables")
+    raise ValueError("API_HASH is missing")
+
+logger.info("Environment variables validated successfully")
 
 client = None
 
