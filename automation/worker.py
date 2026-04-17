@@ -6,6 +6,7 @@ import random
 import threading
 import time
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -44,12 +45,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 session_name = os.getenv("TG_SESSION", "session")
+session_string = os.getenv("SESSION_STRING")
 api_id = os.getenv("API_ID")
 api_hash = os.getenv("API_HASH")
 
 print("DEBUG API_ID:", api_id)
 print("DEBUG API_HASH:", api_hash)
 print("DEBUG TG_SESSION:", session_name)
+print("DEBUG SESSION_STRING:", "set" if session_string else "not set")
 
 if not api_id or not api_id.isdigit():
     logger.error(f"Invalid API_ID: {api_id}. It must be a numeric value.")
@@ -71,8 +74,28 @@ client = None
 def get_client():
     global client
     if client is None:
-        client = TelegramClient(session_name, api_id, api_hash)
+        if session_string:
+            client = TelegramClient(StringSession(session_string), api_id, api_hash)
+            print("📱 Using SESSION_STRING")
+        else:
+            client = TelegramClient(session_name, api_id, api_hash)
+            print("📁 Using file session")
     return client
+
+
+def ensure_connected():
+    global client
+    client = get_client()
+    
+    if not client.is_connected() or not client.isconnected():
+        print("🔌 Connecting to Telegram...")
+        try:
+            client.connect()
+            print("✅ Client connected")
+        except Exception as e:
+            print(f"❌ Connect error: {e}")
+    
+    print("Client connected:", client.is_connected())
 
 
 client = get_client()
@@ -159,14 +182,23 @@ async def handle_new_message(event):
 
 async def start_automation():
     try:
-        await client.start()
+        ensure_connected()
+        
+        if not client.is_connected():
+            logger.warning("Client not connected, attempting to start...")
+            await client.start()
+        
+        print("✅ Telethon client started")
         logger.info("Telethon client started successfully")
         
         bots = get_all_bots().copy()
         for bot_username in list(bots.keys()):
             if state_manager.is_enabled(bot_username):
                 logger.info(f"Starting automation for @{bot_username}")
-                await client.send_message(bot_username, bots[bot_username]["start_cmd"])
+                try:
+                    await client.send_message(bot_username, bots[bot_username]["start_cmd"])
+                except Exception as e:
+                    logger.error(f"Failed to send to {bot_username}: {e}")
     except Exception as e:
         logger.error(f"Failed to start automation: {e}")
         raise
@@ -176,7 +208,12 @@ async def run_automation():
     await start_automation()
     while True:
         try:
-            await client.run_until_disconnected()
+            if client.is_connected():
+                await client.run_until_disconnected()
+            else:
+                logger.warning("Client disconnected, reconnecting...")
+                ensure_connected()
+                await asyncio.sleep(5)
         except Exception as e:
             logger.error(f"Reconnect error: {e}")
             await asyncio.sleep(5)
