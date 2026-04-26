@@ -1,341 +1,343 @@
-import os
 import asyncio
-import datetime
 import logging
+import os
 import random
-import threading
-import time
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from dotenv import load_dotenv
+
+from storage.db import (
+    get_bot,
+    get_bots,
+    get_setting,
+    is_bot_enabled,
+    is_bot_paused,
+    list_groups,
+    list_messages,
+    set_bot_paused,
+    set_setting,
+    update_group_runtime,
+)
 
 load_dotenv()
 
-from config.bots_config import get_all_bots, messages as promo_messages
-from state.state_manager import state_manager
-
-SECURITY_KEYWORDS = ["security", "verify", "captcha", "check"]
-
-last_group_sent_time = 0
-MIN_GROUP_DELAY_RANGE = (4, 9)
-
-
-def tweak_message(msg):
-    variations = [
-        msg,
-        msg + " 🙂",
-        msg + " 👍",
-        msg.replace("India", "Indian"),
-        msg.replace("chat", "talk"),
-    ]
-    return random.choice(variations)
-
-
-def notify_security(bot_name: str):
-    try:
-        from control.controller import trigger_security_notification
-        trigger_security_notification(bot_name)
-    except ImportError as e:
-        logger.warning(f"Could not import controller for notification: {e}")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
-session_name = os.getenv("TG_SESSION", "session")
-session_string = os.getenv("SESSION_STRING")
-api_id = os.getenv("API_ID")
-api_hash = os.getenv("API_HASH")
 
-print("DEBUG API_ID:", api_id)
-print("DEBUG API_HASH:", api_hash)
-print("DEBUG TG_SESSION:", session_name)
-print("DEBUG SESSION_STRING:", "set" if session_string else "not set")
-
-if not api_id or not api_id.isdigit():
-    logger.error(f"Invalid API_ID: {api_id}. It must be a numeric value.")
-    raise ValueError(f"Invalid API_ID: {api_id}. It must be a numeric value from my.telegram.org")
-
-api_id = int(api_id)
-
-if not api_hash:
-    logger.error("API_HASH missing from environment variables")
-    raise ValueError("API_HASH is missing")
-
-logger.info("Environment variables validated successfully")
-
-print("🚀 Initializing Telethon client...")
-
-client = None
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name) or os.getenv(name.lower(), default)
 
 
-def get_client():
-    global client
-    if client is None:
-        if session_string:
-            client = TelegramClient(StringSession(session_string), api_id, api_hash)
-            print("📱 Using SESSION_STRING")
-        else:
-            client = TelegramClient(session_name, api_id, api_hash)
-            print("📁 Using file session")
-    return client
+def _normalize_command(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return cleaned if cleaned.startswith("/") else f"/{cleaned}"
 
 
-def ensure_connected():
-    loop = asyncio.get_event_loop()
-    
-    async def async_connect():
-        global client
-        client = get_client()
-        
-        if not client.is_connected():
-            print("🔌 Connecting to Telegram...")
-            try:
-                await client.connect()
-                print("✅ Client connected")
-            except Exception as e:
-                print(f"❌ Connect error: {e}")
-        
-        print("Client connected:", client.is_connected())
-    
-    if loop.is_running():
-        asyncio.ensure_future(async_connect())
-    else:
-        loop.run_until_complete(async_connect())
+API_ID = _env("API_ID")
+API_HASH = _env("API_HASH")
+SESSION_NAME = _env("TG_SESSION", "session")
+SESSION_STRING = _env("SESSION_STRING")
 
 
-client = get_client()
-print("✅ Telethon client initialized")
+class TelegramService:
+    def __init__(self) -> None:
+        if not API_ID or not API_ID.isdigit():
+            raise ValueError("API_ID must be set to a numeric value")
+        if not API_HASH:
+            raise ValueError("API_HASH must be set")
+        session = StringSession(SESSION_STRING) if SESSION_STRING else SESSION_NAME
+        self.client = TelegramClient(session, int(API_ID), API_HASH)
+        self._connect_lock = asyncio.Lock()
 
+    async def ensure_connected(self) -> None:
+        async with self._connect_lock:
+            if not self.client.is_connected():
+                await self.client.connect()
+            if not await self.client.is_user_authorized():
+                raise RuntimeError("Telegram session is not authorized")
 
-@client.on(events.NewMessage)
-async def handle_new_message(event):
-    if event.out:
-        return
+    async def is_authorized(self) -> bool:
+        async with self._connect_lock:
+            if not self.client.is_connected():
+                await self.client.connect()
+            return await self.client.is_user_authorized()
 
-    bots = get_all_bots()
-    
-    chat = await event.get_chat()
-    bot_username = getattr(chat, "username", None)
-    
-    if not bot_username:
-        return
-    
-    if bot_username not in bots:
-        return
+    async def ensure_authorized_session(self) -> None:
+        async with self._connect_lock:
+            if not self.client.is_connected():
+                await self.client.connect()
 
-    text = event.raw_text.lower()
-    logger.info(f"[{bot_username}] Incoming: {text[:100]}")
-    logger.info(f"[{bot_username}] Enabled: {state_manager.is_enabled(bot_username)}")
-
-    if "left the chat" in text or "partner left" in text or "chat is over" in text:
-        return
-
-    config = bots[bot_username]
-    triggers = config.get("triggers", [])
-
-    trigger_found = any(t.lower() in text for t in triggers)
-    logger.info(f"[{bot_username}] Triggers: {triggers}, Matched: {trigger_found}")
-
-    if state_manager.is_security_paused(bot_username):
-        logger.info(f"[{bot_username}] Security paused, skipping")
-        return
-
-    if trigger_found and state_manager.is_enabled(bot_username):
-        if any(keyword in text for keyword in SECURITY_KEYWORDS):
-            if state_manager.is_security_paused(bot_username):
+            if await self.client.is_user_authorized():
                 return
 
-            logger.warning(f"Security detected in {bot_username}")
+            logger.warning(
+                "Telegram session is missing or unauthorized. Starting interactive login in this terminal."
+            )
+            await self.client.start()
 
-            state_manager.set_security_pause(bot_username, True)
-            state_manager.disable_bot(bot_username)
+            if not await self.client.is_user_authorized():
+                raise RuntimeError("Telegram login did not complete successfully")
 
-            from control.controller import notify_security
-            await notify_security(bot_username)
+    async def resolve_entity(self, chat_ref: str):
+        await self.ensure_connected()
+        if chat_ref.startswith("-100"):
+            return await self.client.get_entity(int(chat_ref))
+        return await self.client.get_entity(chat_ref)
 
-            return
+    async def send_saved_message(self, group_id: str, message: dict) -> None:
+        await self.ensure_connected()
+        entity = await self.resolve_entity(group_id)
+        media_type = message.get("media_type")
+        media_file_id = message.get("media_file_id")
+        content = message["content"]
 
-        if state_manager.should_stop(bot_username):
-            logger.info(f"[{bot_username}] Limit reached, stopping automation")
-            state_manager.disable_bot(bot_username)
-            return
+        if media_type and media_file_id:
+            await self.client.send_file(entity, media_file_id, caption=content)
+        else:
+            await self.client.send_message(entity, content)
 
-        delay = random.uniform(*config.get("speed", (0.5, 2)))
-        logger.info(f"[{bot_username}] Match found, waiting {delay:.2f}s before sending")
-        await asyncio.sleep(delay)
+    async def send_text(self, group_id: str, content: str) -> None:
+        await self.ensure_connected()
+        entity = await self.resolve_entity(group_id)
+        await self.client.send_message(entity, content)
 
-        promo_msg = random.choice(promo_messages)
-        await client.send_message(bot_username, promo_msg)
-        logger.info(f"[{bot_username}] Sent promotion message")
-        
-        stop_delay = random.randint(*config.get("stop_delay", (5, 8)))
-        await asyncio.sleep(stop_delay)
-        
-        await client.send_message(bot_username, config["stop_cmd"])
-        logger.info(f"[{bot_username}] Sent stop command")
-        
-        restart_delay = random.randint(*config.get("restart_delay", (3, 6)))
-        await asyncio.sleep(restart_delay)
-        
-        state_manager.increment_count(bot_username)
-        count = state_manager.get_state(bot_username).get("count", 0)
-        logger.info(f"[{bot_username}] Incremented count to {count}")
-        
-        await client.send_message(bot_username, config["start_cmd"])
-        logger.info(f"[{bot_username}] Sent start command to continue")
-
-
-async def start_automation():
-    try:
-        ensure_connected()
-        
-        if not client.is_connected():
-            logger.warning("Client not connected, attempting to start...")
-            await client.start()
-        
-        print("✅ Telethon client started")
-        logger.info("Telethon client started successfully")
-        
-        bots = get_all_bots().copy()
-        for bot_username in list(bots.keys()):
-            if state_manager.is_enabled(bot_username):
-                logger.info(f"Starting automation for @{bot_username}")
-                try:
-                    await client.send_message(bot_username, bots[bot_username]["start_cmd"])
-                except Exception as e:
-                    logger.error(f"Failed to send to {bot_username}: {e}")
-    except Exception as e:
-        logger.error(f"Failed to start automation: {e}")
-        raise
+    async def send_saved_payload(self, target: str, message: dict) -> None:
+        await self.ensure_connected()
+        entity = await self.resolve_entity(target)
+        media_type = message.get("media_type")
+        media_file_id = message.get("media_file_id")
+        content = message.get("content", "")
+        if media_type and media_file_id:
+            await self.client.send_file(entity, media_file_id, caption=content)
+        else:
+            await self.client.send_message(entity, content)
 
 
-async def run_automation():
-    await start_automation()
-    while True:
-        try:
-            if client.is_connected():
-                await client.run_until_disconnected()
-            else:
-                logger.warning("Client disconnected, reconnecting...")
-                ensure_connected()
-                await asyncio.sleep(5)
-        except Exception as e:
-            logger.error(f"Reconnect error: {e}")
-            await asyncio.sleep(5)
+@dataclass
+class AutomationSnapshot:
+    group_index: int = 0
+    message_index: int = 0
 
 
-def run_in_background():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_automation())
-    except Exception as e:
-        logger.error(f"Automation error: {e}")
-    finally:
-        loop.close()
+class AutomationService:
+    def __init__(self, telegram: TelegramService) -> None:
+        self.telegram = telegram
+        self._running = False
+        self._paused = False
+        self._wake_event = asyncio.Event()
 
+    @property
+    def is_running(self) -> bool:
+        return self._running
 
-def run_in_thread():
-    automation_thread = threading.Thread(target=run_in_background, daemon=True)
-    automation_thread.start()
-    logger.info("Automation worker started in background thread")
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
 
+    def start(self) -> None:
+        self._running = True
+        self._paused = False
+        set_setting("automation_state", "RUNNING")
+        self._wake_event.set()
 
-async def stop_automation():
-    try:
-        bots = get_all_bots().copy()
-        for bot_username in list(bots.keys()):
-            if state_manager.is_enabled(bot_username):
-                await client.send_message(bot_username, bots[bot_username]["stop_cmd"])
-        await client.disconnect()
-        logger.info("Automation stopped gracefully")
-    except Exception as e:
-        logger.error(f"Error stopping automation: {e}")
+    def stop(self) -> None:
+        self._running = False
+        self._paused = False
+        set_setting("automation_state", "IDLE")
+        self._wake_event.set()
 
+    def pause(self) -> None:
+        self._running = True
+        self._paused = True
+        set_setting("automation_state", "PAUSED")
+        self._wake_event.set()
 
-async def send_command(bot_username: str, command: str):
-    try:
-        if not client.is_connected():
-            await client.connect()
-        await client.send_message(bot_username, command)
-        logger.info(f"Sent command {command} to {bot_username}")
-    except Exception as e:
-        logger.error(f"Failed to send command to {bot_username}: {e}")
+    def resume(self) -> None:
+        self._running = True
+        self._paused = False
+        set_setting("automation_state", "RUNNING")
+        self._wake_event.set()
 
+    def _load_snapshot(self) -> AutomationSnapshot:
+        return AutomationSnapshot(
+            group_index=int(get_setting("automation_group_index", 0) or 0),
+            message_index=int(get_setting("automation_message_index", 0) or 0),
+        )
 
-async def send_group_messages():
-    global last_group_sent_time
-    logger.info("Group messaging worker started")
-    while True:
-        try:
-            hour = datetime.datetime.now().hour
-            if 1 <= hour <= 7:
-                logger.info(f"Night hours ({hour}:00), sleeping...")
-                await asyncio.sleep(random.randint(300, 900))
+    def _save_snapshot(self, snapshot: AutomationSnapshot) -> None:
+        set_setting("automation_group_index", snapshot.group_index)
+        set_setting("automation_message_index", snapshot.message_index)
+
+    async def run_forever(self) -> None:
+        self._running = bool(get_setting("automation_running", False))
+        self._paused = bool(get_setting("automation_paused", False))
+        while True:
+            if not self._running:
+                self._wake_event.clear()
+                await self._wake_event.wait()
                 continue
-            
-            if state_manager.is_group_enabled():
-                settings = state_manager.get_group_settings()
-                if settings.get("enabled", False):
-                    if state_manager.should_stop_daily(limit=500):
-                        logger.warning("Daily group message limit reached, pausing for rest of day")
-                        await asyncio.sleep(3600)
-                        continue
-                    
-                    max_groups = settings.get("max_groups_per_cycle", 5)
-                    delay_range = settings.get("delay_range", (30, 90))
-                    
-                    selected_groups = state_manager.get_rotated_groups(max_groups)
-                    
-                    if selected_groups:
-                        logger.info(f"Group run: {len(selected_groups)} groups | Delay: {delay_range} sec | Safe mode: {settings.get('safe_mode', True)}")
-                        
-                        for group in selected_groups:
-                            if state_manager.should_stop_daily(limit=500):
-                                logger.warning("Daily limit reached during cycle")
-                                break
-                            
-                            if not state_manager.can_send_to_group(group, cooldown_seconds=300):
-                                logger.info(f"Skipping {group} - cooldown not passed")
-                                continue
-                            
-                            now = time.time()
-                            delay = random.randint(*MIN_GROUP_DELAY_RANGE)
-                            wait_time = delay - (now - last_group_sent_time)
-                            if wait_time > 0:
-                                await asyncio.sleep(wait_time)
-                            last_group_sent_time = time.time()
-                            
-                            try:
-                                await client.send_message(group, tweak_message(state_manager.get_next_message(promo_messages)))
-                                logger.info(f"Sent message to group: {group}")
-                                state_manager.update_group_sent(group)
-                                state_manager.increment_daily_count()
-                                
-                                daily = state_manager.get_daily_count()
-                                if daily < 50:
-                                    delay = random.randint(8, 15)
-                                elif daily < 200:
-                                    delay = random.randint(5, 10)
-                                else:
-                                    delay = random.randint(*delay_range)
-                                
-                                if random.randint(1, 10) == 1:
-                                    long_cooldown = random.randint(1800, 3600)
-                                    logger.info(f"Random long cooldown: {long_cooldown}s")
-                                    await asyncio.sleep(long_cooldown)
-                                else:
-                                    await asyncio.sleep(delay)
-                            except Exception as e:
-                                logger.error(f"Error sending to {group}: {e}")
-            await asyncio.sleep(300)
-        except Exception as e:
-            logger.error(f"Group messaging error: {e}")
-            await asyncio.sleep(60)
+
+            if self._paused:
+                self._wake_event.clear()
+                await self._wake_event.wait()
+                continue
+
+            groups = list_groups(enabled_only=True)
+            messages = list_messages()
+
+            if not groups or not messages:
+                logger.info("Automation paused because groups or messages are missing")
+                self._wake_event.clear()
+                try:
+                    await asyncio.wait_for(self._wake_event.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            snapshot = self._load_snapshot()
+            group = groups[snapshot.group_index % len(groups)]
+            message = messages[snapshot.message_index % len(messages)]
+
+            try:
+                if group.get("special_message"):
+                    await self.telegram.send_text(group["group_id"], group["special_message"])
+                else:
+                    await self.telegram.send_saved_message(group["group_id"], message)
+                update_group_runtime(group["group_id"], last_status="success", last_error="None")
+                set_setting("automation_last_execution_time", __import__("datetime").datetime.utcnow().isoformat())
+                logger.info(
+                    "Sent message %s to %s",
+                    message["id"],
+                    group["group_name"],
+                )
+            except Exception as exc:
+                update_group_runtime(group["group_id"], last_status="error", last_error=str(exc))
+                logger.exception("Failed to send automation message: %s", exc)
+                await asyncio.sleep(5)
+                continue
+
+            snapshot.group_index = (snapshot.group_index + 1) % len(groups)
+            if snapshot.group_index == 0:
+                snapshot.message_index = (snapshot.message_index + 1) % len(messages)
+            self._save_snapshot(snapshot)
+
+            delay_min = int(group.get("delay_min", message.get("delay_minutes", 1)) or 1)
+            delay_max = int(group.get("delay_max", delay_min) or delay_min)
+            if delay_max < delay_min:
+                delay_max = delay_min
+            delay_seconds = random.randint(delay_min, delay_max) * 60
+            self._wake_event.clear()
+            try:
+                await asyncio.wait_for(self._wake_event.wait(), timeout=delay_seconds)
+            except asyncio.TimeoutError:
+                pass
 
 
-def get_client():
-    return client
+telegram_service = TelegramService()
+automation_service = AutomationService(telegram_service)
+
+
+@telegram_service.client.on(events.NewMessage(incoming=True))
+async def handle_bot_automation(event) -> None:
+    try:
+        chat = await event.get_chat()
+        bot_username = getattr(chat, "username", None)
+        if not bot_username:
+            return
+
+        bots = get_bots()
+        bot = get_bot(bot_username) or bots.get(bot_username)
+        if not bot or not is_bot_enabled(bot_username, False):
+            return
+
+        text = (event.raw_text or "").lower()
+        security_triggers = [item.lower() for item in bot.get("security_triggers", [])]
+        if any(trigger in text for trigger in security_triggers):
+            set_bot_paused(bot_username, True)
+            logger.warning("Security trigger hit for %s", bot_username)
+            try:
+                from controller.controller import notify_security
+
+                await notify_security(bot_username)
+            except Exception:
+                logger.exception("Failed to notify security state for %s", bot_username)
+            return
+
+        if is_bot_paused(bot_username, False):
+            return
+
+        match_triggers = [item.lower() for item in (bot.get("match_triggers") or bot.get("triggers") or [])]
+        if not any(trigger in text for trigger in match_triggers):
+            return
+
+        after_match_delay = float(bot.get("after_match_delay", 1) or 0)
+        after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
+        messages = list_messages(active_only=False)
+
+        if after_match_delay:
+            await asyncio.sleep(after_match_delay)
+        if messages:
+            await telegram_service.send_saved_payload(bot_username, random.choice(messages))
+        stop_cmd = _normalize_command(bot.get("stop_cmd"))
+        if stop_cmd:
+            await telegram_service.client.send_message(bot_username, stop_cmd)
+
+        if after_chat_delay:
+            await asyncio.sleep(after_chat_delay)
+        start_cmd = _normalize_command(bot.get("start_cmd"))
+        if start_cmd and is_bot_enabled(bot_username, False):
+            await telegram_service.client.send_message(bot_username, start_cmd)
+            logger.info("Automation cycled for %s", bot_username)
+    except Exception:
+        logger.exception("Bot automation event handling failed")
+
+
+async def start_worker() -> None:
+    while True:
+        try:
+            await telegram_service.ensure_connected()
+            logger.info("Telegram user session connected")
+            for bot_name, config in get_bots().items():
+                start_cmd = _normalize_command(config.get("start_cmd"))
+                if is_bot_enabled(bot_name, False) and start_cmd:
+                    try:
+                        await telegram_service.client.send_message(bot_name, start_cmd)
+                    except Exception:
+                        logger.exception("Failed to start enabled bot %s", bot_name)
+            await telegram_service.client.run_until_disconnected()
+        except RuntimeError as exc:
+            logger.error("%s. Waiting for re-authorization...", exc)
+            await asyncio.sleep(30)
+        except Exception:
+            logger.exception("Worker crashed unexpectedly. Restarting shortly.")
+            await asyncio.sleep(10)
+
+
+async def start_group_worker() -> None:
+    while True:
+        try:
+            await telegram_service.ensure_connected()
+            await automation_service.run_forever()
+        except RuntimeError as exc:
+            logger.error("%s. Group automation is paused until the session is re-authorized.", exc)
+            await asyncio.sleep(30)
+        except Exception:
+            logger.exception("Group worker crashed unexpectedly. Restarting shortly.")
+            await asyncio.sleep(10)
+
+
+async def send_command(bot_username: str, command: str) -> None:
+    await telegram_service.ensure_connected()
+    normalized = _normalize_command(command)
+    if normalized:
+        await telegram_service.client.send_message(bot_username, normalized)
+
+
+def get_client() -> TelegramClient:
+    return telegram_service.client
