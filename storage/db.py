@@ -18,6 +18,7 @@ DB_PATH = BASE_DIR / "telegram_auto_reply.db"
 _LOCK = threading.RLock()
 _MONGO_CLIENT = None
 _MONGO_DB = None
+_UNSET = object()
 
 
 def _env(name: str, default: str = "") -> str:
@@ -67,6 +68,18 @@ def init_db() -> None:
                     group_id TEXT UNIQUE NOT NULL,
                     group_name TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'enabled',
+                    delay_min INTEGER NOT NULL DEFAULT 4,
+                    delay_max INTEGER NOT NULL DEFAULT 7,
+                    special_message TEXT,
+                    last_status TEXT,
+                    last_error TEXT,
+                    fail_count INTEGER NOT NULL DEFAULT 0,
+                    last_failed_at TEXT,
+                    cooldown_until TEXT,
+                    next_run_at TEXT,
+                    last_sent_at TEXT,
+                    active_start_hour INTEGER,
+                    active_end_hour INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
@@ -96,6 +109,30 @@ def init_db() -> None:
                 else:
                     conn.execute("ALTER TABLE groups ADD COLUMN group_name TEXT")
                     conn.execute("UPDATE groups SET group_name = COALESCE(group_name, group_id)")
+            if "fail_count" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0")
+            if "delay_min" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN delay_min INTEGER NOT NULL DEFAULT 4")
+            if "delay_max" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN delay_max INTEGER NOT NULL DEFAULT 7")
+            if "special_message" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN special_message TEXT")
+            if "last_status" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN last_status TEXT")
+            if "last_error" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN last_error TEXT")
+            if "last_failed_at" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN last_failed_at TEXT")
+            if "cooldown_until" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN cooldown_until TEXT")
+            if "next_run_at" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN next_run_at TEXT")
+            if "last_sent_at" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN last_sent_at TEXT")
+            if "active_start_hour" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN active_start_hour INTEGER")
+            if "active_end_hour" not in columns:
+                conn.execute("ALTER TABLE groups ADD COLUMN active_end_hour INTEGER")
             conn.commit()
 
 
@@ -123,14 +160,58 @@ def _sqlite_execute(query: str, params: tuple[Any, ...] = ()) -> int:
 def _sync_group_to_sqlite(group: dict[str, Any]) -> None:
     _sqlite_execute(
         """
-        INSERT INTO groups (group_id, group_name, status)
-        VALUES (?, ?, ?)
+        INSERT INTO groups (
+            group_id,
+            group_name,
+            status,
+            delay_min,
+            delay_max,
+            special_message,
+            last_status,
+            last_error,
+            fail_count,
+            last_failed_at,
+            cooldown_until,
+            next_run_at,
+            last_sent_at,
+            active_start_hour,
+            active_end_hour
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(group_id) DO UPDATE SET
             group_name=excluded.group_name,
             status=excluded.status,
+            delay_min=COALESCE(excluded.delay_min, groups.delay_min),
+            delay_max=COALESCE(excluded.delay_max, groups.delay_max),
+            special_message=COALESCE(excluded.special_message, groups.special_message),
+            last_status=COALESCE(excluded.last_status, groups.last_status),
+            last_error=COALESCE(excluded.last_error, groups.last_error),
+            fail_count=COALESCE(excluded.fail_count, groups.fail_count),
+            last_failed_at=COALESCE(excluded.last_failed_at, groups.last_failed_at),
+            cooldown_until=COALESCE(excluded.cooldown_until, groups.cooldown_until),
+            next_run_at=COALESCE(excluded.next_run_at, groups.next_run_at),
+            last_sent_at=COALESCE(excluded.last_sent_at, groups.last_sent_at),
+            active_start_hour=COALESCE(excluded.active_start_hour, groups.active_start_hour),
+            active_end_hour=COALESCE(excluded.active_end_hour, groups.active_end_hour),
             updated_at=CURRENT_TIMESTAMP
         """,
-        (str(group["group_id"]), group["group_name"], group["status"]),
+        (
+            str(group["group_id"]),
+            group["group_name"],
+            group["status"],
+            group.get("delay_min", 4),
+            group.get("delay_max", 7),
+            group.get("special_message"),
+            group.get("last_status"),
+            group.get("last_error"),
+            int(group.get("fail_count", 0) or 0),
+            group.get("last_failed_at"),
+            group.get("cooldown_until"),
+            group.get("next_run_at"),
+            group.get("last_sent_at"),
+            group.get("active_start_hour"),
+            group.get("active_end_hour"),
+        ),
     )
 
 
@@ -185,6 +266,13 @@ def add_group(group_id: str, group_name: str, status: str = "enabled") -> bool:
                     "delay_max": 7,
                     "created_at": now,
                     "last_error": None,
+                    "fail_count": 0,
+                    "last_failed_at": None,
+                    "cooldown_until": None,
+                    "next_run_at": None,
+                    "last_sent_at": None,
+                    "active_start_hour": None,
+                    "active_end_hour": None,
                 },
             },
             upsert=True,
@@ -210,6 +298,13 @@ def get_group(group_id: str) -> dict[str, Any] | None:
                 "special_message": doc.get("special_message"),
                 "last_status": doc.get("last_status") or doc.get("last_run_status") or "N/A",
                 "last_error": doc.get("last_error"),
+                "fail_count": int(doc.get("fail_count", 0) or 0),
+                "last_failed_at": doc.get("last_failed_at"),
+                "cooldown_until": doc.get("cooldown_until"),
+                "next_run_at": doc.get("next_run_at"),
+                "last_sent_at": doc.get("last_sent_at"),
+                "active_start_hour": doc.get("active_start_hour"),
+                "active_end_hour": doc.get("active_end_hour"),
             }
             _sync_group_to_sqlite(group)
             return group
@@ -231,6 +326,13 @@ def list_groups(enabled_only: bool = False) -> list[dict[str, Any]]:
                 "special_message": doc.get("special_message"),
                 "last_status": doc.get("last_status") or doc.get("last_run_status") or "N/A",
                 "last_error": doc.get("last_error"),
+                "fail_count": int(doc.get("fail_count", 0) or 0),
+                "last_failed_at": doc.get("last_failed_at"),
+                "cooldown_until": doc.get("cooldown_until"),
+                "next_run_at": doc.get("next_run_at"),
+                "last_sent_at": doc.get("last_sent_at"),
+                "active_start_hour": doc.get("active_start_hour"),
+                "active_end_hour": doc.get("active_end_hour"),
             }
             groups.append(group)
             _sync_group_to_sqlite(group)
@@ -266,7 +368,16 @@ def set_group_status(group_id: str, status: str) -> bool:
     )
 
 
-def update_group_runtime(group_id: str, last_status: str | None = None, last_error: str | None = None) -> bool:
+def update_group_runtime(
+    group_id: str,
+    last_status: str | None = None,
+    last_error: str | None = None,
+    fail_count: int | None = None,
+    last_failed_at: str | None = None,
+    cooldown_until: str | None | object = _UNSET,
+    next_run_at: str | None | object = _UNSET,
+    last_sent_at: str | None | object = _UNSET,
+) -> bool:
     mongo = _get_mongo_db()
     normalized_id = str(group_id)
     update_fields: dict[str, Any] = {"updated_at": datetime.utcnow()}
@@ -275,8 +386,46 @@ def update_group_runtime(group_id: str, last_status: str | None = None, last_err
         update_fields["last_run_status"] = last_status
     if last_error is not None:
         update_fields["last_error"] = last_error
+    if fail_count is not None:
+        update_fields["fail_count"] = int(fail_count)
+    if last_failed_at is not None:
+        update_fields["last_failed_at"] = last_failed_at
+    if cooldown_until is not _UNSET:
+        update_fields["cooldown_until"] = cooldown_until
+    if next_run_at is not _UNSET:
+        update_fields["next_run_at"] = next_run_at
+    if last_sent_at is not _UNSET:
+        update_fields["last_sent_at"] = last_sent_at
     if mongo is not None:
         mongo["groups"].update_one({"_id": normalized_id}, {"$set": update_fields})
+    sqlite_fields: list[str] = ["updated_at = CURRENT_TIMESTAMP"]
+    sqlite_params: list[Any] = []
+    if last_status is not None:
+        sqlite_fields.append("last_status = ?")
+        sqlite_params.append(last_status)
+    if last_error is not None:
+        sqlite_fields.append("last_error = ?")
+        sqlite_params.append(last_error)
+    if fail_count is not None:
+        sqlite_fields.append("fail_count = ?")
+        sqlite_params.append(int(fail_count))
+    if last_failed_at is not None:
+        sqlite_fields.append("last_failed_at = ?")
+        sqlite_params.append(last_failed_at)
+    if cooldown_until is not _UNSET:
+        sqlite_fields.append("cooldown_until = ?")
+        sqlite_params.append(cooldown_until)
+    if next_run_at is not _UNSET:
+        sqlite_fields.append("next_run_at = ?")
+        sqlite_params.append(next_run_at)
+    if last_sent_at is not _UNSET:
+        sqlite_fields.append("last_sent_at = ?")
+        sqlite_params.append(last_sent_at)
+    sqlite_params.append(normalized_id)
+    _sqlite_execute(
+        f"UPDATE groups SET {', '.join(sqlite_fields)} WHERE group_id = ?",
+        tuple(sqlite_params),
+    )
     return True
 
 
@@ -311,7 +460,48 @@ def update_group_delay(group_id: str, delay_min: int, delay_max: int) -> bool:
                 }
             },
         )
-    return True
+    return (
+        _sqlite_execute(
+            """
+            UPDATE groups
+            SET delay_min = ?, delay_max = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE group_id = ?
+            """,
+            (delay_min, delay_max, normalized_id),
+        )
+        >= 0
+    )
+
+
+def update_group_time_window(
+    group_id: str,
+    active_start_hour: int | None,
+    active_end_hour: int | None,
+) -> bool:
+    mongo = _get_mongo_db()
+    normalized_id = str(group_id)
+    if mongo is not None:
+        mongo["groups"].update_one(
+            {"_id": normalized_id},
+            {
+                "$set": {
+                    "active_start_hour": active_start_hour,
+                    "active_end_hour": active_end_hour,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+    return (
+        _sqlite_execute(
+            """
+            UPDATE groups
+            SET active_start_hour = ?, active_end_hour = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE group_id = ?
+            """,
+            (active_start_hour, active_end_hour, normalized_id),
+        )
+        >= 0
+    )
 
 
 def set_group_special_message(group_id: str, message: str) -> bool:
@@ -322,7 +512,17 @@ def set_group_special_message(group_id: str, message: str) -> bool:
             {"_id": normalized_id},
             {"$set": {"special_message": message, "updated_at": datetime.utcnow()}},
         )
-    return True
+    return (
+        _sqlite_execute(
+            """
+            UPDATE groups
+            SET special_message = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE group_id = ?
+            """,
+            (message, normalized_id),
+        )
+        >= 0
+    )
 
 
 def clear_group_special_message(group_id: str) -> bool:
@@ -333,7 +533,17 @@ def clear_group_special_message(group_id: str) -> bool:
             {"_id": normalized_id},
             {"$set": {"special_message": None, "updated_at": datetime.utcnow()}},
         )
-    return True
+    return (
+        _sqlite_execute(
+            """
+            UPDATE groups
+            SET special_message = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE group_id = ?
+            """,
+            (normalized_id,),
+        )
+        >= 0
+    )
 
 
 def add_message(
