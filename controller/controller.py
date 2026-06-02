@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import traceback
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telethon import utils as telethon_utils
@@ -47,6 +48,7 @@ from storage.db import (
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+STICKER_DIR = Path("stickers")
 
 ADD_GROUP_CHAT_ID = 100
 ADD_MESSAGE_CONTENT = 200
@@ -561,10 +563,35 @@ async def promotion_sticker_handler(update: Update, context: ContextTypes.DEFAUL
     if not update.message or not update.message.sticker:
         await update.message.reply_text("Please send a Telegram sticker.")
         return SET_PROMOTION_STICKER
-    sticker_file_id = update.message.sticker.file_id
+    sticker = update.message.sticker
+    sticker_file_id = sticker.file_id
+    sticker_unique_id = sticker.file_unique_id
+    sticker_type = "video" if getattr(sticker, "is_video", False) else "animated" if getattr(sticker, "is_animated", False) else "static"
     set_setting("promotion_sticker", sticker_file_id)
+    STICKER_DIR.mkdir(parents=True, exist_ok=True)
+    sticker_path = STICKER_DIR / "promotion.webp"
+    saved_path = None
+    if _application is None:
+        logger.warning("Promotion sticker upload skipped file download because application is unavailable")
+        set_setting("promotion_sticker_path", None)
+    else:
+        try:
+            tg_file = await _application.bot.get_file(sticker_file_id)
+            await tg_file.download_to_drive(custom_path=str(sticker_path))
+            set_setting("promotion_sticker_path", str(sticker_path))
+            saved_path = str(sticker_path)
+        except Exception:
+            logger.exception("Failed to download promotion sticker to %s", sticker_path)
+            set_setting("promotion_sticker_path", None)
+    logger.info(
+        "promotion_sticker uploaded file_id=%s unique_id=%s type=%s saved_path=%s",
+        sticker_file_id,
+        sticker_unique_id,
+        sticker_type,
+        saved_path,
+    )
     context.user_data.clear()
-    await update.message.reply_text("✅ Promotion sticker updated successfully.")
+    await update.message.reply_text("Promotion sticker updated successfully.")
     await update.message.reply_text(
         _promotion_settings_text(),
         reply_markup=_promotion_settings_keyboard(),
@@ -575,6 +602,7 @@ async def promotion_sticker_handler(update: Update, context: ContextTypes.DEFAUL
 async def promotion_sticker_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.callback_query.answer()
     set_setting("promotion_sticker", None)
+    set_setting("promotion_sticker_path", None)
     await _send_or_edit(update, "Promotion sticker removed.", _promotion_settings_keyboard())
 
 
@@ -1491,3 +1519,4 @@ async def start_controller() -> None:
         await _application.updater.stop()
         await _application.stop()
         await _application.shutdown()
+

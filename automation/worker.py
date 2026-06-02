@@ -208,12 +208,29 @@ class AutomationService:
         sticker = get_setting("promotion_sticker", None)
         return str(sticker) if sticker else None
 
+    @staticmethod
+    def _promotion_sticker_path() -> str | None:
+        sticker_path = get_setting("promotion_sticker_path", None)
+        return str(sticker_path) if sticker_path else None
+
     async def _send_promotion_sticker(self, target: str) -> bool:
         sticker_file_id = self._promotion_sticker()
-        if not sticker_file_id:
+        sticker_path = self._promotion_sticker_path()
+        path_exists = bool(sticker_path and os.path.exists(sticker_path))
+        logger.info(
+            "promotion_sticker send check promotion_sticker=%r promotion_sticker_path=%r exists=%s",
+            sticker_file_id,
+            sticker_path,
+            path_exists,
+        )
+        if not sticker_path:
+            logger.warning("Skipping promotion sticker send because promotion_sticker_path is missing")
+            return False
+        if not path_exists:
+            logger.warning("Skipping promotion sticker send because file does not exist: %s", sticker_path)
             return False
         try:
-            await self.telegram.send_sticker(target, sticker_file_id)
+            await self.telegram.send_sticker(target, sticker_path)
             return True
         except Exception:
             logger.exception("Failed to send promotion sticker to %s", target)

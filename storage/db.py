@@ -157,6 +157,14 @@ def init_db() -> None:
                 """,
                 (json.dumps(None),),
             )
+            conn.execute(
+                """
+                INSERT INTO settings (key, value)
+                VALUES ('promotion_sticker_path', ?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (json.dumps(None),),
+            )
             conn.commit()
 
 
