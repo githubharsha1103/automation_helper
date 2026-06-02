@@ -56,6 +56,7 @@ def _log_environment() -> None:
     for key in [
         "API_ID",
         "API_HASH",
+        "SESSION_STRING",
         "BOT_TOKEN",
         "CONTROL_BOT_TOKEN",
         "MONGO_URI",

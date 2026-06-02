@@ -55,6 +55,7 @@ class TelegramService:
         self.client: TelegramClient | None = None
         self._connect_lock = asyncio.Lock()
         self._configured = bool(API_ID and API_ID.isdigit() and API_HASH)
+        self._session_source = "env:SESSION_STRING" if SESSION_STRING else f"file:{SESSION_NAME}.session"
 
     def _ensure_client(self) -> TelegramClient:
         if self.client is None:
@@ -63,6 +64,7 @@ class TelegramService:
             if not API_HASH:
                 raise ValueError("API_HASH must be set")
             session = StringSession(SESSION_STRING) if SESSION_STRING else SESSION_NAME
+            logger.info("Using Telegram session source: %s", self._session_source)
             self.client = TelegramClient(session, int(API_ID), API_HASH)
         return self.client
 
