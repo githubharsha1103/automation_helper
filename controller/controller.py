@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import traceback
 
 from dotenv import load_dotenv
 from telethon import utils as telethon_utils
@@ -1376,6 +1377,8 @@ async def start_controller() -> None:
     if not TOKEN:
         raise ValueError("CONTROL_BOT_TOKEN is required")
 
+    print("[STARTUP] Building Telegram control application...")
+    logger.info("[STARTUP] Building Telegram control application...")
     _application = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -1465,9 +1468,21 @@ async def start_controller() -> None:
     _application.add_handler(CallbackQueryHandler(automation_resume, pattern="^automation:resume$"))
     _application.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
 
-    await _application.initialize()
-    await _application.start()
-    await _application.updater.start_polling()
+    try:
+        print("[STARTUP] Initializing Telegram control application...")
+        logger.info("[STARTUP] Initializing Telegram control application...")
+        await _application.initialize()
+        print("[STARTUP] Starting Telegram control application...")
+        logger.info("[STARTUP] Starting Telegram control application...")
+        await _application.start()
+        print("[STARTUP] Starting Telegram polling...")
+        logger.info("[STARTUP] Starting Telegram polling...")
+        await _application.updater.start_polling()
+    except Exception:
+        print("FATAL ERROR: Telegram controller failed to start")
+        print(traceback.format_exc())
+        logger.exception("Telegram controller failed to start")
+        raise
 
     try:
         while True:

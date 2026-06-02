@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -11,18 +12,20 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 
 
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name) or os.getenv(name.lower(), default)
+
+
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "telegram_auto_reply.db"
+DB_PATH = Path(_env("DATABASE_PATH", str(BASE_DIR / "telegram_auto_reply.db"))).expanduser()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 _LOCK = threading.RLock()
 _MONGO_CLIENT = None
 _MONGO_DB = None
 _UNSET = object()
-
-
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name) or os.getenv(name.lower(), default)
 
 
 def _connect() -> sqlite3.Connection:
@@ -38,14 +41,18 @@ def _get_mongo_db():
 
     uri = _env("MONGO_URI")
     if not uri:
+        logger.info("MONGO_URI not set; using local SQLite only")
         return None
 
     try:
+        logger.info("Connecting to MongoDB...")
         _MONGO_CLIENT = MongoClient(uri, serverSelectionTimeoutMS=10000)
         _MONGO_CLIENT.admin.command("ping")
         _MONGO_DB = _MONGO_CLIENT["telegram_automation"]
+        logger.info("MongoDB connection established")
         return _MONGO_DB
     except Exception:
+        logger.exception("MongoDB connection failed; falling back to SQLite")
         _MONGO_CLIENT = None
         _MONGO_DB = None
         return None
@@ -53,6 +60,7 @@ def _get_mongo_db():
 
 def init_db() -> None:
     with _LOCK:
+        logger.info("Initializing SQLite database at %s", DB_PATH)
         with _connect() as conn:
             conn.executescript(
                 """
@@ -795,6 +803,3 @@ def delete_bot(bot_name: str) -> bool:
     delete_setting(f"bot_enabled_{bot_name}")
     delete_setting(f"bot_paused_{bot_name}")
     return _sqlite_execute("DELETE FROM bots WHERE bot_name = ?", (bot_name,)) >= 0
-
-
-init_db()

@@ -52,48 +52,60 @@ GROUP_LOOP_POLL_SECONDS = 2
 
 class TelegramService:
     def __init__(self) -> None:
-        if not API_ID or not API_ID.isdigit():
-            raise ValueError("API_ID must be set to a numeric value")
-        if not API_HASH:
-            raise ValueError("API_HASH must be set")
-        session = StringSession(SESSION_STRING) if SESSION_STRING else SESSION_NAME
-        self.client = TelegramClient(session, int(API_ID), API_HASH)
+        self.client: TelegramClient | None = None
         self._connect_lock = asyncio.Lock()
+        self._configured = bool(API_ID and API_ID.isdigit() and API_HASH)
+
+    def _ensure_client(self) -> TelegramClient:
+        if self.client is None:
+            if not API_ID or not API_ID.isdigit():
+                raise ValueError("API_ID must be set to a numeric value")
+            if not API_HASH:
+                raise ValueError("API_HASH must be set")
+            session = StringSession(SESSION_STRING) if SESSION_STRING else SESSION_NAME
+            self.client = TelegramClient(session, int(API_ID), API_HASH)
+        return self.client
 
     async def ensure_connected(self) -> None:
+        client = self._ensure_client()
         async with self._connect_lock:
-            if not self.client.is_connected():
-                await self.client.connect()
-            if not await self.client.is_user_authorized():
+            if not client.is_connected():
+                await client.connect()
+            if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
 
     async def is_authorized(self) -> bool:
+        client = self._ensure_client()
         async with self._connect_lock:
-            if not self.client.is_connected():
-                await self.client.connect()
-            return await self.client.is_user_authorized()
+            if not client.is_connected():
+                await client.connect()
+            return await client.is_user_authorized()
 
     async def ensure_authorized_session(self) -> None:
+        if not self._configured:
+            raise RuntimeError("Telegram credentials are not configured")
+        client = self._ensure_client()
         async with self._connect_lock:
-            if not self.client.is_connected():
-                await self.client.connect()
+            if not client.is_connected():
+                await client.connect()
 
-            if await self.client.is_user_authorized():
+            if await client.is_user_authorized():
                 return
 
             logger.warning(
                 "Telegram session is missing or unauthorized. Starting interactive login in this terminal."
             )
-            await self.client.start()
+            await client.start()
 
-            if not await self.client.is_user_authorized():
+            if not await client.is_user_authorized():
                 raise RuntimeError("Telegram login did not complete successfully")
 
     async def resolve_entity(self, chat_ref: str):
+        client = self._ensure_client()
         await self.ensure_connected()
         if chat_ref.startswith("-100"):
-            return await self.client.get_entity(int(chat_ref))
-        return await self.client.get_entity(chat_ref)
+            return await client.get_entity(int(chat_ref))
+        return await client.get_entity(chat_ref)
 
     async def send_saved_message(self, group_id: str, message: dict) -> None:
         await self.ensure_connected()
@@ -103,14 +115,14 @@ class TelegramService:
         content = message["content"]
 
         if media_type and media_file_id:
-            await self.client.send_file(entity, media_file_id, caption=content)
+            await self._ensure_client().send_file(entity, media_file_id, caption=content)
         else:
-            await self.client.send_message(entity, content)
+            await self._ensure_client().send_message(entity, content)
 
     async def send_text(self, group_id: str, content: str) -> None:
         await self.ensure_connected()
         entity = await self.resolve_entity(group_id)
-        await self.client.send_message(entity, content)
+        await self._ensure_client().send_message(entity, content)
 
     async def send_saved_payload(self, target: str, message: dict) -> None:
         await self.ensure_connected()
@@ -119,14 +131,14 @@ class TelegramService:
         media_file_id = message.get("media_file_id")
         content = message.get("content", "")
         if media_type and media_file_id:
-            await self.client.send_file(entity, media_file_id, caption=content)
+            await self._ensure_client().send_file(entity, media_file_id, caption=content)
         else:
-            await self.client.send_message(entity, content)
+            await self._ensure_client().send_message(entity, content)
 
     async def send_sticker(self, target: str, sticker_file_id: str) -> None:
         await self.ensure_connected()
         entity = await self.resolve_entity(target)
-        await self.client.send_file(entity, sticker_file_id)
+        await self._ensure_client().send_file(entity, sticker_file_id)
 
 
 @dataclass
@@ -494,7 +506,6 @@ telegram_service = TelegramService()
 automation_service = AutomationService(telegram_service)
 
 
-@telegram_service.client.on(events.NewMessage(incoming=True))
 async def handle_bot_automation(event) -> None:
     try:
         chat = await event.get_chat()
@@ -570,15 +581,17 @@ async def start_worker() -> None:
     while True:
         try:
             await telegram_service.ensure_connected()
+            client = telegram_service._ensure_client()
+            client.add_event_handler(handle_bot_automation, events.NewMessage(incoming=True))
             logger.info("Telegram user session connected")
             for bot_name, config in get_bots().items():
                 start_cmd = _normalize_command(config.get("start_cmd"))
                 if is_bot_enabled(bot_name, False) and start_cmd:
                     try:
-                        await telegram_service.client.send_message(bot_name, start_cmd)
+                        await client.send_message(bot_name, start_cmd)
                     except Exception:
                         logger.exception("Failed to start enabled bot %s", bot_name)
-            await telegram_service.client.run_until_disconnected()
+            await client.run_until_disconnected()
         except RuntimeError as exc:
             logger.error("%s. Waiting for re-authorization...", exc)
             await asyncio.sleep(30)
