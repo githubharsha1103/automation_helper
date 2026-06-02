@@ -137,12 +137,6 @@ class TelegramService:
         else:
             await self._ensure_client().send_message(entity, content)
 
-    async def send_sticker(self, target: str, sticker_file_id: str) -> None:
-        await self.ensure_connected()
-        entity = await self.resolve_entity(target)
-        await self._ensure_client().send_file(entity, sticker_file_id)
-
-
 @dataclass
 class AutomationSnapshot:
     group_index: int = 0
@@ -204,25 +198,14 @@ class AutomationService:
         return mode if mode in {"message", "sticker", "both"} else "message"
 
     @staticmethod
-    def _promotion_sticker() -> str | None:
-        sticker = get_setting("promotion_sticker", None)
-        return str(sticker) if sticker else None
-
-    @staticmethod
     def _promotion_sticker_path() -> str | None:
         sticker_path = get_setting("promotion_sticker_path", None)
         return str(sticker_path) if sticker_path else None
 
     async def _send_promotion_sticker(self, target: str) -> bool:
-        sticker_file_id = self._promotion_sticker()
         sticker_path = self._promotion_sticker_path()
         path_exists = bool(sticker_path and os.path.exists(sticker_path))
-        logger.info(
-            "promotion_sticker send check promotion_sticker=%r promotion_sticker_path=%r exists=%s",
-            sticker_file_id,
-            sticker_path,
-            path_exists,
-        )
+        logger.info("PROMOTION STICKER CHECK: path=%s exists=%s", sticker_path, path_exists)
         if not sticker_path:
             logger.warning("Skipping promotion sticker send because promotion_sticker_path is missing")
             return False
@@ -230,22 +213,21 @@ class AutomationService:
             logger.warning("Skipping promotion sticker send because file does not exist: %s", sticker_path)
             return False
         try:
-            await self.telegram.send_sticker(target, sticker_path)
+            await self.telegram.ensure_connected()
+            entity = await self.telegram.resolve_entity(target)
+            await self.telegram._ensure_client().send_file(entity, sticker_path)
+            logger.info("PROMOTION STICKER SENT SUCCESSFULLY")
             return True
         except Exception:
-            logger.exception("Failed to send promotion sticker to %s", target)
+            logger.exception("PROMOTION STICKER SEND FAILED")
             return False
 
     async def _send_group_promotion(self, group: dict, message: dict) -> None:
         mode = self._promotion_mode()
-        sticker_available = bool(self._promotion_sticker())
-        if mode in {"sticker", "both"} and not sticker_available:
-            mode = "message"
-        if mode == "sticker":
-            await self._send_promotion_sticker(group["group_id"])
-            return
-        if mode == "both":
+        if mode in {"sticker", "both"}:
             sticker_sent = await self._send_promotion_sticker(group["group_id"])
+            if mode == "sticker":
+                return
             if sticker_sent:
                 await asyncio.sleep(1)
             if group.get("special_message"):
@@ -260,14 +242,10 @@ class AutomationService:
 
     async def _send_bot_promotion(self, bot_username: str, message: dict) -> None:
         mode = self._promotion_mode()
-        sticker_available = bool(self._promotion_sticker())
-        if mode in {"sticker", "both"} and not sticker_available:
-            mode = "message"
-        if mode == "sticker":
-            await self._send_promotion_sticker(bot_username)
-            return
-        if mode == "both":
+        if mode in {"sticker", "both"}:
             sticker_sent = await self._send_promotion_sticker(bot_username)
+            if mode == "sticker":
+                return
             if sticker_sent:
                 await asyncio.sleep(1)
             await self.telegram.send_saved_payload(bot_username, message)
@@ -561,10 +539,13 @@ async def handle_bot_automation(event) -> None:
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
         messages = list_messages(active_only=False)
         promotion_mode = str(get_setting("promotion_mode", "message") or "message").strip().lower()
-        promotion_sticker = get_setting("promotion_sticker", None)
+        promotion_sticker_path = get_setting("promotion_sticker_path", None)
+        path_exists = bool(promotion_sticker_path and os.path.exists(str(promotion_sticker_path)))
+        logger.info("PROMOTION STICKER CHECK: path=%s exists=%s", promotion_sticker_path, path_exists)
         if promotion_mode not in {"message", "sticker", "both"}:
             promotion_mode = "message"
-        if promotion_mode in {"sticker", "both"} and not promotion_sticker:
+        if promotion_mode in {"sticker", "both"} and not path_exists:
+            logger.warning("Skipping sticker send because promotion_sticker_path is missing or invalid")
             promotion_mode = "message"
 
         if after_match_delay:
@@ -573,9 +554,9 @@ async def handle_bot_automation(event) -> None:
             selected_message = random.choice(messages)
             try:
                 if promotion_mode == "sticker":
-                    await telegram_service.send_sticker(bot_username, str(promotion_sticker))
+                    await automation_service._send_promotion_sticker(bot_username)
                 elif promotion_mode == "both":
-                    await telegram_service.send_sticker(bot_username, str(promotion_sticker))
+                    await automation_service._send_promotion_sticker(bot_username)
                     await asyncio.sleep(1)
                     await telegram_service.send_saved_payload(bot_username, selected_message)
                 else:
