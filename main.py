@@ -1,12 +1,25 @@
 import asyncio
 import logging
 import os
+import sys
+import threading
 import traceback
 
-from automation.worker import telegram_service, start_group_worker, start_worker
-from controller.controller import TOKEN as CONTROL_BOT_TOKEN, start_controller
-from storage.db import init_db
-from web.server import run_flask_in_thread
+print("[BOOT] Starting main.py import sequence")
+
+try:
+    print("[BOOT] Importing automation.worker")
+    from automation.worker import telegram_service, start_group_worker, start_worker
+    print("[BOOT] Importing controller.controller")
+    from controller.controller import TOKEN as CONTROL_BOT_TOKEN, start_controller
+    print("[BOOT] Importing storage.db")
+    from storage.db import init_db
+    print("[BOOT] Importing web.server")
+    from web.server import run_flask_in_thread
+except Exception:
+    print("[BOOT] Import failure")
+    print(traceback.format_exc())
+    raise
 
 
 logging.basicConfig(
@@ -15,6 +28,22 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_global_exception_handlers() -> None:
+    def handle_uncaught_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        print("FATAL ERROR: Uncaught exception")
+        print("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+
+    def handle_thread_exception(args):
+        print(f"FATAL ERROR: Uncaught exception in thread {args.thread.name}")
+        print("".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+
+    sys.excepthook = handle_uncaught_exception
+    threading.excepthook = handle_thread_exception
 
 
 def _log_startup(step: str) -> None:
@@ -50,6 +79,7 @@ async def _run_named_task(name: str, coroutine) -> None:
 
 
 async def main() -> None:
+    _configure_global_exception_handlers()
     _log_environment()
     try:
         _log_startup("Initializing database")
