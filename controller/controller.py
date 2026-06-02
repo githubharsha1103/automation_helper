@@ -40,6 +40,7 @@ from storage.db import (
     set_setting,
     update_group_delay,
     update_group_name,
+    update_group_time_window,
 )
 
 load_dotenv()
@@ -53,6 +54,8 @@ DELETE_MESSAGE_PICK = 300
 EDIT_GROUP_NAME = 400
 EDIT_GROUP_DELAY = 401
 SET_GROUP_MESSAGE = 402
+EDIT_GROUP_TIME_START = 403
+EDIT_GROUP_TIME_END = 404
 ADD_BOT_USERNAME = 500
 ADD_BOT_START_CMD = 501
 ADD_BOT_STOP_CMD = 502
@@ -66,6 +69,7 @@ EDIT_BOT_MATCH_TRIGGERS = 509
 EDIT_BOT_SECURITY_TRIGGERS = 510
 EDIT_BOT_AFTER_MATCH_DELAY = 511
 EDIT_BOT_AFTER_CHAT_DELAY = 512
+SET_PROMOTION_STICKER = 600
 
 
 def _env(name: str, default: str = "") -> str:
@@ -149,6 +153,7 @@ def _automation_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Stop Automation", callback_data="automation:stop")],
             [InlineKeyboardButton("Pause", callback_data="automation:pause")],
             [InlineKeyboardButton("Resume", callback_data="automation:resume")],
+            [InlineKeyboardButton("Promotion Settings", callback_data="promotion:settings")],
             [InlineKeyboardButton("Back", callback_data="menu:main")],
         ]
     )
@@ -178,6 +183,18 @@ def _group_details_text(group: dict) -> str:
     special_message = group.get("special_message") or "None"
     last_status = group.get("last_status") or "N/A"
     last_error = group.get("last_error") or "None"
+    fail_count = group.get("fail_count", 0)
+    last_failed_at = group.get("last_failed_at") or "Never"
+    cooldown_until = group.get("cooldown_until") or "None"
+    last_sent_at = group.get("last_sent_at") or "Never"
+    next_run_at = group.get("next_run_at") or "Not Scheduled"
+    active_start_hour = group.get("active_start_hour")
+    active_end_hour = group.get("active_end_hour")
+    time_window = (
+        f"{active_start_hour} -> {active_end_hour}"
+        if active_start_hour is not None and active_end_hour is not None
+        else "Not Set"
+    )
     delay_min = group.get("delay_min", 4)
     delay_max = group.get("delay_max", 7)
     return (
@@ -186,9 +203,15 @@ def _group_details_text(group: dict) -> str:
         f"Group ID: {group.get('group_id', 'N/A')}\n"
         f"Status: {status}\n"
         f"Delay Range: {delay_min}-{delay_max} min\n"
+        f"Time Window: {time_window}\n"
         f"Special Message: {special_message}\n"
+        f"Last Sent Time: {last_sent_at}\n"
+        f"Next Run Time: {next_run_at}\n"
         f"Last Status: {last_status}\n"
-        f"Last Error: {last_error}"
+        f"Last Error: {last_error}\n"
+        f"Fail Count: {fail_count}\n"
+        f"Last Failed At: {last_failed_at}\n"
+        f"Cooldown Until: {cooldown_until}"
     )
 
 
@@ -200,12 +223,56 @@ def _group_details_keyboard(group_id: str, enabled: bool) -> InlineKeyboardMarku
                 InlineKeyboardButton("Edit Name", callback_data=f"group:edit_name:{group_id}"),
                 InlineKeyboardButton("Edit Delay", callback_data=f"group:edit_delay:{group_id}"),
             ],
+            [InlineKeyboardButton("Time Window Settings", callback_data=f"group:time_window:{group_id}")],
             [InlineKeyboardButton("Set Message", callback_data=f"group:set_message:{group_id}")],
             [InlineKeyboardButton("Clear Message", callback_data=f"group:clear_message:{group_id}")],
             [InlineKeyboardButton("Delete Group", callback_data=f"group:delete:{group_id}")],
             [InlineKeyboardButton("Back to List", callback_data="group:list")],
         ]
     )
+
+
+def _group_time_window_text(group: dict) -> str:
+    start = group.get("active_start_hour")
+    end = group.get("active_end_hour")
+    time_window = f"{start} -> {end}" if start is not None and end is not None else "Not Set"
+    return (
+        "Time Window Settings\n\n"
+        f"Group: {group.get('group_name') or group.get('group_id')}\n"
+        f"Current Window: {time_window}\n\n"
+        "Choose what to update."
+    )
+
+
+def _group_time_window_keyboard(group_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Set Start Hour", callback_data=f"group:time_start:{group_id}")],
+            [InlineKeyboardButton("Set End Hour", callback_data=f"group:time_end:{group_id}")],
+            [InlineKeyboardButton("Clear Time Window", callback_data=f"group:time_clear:{group_id}")],
+            [InlineKeyboardButton("Back", callback_data=f"group:view:{group_id}")],
+        ]
+    )
+
+
+async def _render_group_details(update: Update, group_id: str) -> None:
+    group = get_group(group_id)
+    if not group:
+        await _send_or_edit(update, "Group not found", InlineKeyboardMarkup(_group_rows()))
+        return
+    await _send_or_edit(
+        update,
+        _group_details_text(group),
+        _group_details_keyboard(group_id, group["status"] == "enabled"),
+    )
+
+
+async def _render_group_time_window(update: Update, group_id: str) -> None:
+    group = get_group(group_id)
+    if not group:
+        await _send_or_edit(update, "Group not found", InlineKeyboardMarkup(_group_rows()))
+        return
+    await _send_or_edit(update, _group_time_window_text(group), _group_time_window_keyboard(group_id))
 
 
 def _message_rows() -> list[list[InlineKeyboardButton]]:
@@ -242,10 +309,20 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
     runtime_state = "RUNNING" if enabled and not paused else "IDLE"
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
+    promotion_mode = get_setting("promotion_mode", "message") or "message"
+    promotion_sticker = get_setting("promotion_sticker", None)
+    sticker_configured = "Yes" if promotion_sticker else "No"
+    mode_label = {
+        "message": "Message",
+        "sticker": "Sticker",
+        "both": "Message + Sticker",
+    }.get(str(promotion_mode), "Message")
     return (
         f"Bot: {bot_name}\n"
         f"Status: {'ON' if enabled else 'OFF'}\n"
         f"Runtime state: {runtime_state}\n"
+        f"Promotion Mode: {mode_label}\n"
+        f"Sticker Configured: {sticker_configured}\n"
         f"Paused: {'Yes' if paused else 'No'}\n"
         f"Start cmd: {bot.get('start_cmd', '-')}\n"
         f"Stop cmd: {bot.get('stop_cmd', '-')}\n"
@@ -353,13 +430,72 @@ def _automation_status_text() -> str:
     messages_count = len(list_messages())
     active_bots = sum(1 for name in get_bots() if is_bot_enabled(name, False))
     last_execution_time = get_setting("automation_last_execution_time", "Never")
+    promotion_mode = get_setting("promotion_mode", "message") or "message"
+    promotion_sticker = get_setting("promotion_sticker", None)
+    mode_label = {
+        "message": "Message",
+        "sticker": "Sticker",
+        "both": "Message + Sticker",
+    }.get(str(promotion_mode), "Message")
     return (
         f"Automation is {'running' if state == 'RUNNING' else 'paused' if state == 'PAUSED' else 'idle'}\n"
         f"Runtime state: {state}\n"
+        f"Promotion Mode: {mode_label}\n"
+        f"Sticker Configured: {'Yes' if promotion_sticker else 'No'}\n"
         f"Enabled groups: {enabled_groups}\n"
         f"Active messages: {messages_count}\n"
         f"Active bot count: {active_bots}\n"
         f"Last execution time: {last_execution_time}"
+    )
+
+
+def _promotion_mode_label(mode: str | None) -> str:
+    return {
+        "message": "Message",
+        "sticker": "Sticker",
+        "both": "Message + Sticker",
+    }.get(str(mode or "message"), "Message")
+
+
+def _promotion_settings_text() -> str:
+    mode = get_setting("promotion_mode", "message") or "message"
+    sticker = get_setting("promotion_sticker", None)
+    return (
+        "Promotion Settings\n\n"
+        f"Current Mode: {mode}\n"
+        f"Sticker Configured: {'Yes' if sticker else 'No'}\n\n"
+        "Choose an option."
+    )
+
+
+def _promotion_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Promotion Mode", callback_data="promotion:mode")],
+            [InlineKeyboardButton("Set Promotion Sticker", callback_data="promotion:set_sticker")],
+            [InlineKeyboardButton("Remove Sticker", callback_data="promotion:remove_sticker")],
+            [InlineKeyboardButton("Back", callback_data="menu:automation")],
+        ]
+    )
+
+
+def _promotion_mode_text() -> str:
+    mode = get_setting("promotion_mode", "message") or "message"
+    return (
+        "Promotion Mode\n\n"
+        f"Current Mode: {mode}\n\n"
+        "Choose Promotion Type"
+    )
+
+
+def _promotion_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Message", callback_data="promotion:mode:message")],
+            [InlineKeyboardButton("Sticker", callback_data="promotion:mode:sticker")],
+            [InlineKeyboardButton("Message + Sticker", callback_data="promotion:mode:both")],
+            [InlineKeyboardButton("Back", callback_data="promotion:settings")],
+        ]
     )
 
 
@@ -388,6 +524,62 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _send_or_edit(update, "Message management", _messages_menu())
     elif action == "menu:automation":
         await _send_or_edit(update, _automation_status_text(), _automation_menu())
+
+
+async def promotion_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
+    await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
+
+
+async def promotion_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
+    await _send_or_edit(update, _promotion_mode_text(), _promotion_mode_keyboard())
+
+
+async def promotion_mode_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split(":", 2)[2]
+    set_setting("promotion_mode", mode)
+    await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
+
+
+async def promotion_sticker_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
+    context.user_data.clear()
+    context.user_data["promotion_sticker_flow"] = True
+    await _send_or_edit(
+        update,
+        "Send me one sticker to use for promotions.\n\nPress Cancel to abort.",
+        _cancel_menu(),
+    )
+    return SET_PROMOTION_STICKER
+
+
+async def promotion_sticker_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.sticker:
+        await update.message.reply_text("Please send a Telegram sticker.")
+        return SET_PROMOTION_STICKER
+    sticker_file_id = update.message.sticker.file_id
+    set_setting("promotion_sticker", sticker_file_id)
+    context.user_data.clear()
+    await update.message.reply_text("✅ Promotion sticker updated successfully.")
+    await update.message.reply_text(
+        _promotion_settings_text(),
+        reply_markup=_promotion_settings_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def promotion_sticker_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
+    set_setting("promotion_sticker", None)
+    await _send_or_edit(update, "Promotion sticker removed.", _promotion_settings_keyboard())
+
+
+async def promotion_settings_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
+    await _send_or_edit(update, _automation_status_text(), _automation_menu())
 
 
 async def list_groups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -737,15 +929,7 @@ async def view_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     group_id = query.data.split(":", 2)[2]
-    group = get_group(group_id)
-    if not group:
-        await _send_or_edit(update, "Group not found", InlineKeyboardMarkup(_group_rows()))
-        return
-    await _send_or_edit(
-        update,
-        _group_details_text(group),
-        _group_details_keyboard(group_id, group["status"] == "enabled"),
-    )
+    await _render_group_details(update, group_id)
 
 
 async def toggle_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -761,12 +945,7 @@ async def toggle_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if new_status == "enabled":
         automation_service.start()
         set_setting("automation_running", True)
-    refreshed = get_group(group_id)
-    await _send_or_edit(
-        update,
-        _group_details_text(refreshed),
-        _group_details_keyboard(group_id, refreshed["status"] == "enabled"),
-    )
+    await _render_group_details(update, group_id)
 
 
 async def delete_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -840,6 +1019,88 @@ async def group_edit_delay_handler(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
+async def group_time_window_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    group_id = query.data.split(":", 2)[2]
+    context.user_data.clear()
+    context.user_data["edit_group_id"] = group_id
+    context.user_data["group_back_view"] = "time_window"
+    await _render_group_time_window(update, group_id)
+
+
+async def group_time_start_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    group_id = query.data.split(":", 2)[2]
+    context.user_data.clear()
+    context.user_data["edit_group_id"] = group_id
+    context.user_data["group_back_view"] = "time_window"
+    await _send_or_edit(update, "Send the start hour from 0 to 23.", _cancel_menu())
+    return EDIT_GROUP_TIME_START
+
+
+async def group_time_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    group_id = context.user_data.get("edit_group_id")
+    if not group_id:
+        return ConversationHandler.END
+    try:
+        start_hour = int(update.message.text.strip())
+        if start_hour < 0 or start_hour > 23:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Start hour must be a number from 0 to 23.")
+        return EDIT_GROUP_TIME_START
+    group = get_group(group_id) or {}
+    update_group_time_window(group_id, start_hour, group.get("active_end_hour"))
+    context.user_data["group_back_view"] = "time_window"
+    await update.message.reply_text("Start hour saved.")
+    await _render_group_time_window(update, group_id)
+    return ConversationHandler.END
+
+
+async def group_time_end_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    group_id = query.data.split(":", 2)[2]
+    context.user_data.clear()
+    context.user_data["edit_group_id"] = group_id
+    context.user_data["group_back_view"] = "time_window"
+    await _send_or_edit(update, "Send the end hour from 0 to 23.", _cancel_menu())
+    return EDIT_GROUP_TIME_END
+
+
+async def group_time_end_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    group_id = context.user_data.get("edit_group_id")
+    if not group_id:
+        return ConversationHandler.END
+    try:
+        end_hour = int(update.message.text.strip())
+        if end_hour < 0 or end_hour > 23:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("End hour must be a number from 0 to 23.")
+        return EDIT_GROUP_TIME_END
+    group = get_group(group_id) or {}
+    update_group_time_window(group_id, group.get("active_start_hour"), end_hour)
+    context.user_data["group_back_view"] = "time_window"
+    await update.message.reply_text("End hour saved.")
+    await _render_group_time_window(update, group_id)
+    return ConversationHandler.END
+
+
+async def group_time_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    group_id = query.data.split(":", 2)[2]
+    context.user_data.clear()
+    context.user_data["edit_group_id"] = group_id
+    context.user_data["group_back_view"] = "time_window"
+    update_group_time_window(group_id, None, None)
+    await _render_group_time_window(update, group_id)
+    return None
+
+
 async def group_set_message_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -873,12 +1134,7 @@ async def clear_group_message_callback(update: Update, context: ContextTypes.DEF
     await query.answer()
     group_id = query.data.split(":", 2)[2]
     clear_group_special_message(group_id)
-    group = get_group(group_id)
-    await _send_or_edit(
-        update,
-        _group_details_text(group),
-        _group_details_keyboard(group_id, group["status"] == "enabled"),
-    )
+    await _render_group_details(update, group_id)
 
 
 async def add_group_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1090,19 +1346,23 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.callback_query.answer()
     bot_name = context.user_data.get("edit_bot_name")
     group_id = context.user_data.get("edit_group_id")
+    group_back_view = context.user_data.get("group_back_view")
+    promotion_sticker_flow = context.user_data.get("promotion_sticker_flow")
     context.user_data.clear()
     if bot_name:
         await _render_bot_settings(update, bot_name)
         return ConversationHandler.END
     if group_id:
         group = get_group(group_id)
-        if group:
-            await _send_or_edit(
-                update,
-                _group_details_text(group),
-                _group_details_keyboard(group_id, group["status"] == "enabled"),
-            )
+        if group and group_back_view == "time_window":
+            await _render_group_time_window(update, group_id)
             return ConversationHandler.END
+        if group:
+            await _render_group_details(update, group_id)
+            return ConversationHandler.END
+    if promotion_sticker_flow:
+        await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
+        return ConversationHandler.END
     await _send_or_edit(update, "Cancelled.", _main_menu())
     return ConversationHandler.END
 
@@ -1126,12 +1386,19 @@ async def start_controller() -> None:
             CallbackQueryHandler(group_edit_name_entry, pattern="^group:edit_name:"),
             CallbackQueryHandler(group_edit_delay_entry, pattern="^group:edit_delay:"),
             CallbackQueryHandler(group_set_message_entry, pattern="^group:set_message:"),
+            CallbackQueryHandler(group_time_start_entry, pattern="^group:time_start:"),
+            CallbackQueryHandler(group_time_end_entry, pattern="^group:time_end:"),
             CallbackQueryHandler(bot_settings_start_cmd_entry, pattern="^botcfg:start:"),
             CallbackQueryHandler(bot_settings_stop_cmd_entry, pattern="^botcfg:stop:"),
             CallbackQueryHandler(bot_settings_match_entry, pattern="^botcfg:match:"),
             CallbackQueryHandler(bot_settings_security_entry, pattern="^botcfg:security:"),
             CallbackQueryHandler(bot_settings_after_match_entry, pattern="^botcfg:after_match:"),
             CallbackQueryHandler(bot_settings_after_chat_entry, pattern="^botcfg:after_chat:"),
+            CallbackQueryHandler(promotion_settings_callback, pattern="^promotion:settings$"),
+            CallbackQueryHandler(promotion_mode_callback, pattern="^promotion:mode$"),
+            CallbackQueryHandler(promotion_mode_set_callback, pattern="^promotion:mode:"),
+            CallbackQueryHandler(promotion_sticker_entry, pattern="^promotion:set_sticker$"),
+            CallbackQueryHandler(promotion_sticker_remove_callback, pattern="^promotion:remove_sticker$"),
         ],
         states={
             ADD_GROUP_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_chat_id)],
@@ -1159,6 +1426,9 @@ async def start_controller() -> None:
             EDIT_GROUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_name_handler)],
             EDIT_GROUP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_delay_handler)],
             SET_GROUP_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_set_message_handler)],
+            EDIT_GROUP_TIME_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_start_handler)],
+            EDIT_GROUP_TIME_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_end_handler)],
+            SET_PROMOTION_STICKER: [MessageHandler(filters.ALL & ~filters.COMMAND, promotion_sticker_handler)],
         },
         fallbacks=[
             CallbackQueryHandler(cancel_callback, pattern="^nav:cancel$"),
@@ -1181,6 +1451,8 @@ async def start_controller() -> None:
     _application.add_handler(CallbackQueryHandler(list_groups_callback, pattern="^group:list$"))
     _application.add_handler(CallbackQueryHandler(view_group_callback, pattern="^group:view:"))
     _application.add_handler(CallbackQueryHandler(toggle_group_callback, pattern="^group:toggle:"))
+    _application.add_handler(CallbackQueryHandler(group_time_window_menu, pattern="^group:time_window:"))
+    _application.add_handler(CallbackQueryHandler(group_time_clear_callback, pattern="^group:time_clear:"))
     _application.add_handler(CallbackQueryHandler(clear_group_message_callback, pattern="^group:clear_message:"))
     _application.add_handler(CallbackQueryHandler(delete_group_callback, pattern="^group:delete:"))
     _application.add_handler(CallbackQueryHandler(messages_list_callback, pattern="^message:list$"))

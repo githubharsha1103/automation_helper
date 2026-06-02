@@ -26,7 +26,8 @@ def run_server(host="0.0.0.0", port=5000):
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
-def run_in_background():
-    server_thread = threading.Thread(target=run_server, daemon=True)
+def run_flask_in_thread(host="0.0.0.0", port=5000):
+    server_thread = threading.Thread(target=run_server, args=(host, port), daemon=True)
     server_thread.start()
     logger.info("Flask server started in background thread")
+    return server_thread

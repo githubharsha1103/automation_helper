@@ -133,6 +133,22 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE groups ADD COLUMN active_start_hour INTEGER")
             if "active_end_hour" not in columns:
                 conn.execute("ALTER TABLE groups ADD COLUMN active_end_hour INTEGER")
+            conn.execute(
+                """
+                INSERT INTO settings (key, value)
+                VALUES ('promotion_mode', ?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (json.dumps("message"),),
+            )
+            conn.execute(
+                """
+                INSERT INTO settings (key, value)
+                VALUES ('promotion_sticker', ?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (json.dumps(None),),
+            )
             conn.commit()
 
 
