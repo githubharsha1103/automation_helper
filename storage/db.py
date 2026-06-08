@@ -171,13 +171,10 @@ def init_db() -> None:
     db["settings"].update_one({"_id": "promotion_mode"}, {"$setOnInsert": {"value": "message"}}, upsert=True)
     db["settings"].update_one({"_id": "promotion_sticker"}, {"$setOnInsert": {"value": None}}, upsert=True)
     db["settings"].update_one({"_id": "promotion_sticker_path"}, {"$setOnInsert": {"value": None}}, upsert=True)
-    db["bots"].create_index("_id", unique=True)
-    db["groups"].create_index("_id", unique=True)
     db["groups"].create_index([("status", 1), ("updated_at", 1)])
     db["groups"].create_index([("status", 1), ("next_run_at", 1)])
     db["groups"].create_index([("status", 1), ("cooldown_until", 1)])
     db["messages"].create_index([("is_active", 1), ("id", 1)])
-    db["messages"].create_index([("id", 1)], unique=True)
 
 
 def _settings_value(doc: dict[str, Any] | None, default: Any) -> Any:
