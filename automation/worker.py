@@ -364,7 +364,7 @@ class AutomationService:
         asset_channel = self._promotion_asset_channel()
         sticker_message_id = self._promotion_sticker_message_id()
         if not asset_channel or not sticker_message_id:
-            logger.info("ASSET STICKER FORWARD FAILED target=%s reason=missing_asset_configuration", target)
+            logger.info("ASSET STICKER NOT CONFIGURED target=%s asset_channel=%s message_id=%s", target, asset_channel, sticker_message_id)
             record_operation(
                 "promotion_sticker",
                 (time.monotonic() - cycle_start) * 1000,
@@ -427,21 +427,7 @@ class AutomationService:
 
     async def _send_promotion_sticker(self, target: str) -> bool:
         asset_sent = await self._send_asset_sticker(target)
-        if asset_sent:
-            return True
-        legacy_sticker_file_id = get_setting("promotion_sticker", None)
-        if legacy_sticker_file_id:
-            try:
-                await self.telegram.ensure_connected()
-                entity = await self.telegram.resolve_entity(target)
-                logger.info("LEGACY PROMOTION STICKER FALLBACK START target=%s", target)
-                await self.telegram._ensure_client().send_file(entity, str(legacy_sticker_file_id))
-                logger.info("LEGACY PROMOTION STICKER FALLBACK SUCCESS target=%s", target)
-                return True
-            except Exception as exc:
-                logger.exception("LEGACY PROMOTION STICKER FALLBACK FAILED target=%s error=%s", target, exc)
-                return False
-        return False
+        return asset_sent
 
     async def _send_group_promotion(self, group: dict, message: dict) -> None:
         mode = self._promotion_mode()
@@ -801,14 +787,10 @@ async def handle_bot_automation(event) -> None:
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
         messages = await alist_messages(active_only=False)
         promotion_mode = str(await aget_setting("promotion_mode", "message") or "message").strip().lower()
-        promotion_sticker = await aget_setting("promotion_sticker", None)
-        promotion_sticker_path = await aget_setting("promotion_sticker_path", None)
-        path_exists = bool(promotion_sticker_path and os.path.exists(str(promotion_sticker_path)))
         logger.info(
-            "PROMOTION STICKER CHECK: file_id_exists=%s path=%s path_exists=%s",
-            bool(promotion_sticker),
-            promotion_sticker_path,
-            path_exists,
+            "PROMOTION STICKER CHECK: asset_channel=%s sticker_message_id=%s",
+            get_promotion_asset_channel(),
+            get_promotion_sticker_message_id(),
         )
         if promotion_mode not in {"message", "sticker", "both"}:
             promotion_mode = "message"

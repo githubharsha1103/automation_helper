@@ -185,8 +185,6 @@ def _mongo_db():
 def init_db() -> None:
     db = _mongo_db()
     db["settings"].update_one({"_id": "promotion_mode"}, {"$setOnInsert": {"value": "message"}}, upsert=True)
-    db["settings"].update_one({"_id": "promotion_sticker"}, {"$setOnInsert": {"value": None}}, upsert=True)
-    db["settings"].update_one({"_id": "promotion_sticker_path"}, {"$setOnInsert": {"value": None}}, upsert=True)
     db["settings"].update_one({"_id": "promotion_asset_channel"}, {"$setOnInsert": {"value": None}}, upsert=True)
     db["settings"].update_one({"_id": "promotion_sticker_message_id"}, {"$setOnInsert": {"value": None}}, upsert=True)
     db["groups"].create_index([("status", 1), ("updated_at", 1)])
