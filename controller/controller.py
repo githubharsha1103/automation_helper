@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telethon import utils as telethon_utils
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -106,6 +107,17 @@ async def _send_or_edit(
             return
     if update.message:
         await update.message.reply_text(text, reply_markup=reply_markup)
+
+
+async def _safe_callback_answer(query) -> None:
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        message = str(exc).lower()
+        if "query is too old" in message or "query id is invalid" in message:
+            logger.warning("Ignoring stale callback query: %s", exc)
+            return
+        raise
 
 
 def _main_menu() -> InlineKeyboardMarkup:
@@ -512,7 +524,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query:
-        await query.answer()
+        await _safe_callback_answer(query)
     if not _is_allowed(update):
         return
     action = query.data
@@ -530,25 +542,25 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def promotion_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
 
 
 async def promotion_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     await _send_or_edit(update, _promotion_mode_text(), _promotion_mode_keyboard())
 
 
 async def promotion_mode_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     mode = query.data.split(":", 2)[2]
     set_setting("promotion_mode", mode)
     await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
 
 
 async def promotion_sticker_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     context.user_data.clear()
     context.user_data["promotion_sticker_flow"] = True
     await _send_or_edit(
@@ -600,37 +612,37 @@ async def promotion_sticker_handler(update: Update, context: ContextTypes.DEFAUL
 
 
 async def promotion_sticker_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     set_setting("promotion_sticker", None)
     set_setting("promotion_sticker_path", None)
     await _send_or_edit(update, "Promotion sticker removed.", _promotion_settings_keyboard())
 
 
 async def promotion_settings_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     await _send_or_edit(update, _automation_status_text(), _automation_menu())
 
 
 async def list_groups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     await _send_or_edit(update, "Saved groups", InlineKeyboardMarkup(_group_rows()))
 
 
 async def list_bots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     await _send_or_edit(update, "Saved bots", InlineKeyboardMarkup(_bot_rows()))
 
 
 async def view_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     await _render_bot_details(update, bot_name)
 
 
 async def toggle_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     bot = get_bots().get(bot_name)
     if not bot:
@@ -658,7 +670,7 @@ async def toggle_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def delete_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     delete_bot(bot_name)
     await _send_or_edit(update, "Bot deleted", InlineKeyboardMarkup(_bot_rows()))
@@ -666,7 +678,7 @@ async def delete_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def edit_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     bot = get_bots().get(bot_name)
     if not bot:
@@ -677,7 +689,7 @@ async def edit_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def add_bot_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     context.user_data.clear()
     context.user_data["bot_flow_mode"] = "add"
     context.user_data["bot_config"] = {}
@@ -787,7 +799,7 @@ def _get_bot_or_end(context: ContextTypes.DEFAULT_TYPE) -> str | None:
 
 async def bot_settings_start_cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_bot_name"] = bot_name
@@ -814,7 +826,7 @@ async def bot_settings_start_cmd_handler(update: Update, context: ContextTypes.D
 
 async def bot_settings_stop_cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_bot_name"] = bot_name
@@ -841,7 +853,7 @@ async def bot_settings_stop_cmd_handler(update: Update, context: ContextTypes.DE
 
 async def bot_settings_match_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_bot_name"] = bot_name
@@ -869,7 +881,7 @@ async def bot_settings_match_handler(update: Update, context: ContextTypes.DEFAU
 
 async def bot_settings_security_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_bot_name"] = bot_name
@@ -896,7 +908,7 @@ async def bot_settings_security_handler(update: Update, context: ContextTypes.DE
 
 async def bot_settings_after_match_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_bot_name"] = bot_name
@@ -926,7 +938,7 @@ async def bot_settings_after_match_handler(update: Update, context: ContextTypes
 
 async def bot_settings_after_chat_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_bot_name"] = bot_name
@@ -956,14 +968,14 @@ async def bot_settings_after_chat_handler(update: Update, context: ContextTypes.
 
 async def view_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     await _render_group_details(update, group_id)
 
 
 async def toggle_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     group = get_group(group_id)
     if not group:
@@ -979,7 +991,7 @@ async def toggle_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def delete_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     delete_group(group_id)
     await _send_or_edit(update, "Group deleted", InlineKeyboardMarkup(_group_rows()))
@@ -987,7 +999,7 @@ async def delete_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def group_edit_name_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_group_id"] = group_id
@@ -1015,7 +1027,7 @@ async def group_edit_name_handler(update: Update, context: ContextTypes.DEFAULT_
 
 async def group_edit_delay_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_group_id"] = group_id
@@ -1050,7 +1062,7 @@ async def group_edit_delay_handler(update: Update, context: ContextTypes.DEFAULT
 
 async def group_time_window_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_group_id"] = group_id
@@ -1060,7 +1072,7 @@ async def group_time_window_menu(update: Update, context: ContextTypes.DEFAULT_T
 
 async def group_time_start_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_group_id"] = group_id
@@ -1090,7 +1102,7 @@ async def group_time_start_handler(update: Update, context: ContextTypes.DEFAULT
 
 async def group_time_end_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_group_id"] = group_id
@@ -1120,7 +1132,7 @@ async def group_time_end_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 async def group_time_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_group_id"] = group_id
@@ -1132,7 +1144,7 @@ async def group_time_clear_callback(update: Update, context: ContextTypes.DEFAUL
 
 async def group_set_message_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     context.user_data.clear()
     context.user_data["edit_group_id"] = group_id
@@ -1160,14 +1172,14 @@ async def group_set_message_handler(update: Update, context: ContextTypes.DEFAUL
 
 async def clear_group_message_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     group_id = query.data.split(":", 2)[2]
     clear_group_special_message(group_id)
     await _render_group_details(update, group_id)
 
 
 async def add_group_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     context.user_data.clear()
     await _send_or_edit(
         update,
@@ -1199,13 +1211,13 @@ async def add_group_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def messages_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     await _send_or_edit(update, "Saved messages", InlineKeyboardMarkup(_message_rows()))
 
 
 async def message_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     message_id = int(query.data.split(":", 2)[2])
     message = get_message(message_id)
     if not message:
@@ -1228,7 +1240,7 @@ async def message_view_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def add_message_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     context.user_data.clear()
     await _send_or_edit(
         update,
@@ -1291,7 +1303,7 @@ async def add_message_delay(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def delete_message_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     rows = []
     for message in list_messages(active_only=False):
         rows.append(
@@ -1304,14 +1316,14 @@ async def delete_message_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def delete_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     message_id = int(query.data.split(":", 3)[3])
     delete_message(message_id)
     await _send_or_edit(update, "Message deleted", InlineKeyboardMarkup(_message_rows()))
 
 
 async def automation_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     automation_service.start()
     set_setting("automation_running", True)
     set_setting("automation_paused", False)
@@ -1319,7 +1331,7 @@ async def automation_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def automation_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     automation_service.stop()
     set_setting("automation_running", False)
     set_setting("automation_paused", False)
@@ -1327,7 +1339,7 @@ async def automation_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def automation_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     automation_service.pause()
     set_setting("automation_running", True)
     set_setting("automation_paused", True)
@@ -1335,7 +1347,7 @@ async def automation_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def automation_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
     automation_service.resume()
     set_setting("automation_running", True)
     set_setting("automation_paused", False)
@@ -1357,7 +1369,7 @@ async def notify_security(bot_name: str) -> None:
 
 async def bypass_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     set_bot_paused(bot_name, False)
     bot = get_bots().get(bot_name)
@@ -1372,7 +1384,7 @@ async def bypass_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.callback_query:
-        await update.callback_query.answer()
+        await _safe_callback_answer(update.callback_query)
     bot_name = context.user_data.get("edit_bot_name")
     group_id = context.user_data.get("edit_group_id")
     group_back_view = context.user_data.get("group_back_view")
@@ -1397,7 +1409,7 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
+    await _safe_callback_answer(update.callback_query)
 
 
 async def start_controller() -> None:
@@ -1519,4 +1531,5 @@ async def start_controller() -> None:
         await _application.updater.stop()
         await _application.stop()
         await _application.shutdown()
+
 

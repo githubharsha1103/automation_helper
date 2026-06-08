@@ -2,6 +2,9 @@ import asyncio
 import logging
 import os
 import random
+import time
+from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -11,6 +14,17 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
 from storage.db import (
+    aget_bot,
+    aget_bots,
+    aget_setting,
+    alist_groups,
+    alist_messages,
+    aset_bot_paused,
+    aset_setting,
+    aupdate_group_runtime,
+    db_status,
+    record_operation,
+    telemetry_snapshot,
     get_bot,
     get_bots,
     get_setting,
@@ -26,6 +40,18 @@ from storage.db import (
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CycleMetrics:
+    groups: int = 0
+    bots: int = 0
+    dialogs: int = 0
+    messages_sent: int = 0
+    timings: list[tuple[str, float]] | None = None
+
+
+CURRENT_CYCLE: ContextVar[CycleMetrics | None] = ContextVar("CURRENT_CYCLE", default=None)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -51,11 +77,21 @@ GROUP_LOOP_POLL_SECONDS = 2
 
 
 class TelegramService:
+    ENTITY_CACHE_TTL_SECONDS = 1800
+    ENTITY_CACHE_MAXSIZE = 500
+
     def __init__(self) -> None:
         self.client: TelegramClient | None = None
         self._connect_lock = asyncio.Lock()
+        self._entity_cache: OrderedDict[str, tuple[float, object]] = OrderedDict()
         self._configured = bool(API_ID and API_ID.isdigit() and API_HASH)
         self._session_source = "env:SESSION_STRING" if SESSION_STRING else f"file:{SESSION_NAME}.session"
+        self.last_ensure_connected_ms = 0.0
+        self.last_resolve_entity_ms = 0.0
+        self.last_send_ms = 0.0
+        self.last_send_success = None
+        self.last_error: str | None = None
+        self.reconnect_count = 0
 
     def _ensure_client(self) -> TelegramClient:
         if self.client is None:
@@ -69,12 +105,26 @@ class TelegramService:
         return self.client
 
     async def ensure_connected(self) -> None:
+        start = time.monotonic()
         client = self._ensure_client()
         async with self._connect_lock:
+            reconnected = False
             if not client.is_connected():
                 await client.connect()
+                reconnected = True
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
+        elapsed_ms = (time.monotonic() - start) * 1000
+        self.last_ensure_connected_ms = elapsed_ms
+        if reconnected:
+            self.reconnect_count += 1
+            record_operation("telegram_reconnect", elapsed_ms, True, "telegram", {"reconnected": True})
+        else:
+            record_operation("ensure_connected", elapsed_ms, True, "telegram", {"reconnected": False})
+        logger.debug("TELEGRAM ensure_connected elapsed_ms=%.2f success=True", elapsed_ms)
+        metrics = CURRENT_CYCLE.get()
+        if metrics is not None and metrics.timings is not None:
+            metrics.timings.append(("ensure_connected", elapsed_ms))
 
     async def is_authorized(self) -> bool:
         client = self._ensure_client()
@@ -103,39 +153,128 @@ class TelegramService:
                 raise RuntimeError("Telegram login did not complete successfully")
 
     async def resolve_entity(self, chat_ref: str):
+        start = time.monotonic()
         client = self._ensure_client()
+        cache_key = str(chat_ref)
+        cached = self._entity_cache.get(cache_key)
+        now = time.monotonic()
+        if cached is not None:
+            cached_at, entity = cached
+            if now - cached_at <= self.ENTITY_CACHE_TTL_SECONDS:
+                self._entity_cache.move_to_end(cache_key)
+                logger.debug("ENTITY CACHE HIT: chat_ref=%s cache_size=%s", chat_ref, len(self._entity_cache))
+                metrics = CURRENT_CYCLE.get()
+                if metrics is not None and metrics.timings is not None:
+                    metrics.timings.append(("resolve_entity_cache_hit", (time.monotonic() - start) * 1000))
+                record_operation("resolve_entity", (time.monotonic() - start) * 1000, True, "telegram", {"cache_hit": True})
+                return entity
+            self._entity_cache.pop(cache_key, None)
+        logger.debug("ENTITY CACHE MISS: chat_ref=%s cache_size=%s", chat_ref, len(self._entity_cache))
         await self.ensure_connected()
         if chat_ref.startswith("-100"):
-            return await client.get_entity(int(chat_ref))
-        return await client.get_entity(chat_ref)
+            entity = await client.get_entity(int(chat_ref))
+        else:
+            entity = await client.get_entity(chat_ref)
+        self._entity_cache[cache_key] = (time.monotonic(), entity)
+        self._entity_cache.move_to_end(cache_key)
+        while len(self._entity_cache) > self.ENTITY_CACHE_MAXSIZE:
+            self._entity_cache.popitem(last=False)
+        elapsed_ms = (time.monotonic() - start) * 1000
+        self.last_resolve_entity_ms = elapsed_ms
+        record_operation("resolve_entity", elapsed_ms, True, "telegram", {"cache_hit": False})
+        logger.debug("ENTITY RESOLUTION: chat_ref=%s elapsed_ms=%.2f", chat_ref, elapsed_ms)
+        metrics = CURRENT_CYCLE.get()
+        if metrics is not None:
+            metrics.dialogs += 1
+            if metrics.timings is not None:
+                metrics.timings.append(("resolve_entity", elapsed_ms))
+        return entity
 
     async def send_saved_message(self, group_id: str, message: dict) -> None:
-        await self.ensure_connected()
-        entity = await self.resolve_entity(group_id)
-        media_type = message.get("media_type")
-        media_file_id = message.get("media_file_id")
-        content = message["content"]
+        start = time.monotonic()
+        try:
+            await self.ensure_connected()
+            entity = await self.resolve_entity(group_id)
+            media_type = message.get("media_type")
+            media_file_id = message.get("media_file_id")
+            content = message["content"]
 
-        if media_type and media_file_id:
-            await self._ensure_client().send_file(entity, media_file_id, caption=content)
-        else:
-            await self._ensure_client().send_message(entity, content)
+            if media_type and media_file_id:
+                await self._ensure_client().send_file(entity, media_file_id, caption=content)
+            else:
+                await self._ensure_client().send_message(entity, content)
+            self.last_send_success = True
+            self.last_error = None
+            logger.debug("TELEGRAM send_saved_message elapsed_ms=%.2f success=True", (time.monotonic() - start) * 1000)
+            record_operation("send_saved_message", (time.monotonic() - start) * 1000, True, "telegram", {"target": group_id})
+        except Exception as exc:
+            self.last_send_success = False
+            self.last_error = str(exc)
+            self._entity_cache.pop(str(group_id), None)
+            logger.debug("ENTITY CACHE INVALIDATED chat_ref=%s reason=send_saved_message_failure", group_id)
+            record_operation("send_saved_message", (time.monotonic() - start) * 1000, False, "telegram", {"target": group_id, "error": str(exc)})
+            raise
+        finally:
+            self.last_send_ms = (time.monotonic() - start) * 1000
 
     async def send_text(self, group_id: str, content: str) -> None:
-        await self.ensure_connected()
-        entity = await self.resolve_entity(group_id)
-        await self._ensure_client().send_message(entity, content)
+        start = time.monotonic()
+        try:
+            await self.ensure_connected()
+            entity = await self.resolve_entity(group_id)
+            await self._ensure_client().send_message(entity, content)
+            self.last_send_success = True
+            self.last_error = None
+            logger.debug("TELEGRAM send_message elapsed_ms=%.2f success=True", (time.monotonic() - start) * 1000)
+            record_operation("send_message", (time.monotonic() - start) * 1000, True, "telegram", {"target": group_id})
+        except Exception as exc:
+            self.last_send_success = False
+            self.last_error = str(exc)
+            self._entity_cache.pop(str(group_id), None)
+            logger.debug("ENTITY CACHE INVALIDATED chat_ref=%s reason=send_message_failure", group_id)
+            record_operation("send_message", (time.monotonic() - start) * 1000, False, "telegram", {"target": group_id, "error": str(exc)})
+            raise
+        finally:
+            self.last_send_ms = (time.monotonic() - start) * 1000
 
     async def send_saved_payload(self, target: str, message: dict) -> None:
-        await self.ensure_connected()
-        entity = await self.resolve_entity(target)
-        media_type = message.get("media_type")
-        media_file_id = message.get("media_file_id")
-        content = message.get("content", "")
-        if media_type and media_file_id:
-            await self._ensure_client().send_file(entity, media_file_id, caption=content)
-        else:
-            await self._ensure_client().send_message(entity, content)
+        start = time.monotonic()
+        try:
+            await self.ensure_connected()
+            entity = await self.resolve_entity(target)
+            media_type = message.get("media_type")
+            media_file_id = message.get("media_file_id")
+            content = message.get("content", "")
+            if media_type and media_file_id:
+                await self._ensure_client().send_file(entity, media_file_id, caption=content)
+            else:
+                await self._ensure_client().send_message(entity, content)
+            self.last_send_success = True
+            self.last_error = None
+            logger.debug("TELEGRAM send_saved_payload elapsed_ms=%.2f success=True", (time.monotonic() - start) * 1000)
+            record_operation("send_saved_payload", (time.monotonic() - start) * 1000, True, "telegram", {"target": target})
+        except Exception as exc:
+            self.last_send_success = False
+            self.last_error = str(exc)
+            self._entity_cache.pop(str(target), None)
+            logger.debug("ENTITY CACHE INVALIDATED chat_ref=%s reason=send_payload_failure", target)
+            record_operation("send_saved_payload", (time.monotonic() - start) * 1000, False, "telegram", {"target": target, "error": str(exc)})
+            raise
+        finally:
+            self.last_send_ms = (time.monotonic() - start) * 1000
+
+    def status(self) -> dict[str, object]:
+        return {
+            "connected": bool(self.client and self.client.is_connected()),
+            "authorized": bool(self.client and self.client.is_user_authorized()) if self.client else False,
+            "session_source": self._session_source,
+            "entity_cache_size": len(self._entity_cache),
+            "last_ensure_connected_ms": round(self.last_ensure_connected_ms, 2),
+            "last_resolve_entity_ms": round(self.last_resolve_entity_ms, 2),
+            "last_send_ms": round(self.last_send_ms, 2),
+            "last_send_success": self.last_send_success,
+            "last_error": self.last_error,
+        }
 
 @dataclass
 class AutomationSnapshot:
@@ -149,6 +288,12 @@ class AutomationService:
         self._running = False
         self._paused = False
         self._wake_event = asyncio.Event()
+
+    @staticmethod
+    def _log_timing(label: str, start: float, timings: list[tuple[str, float]]) -> None:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        timings.append((label, elapsed_ms))
+        logger.info("%s elapsed_ms=%.2f", label, elapsed_ms)
 
     @property
     def is_running(self) -> bool:
@@ -202,24 +347,69 @@ class AutomationService:
         sticker_path = get_setting("promotion_sticker_path", None)
         return str(sticker_path) if sticker_path else None
 
+    @staticmethod
+    def _promotion_sticker_file_id() -> str | None:
+        sticker_file_id = get_setting("promotion_sticker", None)
+        return str(sticker_file_id) if sticker_file_id else None
+
     async def _send_promotion_sticker(self, target: str) -> bool:
+        cycle_start = time.monotonic()
+        sticker_file_id = self._promotion_sticker_file_id()
         sticker_path = self._promotion_sticker_path()
         path_exists = bool(sticker_path and os.path.exists(sticker_path))
-        logger.info("PROMOTION STICKER CHECK: path=%s exists=%s", sticker_path, path_exists)
-        if not sticker_path:
-            logger.warning("Skipping promotion sticker send because promotion_sticker_path is missing")
-            return False
-        if not path_exists:
-            logger.warning("Skipping promotion sticker send because file does not exist: %s", sticker_path)
+        logger.info(
+            "PROMOTION STICKER CHECK: file_id_exists=%s path=%s path_exists=%s",
+            bool(sticker_file_id),
+            sticker_path,
+            path_exists,
+        )
+        if not sticker_file_id and not path_exists:
+            logger.warning("Skipping promotion sticker send because no sticker file_id or legacy file path is available")
             return False
         try:
             await self.telegram.ensure_connected()
             entity = await self.telegram.resolve_entity(target)
-            await self.telegram._ensure_client().send_file(entity, sticker_path)
-            logger.info("PROMOTION STICKER SENT SUCCESSFULLY")
+            client = self.telegram._ensure_client()
+            logger.info("Resolved promotion sticker entity=%s file_id_exists=%s", entity, bool(sticker_file_id))
+            if sticker_file_id:
+                await client.send_file(entity, sticker_file_id)
+            else:
+                await client.send_file(entity, sticker_path)
+            logger.info(
+                "PROMOTION STICKER SENT SUCCESSFULLY target=%s delivery=%s",
+                target,
+                "file_id" if sticker_file_id else "local_path",
+            )
+            metrics = CURRENT_CYCLE.get()
+            if metrics is not None:
+                metrics.messages_sent += 1
+            logger.info("PROMOTION STICKER CYCLE target=%s total_elapsed_ms=%.2f success=True", target, (time.monotonic() - cycle_start) * 1000)
+            record_operation("promotion_sticker", (time.monotonic() - cycle_start) * 1000, True, "promotion", {"target": target, "delivery": "file_id" if sticker_file_id else "local_path"})
             return True
-        except Exception:
-            logger.exception("PROMOTION STICKER SEND FAILED")
+        except Exception as exc:
+            logger.exception(
+                "PROMOTION STICKER SEND FAILED target=%s file_id_exists=%s path=%s error=%s",
+                target,
+                bool(sticker_file_id),
+                sticker_path,
+                exc,
+            )
+            if sticker_file_id and path_exists:
+                try:
+                    client = self.telegram._ensure_client()
+                    entity = await self.telegram.resolve_entity(target)
+                    await client.send_file(entity, sticker_path)
+                    logger.info("PROMOTION STICKER FALLBACK SENT SUCCESSFULLY target=%s delivery=local_path", target)
+                    return True
+                except Exception as fallback_exc:
+                    logger.exception(
+                        "PROMOTION STICKER FALLBACK FAILED target=%s path=%s error=%s",
+                        target,
+                        sticker_path,
+                        fallback_exc,
+                    )
+            logger.info("PROMOTION STICKER CYCLE target=%s total_elapsed_ms=%.2f success=False", target, (time.monotonic() - cycle_start) * 1000)
+            record_operation("promotion_sticker", (time.monotonic() - cycle_start) * 1000, False, "promotion", {"target": target, "error": str(exc)})
             return False
 
     async def _send_group_promotion(self, group: dict, message: dict) -> None:
@@ -303,10 +493,15 @@ class AutomationService:
         return (now + timedelta(minutes=delay_minutes)).isoformat()
 
     async def run_forever(self) -> None:
-        self._running = bool(get_setting("automation_running", False))
-        self._paused = bool(get_setting("automation_paused", False))
+        loop_start_overall = time.monotonic()
+        self._running = bool(await aget_setting("automation_running", False))
+        self._paused = bool(await aget_setting("automation_paused", False))
         while True:
             delay_seconds = GROUP_LOOP_POLL_SECONDS
+            cycle_start = time.monotonic()
+            timings: list[tuple[str, float]] = []
+            metrics = CycleMetrics(timings=timings)
+            token = CURRENT_CYCLE.set(metrics)
             try:
                 logger.info("[LOOP START] running=%s paused=%s", self._running, self._paused)
 
@@ -320,9 +515,14 @@ class AutomationService:
                     await self._wake_event.wait()
                     continue
 
-                groups = list_groups(enabled_only=True)
-                messages = list_messages()
+                db_groups_start = time.monotonic()
+                groups = await alist_groups(enabled_only=True)
+                self._log_timing("DB READ list_groups", db_groups_start, timings)
+                db_messages_start = time.monotonic()
+                messages = await alist_messages()
+                self._log_timing("DB READ list_messages", db_messages_start, timings)
                 group_ids = [group.get("group_id") for group in groups]
+                metrics.groups = len(groups)
 
                 logger.info(
                     "automation_groups_loaded total=%s ids=%s",
@@ -361,7 +561,7 @@ class AutomationService:
 
                     if next_run_at is None:
                         next_run_at = now
-                        update_group_runtime(group["group_id"], next_run_at=next_run_at.isoformat())
+                        await aupdate_group_runtime(group["group_id"], next_run_at=next_run_at.isoformat())
 
                     if now < next_run_at:
                         continue
@@ -370,7 +570,7 @@ class AutomationService:
 
                     if cooldown_until and now < cooldown_until:
                         scheduled_next_run = self._compute_next_run_at(group, message, now)
-                        update_group_runtime(
+                        await aupdate_group_runtime(
                             group["group_id"],
                             last_status="cooldown",
                             fail_count=int(group.get("fail_count", 0) or 0),
@@ -393,7 +593,7 @@ class AutomationService:
                         if existing_next_run_at is not None:
                             next_run_candidate = min(existing_next_run_at, next_run_candidate)
                         next_run_at_value = next_run_candidate.isoformat()
-                        update_group_runtime(
+                        await aupdate_group_runtime(
                             group["group_id"],
                             last_status="inactive_time",
                             last_error="None",
@@ -404,9 +604,12 @@ class AutomationService:
                         continue
 
                     try:
+                        bots_start = time.monotonic()
+                        metrics.bots = len(await aget_bots())
+                        self._log_timing("DB READ get_bots", bots_start, timings)
                         await self._send_group_promotion(group, message)
                         next_run_at_value = self._compute_next_run_at(group, message, now)
-                        update_group_runtime(
+                        await aupdate_group_runtime(
                             group["group_id"],
                             last_status="success",
                             last_error="None",
@@ -415,7 +618,7 @@ class AutomationService:
                             next_run_at=next_run_at_value,
                             last_sent_at=now.isoformat(),
                         )
-                        set_setting("automation_last_execution_time", __import__("datetime").datetime.utcnow().isoformat())
+                        await aset_setting("automation_last_execution_time", __import__("datetime").datetime.utcnow().isoformat())
                         logger.info(
                             "[SUCCESS] Group %s reset fail_count",
                             group.get("group_id"),
@@ -428,7 +631,7 @@ class AutomationService:
                         if fail_count >= GROUP_FAILURE_THRESHOLD:
                             cooldown_value = (failed_at + timedelta(minutes=GROUP_FAILURE_COOLDOWN_MINUTES)).isoformat()
                         next_run_at_value = (failed_at + timedelta(seconds=wait_seconds)).isoformat()
-                        update_group_runtime(
+                        await aupdate_group_runtime(
                             group["group_id"],
                             last_status="error",
                             last_error=f"FloodWait:{wait_seconds}s",
@@ -459,7 +662,7 @@ class AutomationService:
                         if fail_count >= GROUP_FAILURE_THRESHOLD:
                             cooldown_value = (failed_at + timedelta(minutes=GROUP_FAILURE_COOLDOWN_MINUTES)).isoformat()
                         next_run_at_value = self._compute_next_run_at(group, message, failed_at)
-                        update_group_runtime(
+                        await aupdate_group_runtime(
                             group["group_id"],
                             last_status="error",
                             last_error=str(exc),
@@ -495,6 +698,29 @@ class AutomationService:
                 logger.exception("[LOOP ERROR] %s", exc)
                 delay_seconds = max(delay_seconds, 1)
             finally:
+                CURRENT_CYCLE.reset(token)
+                cycle_duration_ms = (time.monotonic() - cycle_start) * 1000
+                slowest = sorted(timings, key=lambda item: item[1], reverse=True)[:10]
+                if slowest:
+                    logger.info(
+                        "TOP 10 SLOWEST OPERATIONS: %s",
+                        ", ".join(f"{label}={elapsed:.2f}ms" for label, elapsed in slowest),
+                    )
+                record_operation(
+                    "worker_loop",
+                    cycle_duration_ms,
+                    True,
+                    "worker",
+                    {"groups": metrics.groups, "bots": metrics.bots, "messages_sent": metrics.messages_sent},
+                )
+                logger.info(
+                    "WORKER CYCLE: groups=%s bots=%s dialogs=%s messages_sent=%s duration=%.2f ms",
+                    metrics.groups,
+                    metrics.bots,
+                    metrics.dialogs,
+                    metrics.messages_sent,
+                    cycle_duration_ms,
+                )
                 logger.info("[SLEEPING FOR %s SECONDS]", delay_seconds)
                 await asyncio.sleep(delay_seconds)
 
@@ -504,14 +730,19 @@ automation_service = AutomationService(telegram_service)
 
 
 async def handle_bot_automation(event) -> None:
+    token = None
+    cycle_start = time.monotonic()
     try:
+        timings: list[tuple[str, float]] = []
+        metrics = CycleMetrics(timings=timings)
+        token = CURRENT_CYCLE.set(metrics)
         chat = await event.get_chat()
         bot_username = getattr(chat, "username", None)
         if not bot_username:
             return
 
-        bots = get_bots()
-        bot = get_bot(bot_username) or bots.get(bot_username)
+        bots = await aget_bots()
+        bot = bots.get(bot_username) or await aget_bot(bot_username)
         if not bot or not is_bot_enabled(bot_username, False):
             return
 
@@ -537,15 +768,18 @@ async def handle_bot_automation(event) -> None:
 
         after_match_delay = float(bot.get("after_match_delay", 1) or 0)
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
-        messages = list_messages(active_only=False)
-        promotion_mode = str(get_setting("promotion_mode", "message") or "message").strip().lower()
-        promotion_sticker_path = get_setting("promotion_sticker_path", None)
+        messages = await alist_messages(active_only=False)
+        promotion_mode = str(await aget_setting("promotion_mode", "message") or "message").strip().lower()
+        promotion_sticker = await aget_setting("promotion_sticker", None)
+        promotion_sticker_path = await aget_setting("promotion_sticker_path", None)
         path_exists = bool(promotion_sticker_path and os.path.exists(str(promotion_sticker_path)))
-        logger.info("PROMOTION STICKER CHECK: path=%s exists=%s", promotion_sticker_path, path_exists)
+        logger.info(
+            "PROMOTION STICKER CHECK: file_id_exists=%s path=%s path_exists=%s",
+            bool(promotion_sticker),
+            promotion_sticker_path,
+            path_exists,
+        )
         if promotion_mode not in {"message", "sticker", "both"}:
-            promotion_mode = "message"
-        if promotion_mode in {"sticker", "both"} and not path_exists:
-            logger.warning("Skipping sticker send because promotion_sticker_path is missing or invalid")
             promotion_mode = "message"
 
         if after_match_delay:
@@ -554,13 +788,16 @@ async def handle_bot_automation(event) -> None:
             selected_message = random.choice(messages)
             try:
                 if promotion_mode == "sticker":
-                    await automation_service._send_promotion_sticker(bot_username)
+                    if await automation_service._send_promotion_sticker(bot_username):
+                        pass
                 elif promotion_mode == "both":
-                    await automation_service._send_promotion_sticker(bot_username)
-                    await asyncio.sleep(1)
-                    await telegram_service.send_saved_payload(bot_username, selected_message)
+                    if await automation_service._send_promotion_sticker(bot_username):
+                        await asyncio.sleep(1)
+                        await telegram_service.send_saved_payload(bot_username, selected_message)
+                        metrics.messages_sent += 1
                 else:
                     await telegram_service.send_saved_payload(bot_username, selected_message)
+                    metrics.messages_sent += 1
             except Exception:
                 logger.exception("Failed to send promotion payload to %s", bot_username)
         stop_cmd = _normalize_command(bot.get("stop_cmd"))
@@ -573,43 +810,87 @@ async def handle_bot_automation(event) -> None:
         if start_cmd and is_bot_enabled(bot_username, False):
             await telegram_service.client.send_message(bot_username, start_cmd)
             logger.info("Automation cycled for %s", bot_username)
+        logger.info(
+            "BOT AUTOMATION CYCLE: bot=%s dialogs=%s messages_sent=%s duration=%.2f ms",
+            bot_username,
+            metrics.dialogs,
+            metrics.messages_sent,
+            (time.monotonic() - cycle_start) * 1000,
+        )
+        record_operation(
+            "bot_automation_cycle",
+            (time.monotonic() - cycle_start) * 1000,
+            True,
+            "worker",
+            {"bot": bot_username, "messages_sent": metrics.messages_sent},
+        )
     except Exception:
+        record_operation("bot_automation_cycle", (time.monotonic() - cycle_start) * 1000, False, "worker", {"bot": bot_username if 'bot_username' in locals() else None})
         logger.exception("Bot automation event handling failed")
+    finally:
+        if token is not None:
+            CURRENT_CYCLE.reset(token)
 
 
 async def start_worker() -> None:
     while True:
+        cycle_start = time.monotonic()
+        timings: list[tuple[str, float]] = []
+        metrics = CycleMetrics(timings=timings)
+        token = CURRENT_CYCLE.set(metrics)
         try:
             await telegram_service.ensure_connected()
             client = telegram_service._ensure_client()
             client.add_event_handler(handle_bot_automation, events.NewMessage(incoming=True))
             logger.info("Telegram user session connected")
-            for bot_name, config in get_bots().items():
+            db_start = time.monotonic()
+            bots = await aget_bots()
+            logger.debug("DB READ get_bots elapsed_ms=%.2f", (time.monotonic() - db_start) * 1000)
+            metrics.bots = len(bots)
+            for bot_name, config in bots.items():
                 start_cmd = _normalize_command(config.get("start_cmd"))
                 if is_bot_enabled(bot_name, False) and start_cmd:
                     try:
                         await client.send_message(bot_name, start_cmd)
+                        metrics.messages_sent += 1
+                        metrics.dialogs += 1
                     except Exception:
                         logger.exception("Failed to start enabled bot %s", bot_name)
             await client.run_until_disconnected()
+            record_operation("worker_loop_runtime", (time.monotonic() - cycle_start) * 1000, True, "worker", {"state": "disconnected"})
         except RuntimeError as exc:
             logger.error("%s. Waiting for re-authorization...", exc)
+            record_operation("worker_loop_runtime", (time.monotonic() - cycle_start) * 1000, False, "worker", {"error": str(exc)})
             await asyncio.sleep(30)
         except Exception:
             logger.exception("Worker crashed unexpectedly. Restarting shortly.")
+            record_operation("worker_loop_runtime", (time.monotonic() - cycle_start) * 1000, False, "worker", {"error": "unexpected"})
             await asyncio.sleep(10)
+        finally:
+            CURRENT_CYCLE.reset(token)
+            logger.info(
+                "WORKER CYCLE: groups=%s bots=%s dialogs=%s duration=%.2f ms",
+                metrics.groups,
+                metrics.bots,
+                metrics.dialogs,
+                (time.monotonic() - cycle_start) * 1000,
+            )
 
 
 async def start_group_worker() -> None:
     while True:
+        loop_start = time.monotonic()
         try:
             await telegram_service.ensure_connected()
             await automation_service.run_forever()
+            record_operation("group_worker_loop", (time.monotonic() - loop_start) * 1000, True, "worker", {"state": "completed"})
         except RuntimeError as exc:
             logger.error("%s. Group automation is paused until the session is re-authorized.", exc)
+            record_operation("group_worker_loop", (time.monotonic() - loop_start) * 1000, False, "worker", {"error": str(exc)})
             await asyncio.sleep(30)
         except Exception:
             logger.exception("Group worker crashed unexpectedly. Restarting shortly.")
+            record_operation("group_worker_loop", (time.monotonic() - loop_start) * 1000, False, "worker", {"error": "unexpected"})
             await asyncio.sleep(10)
 
 
@@ -622,3 +903,12 @@ async def send_command(bot_username: str, command: str) -> None:
 
 def get_client() -> TelegramClient:
     return telegram_service.client
+
+
+def get_worker_status() -> dict[str, object]:
+    return {
+        "worker_running": automation_service.is_running,
+        "worker_paused": automation_service.is_paused,
+        "telegram": telegram_service.status(),
+        "db": db_status(),
+    }
