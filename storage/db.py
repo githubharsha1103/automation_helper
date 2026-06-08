@@ -137,6 +137,22 @@ async def aupdate_group_runtime(*args: Any, **kwargs: Any) -> bool:
     return await asyncio.to_thread(update_group_runtime, *args, **kwargs)
 
 
+def get_promotion_asset_channel() -> Any:
+    return get_setting("promotion_asset_channel", None)
+
+
+def get_promotion_sticker_message_id() -> Any:
+    return get_setting("promotion_sticker_message_id", None)
+
+
+def set_promotion_asset_channel(value: Any) -> bool:
+    return set_setting("promotion_asset_channel", value)
+
+
+def set_promotion_sticker_message_id(value: Any) -> bool:
+    return set_setting("promotion_sticker_message_id", value)
+
+
 def db_status() -> dict[str, Any]:
     return {
         "settings_cache": len(_SETTING_CACHE),
@@ -171,6 +187,8 @@ def init_db() -> None:
     db["settings"].update_one({"_id": "promotion_mode"}, {"$setOnInsert": {"value": "message"}}, upsert=True)
     db["settings"].update_one({"_id": "promotion_sticker"}, {"$setOnInsert": {"value": None}}, upsert=True)
     db["settings"].update_one({"_id": "promotion_sticker_path"}, {"$setOnInsert": {"value": None}}, upsert=True)
+    db["settings"].update_one({"_id": "promotion_asset_channel"}, {"$setOnInsert": {"value": None}}, upsert=True)
+    db["settings"].update_one({"_id": "promotion_sticker_message_id"}, {"$setOnInsert": {"value": None}}, upsert=True)
     db["groups"].create_index([("status", 1), ("updated_at", 1)])
     db["groups"].create_index([("status", 1), ("next_run_at", 1)])
     db["groups"].create_index([("status", 1), ("cooldown_until", 1)])

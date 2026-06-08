@@ -23,6 +23,8 @@ from storage.db import (
     aset_setting,
     aupdate_group_runtime,
     db_status,
+    get_promotion_asset_channel,
+    get_promotion_sticker_message_id,
     record_operation,
     telemetry_snapshot,
     get_bot,
@@ -343,74 +345,103 @@ class AutomationService:
         return mode if mode in {"message", "sticker", "both"} else "message"
 
     @staticmethod
-    def _promotion_sticker_path() -> str | None:
-        sticker_path = get_setting("promotion_sticker_path", None)
-        return str(sticker_path) if sticker_path else None
+    def _promotion_asset_channel() -> str | None:
+        asset_channel = get_promotion_asset_channel()
+        return str(asset_channel) if asset_channel else None
 
     @staticmethod
-    def _promotion_sticker_file_id() -> str | None:
-        sticker_file_id = get_setting("promotion_sticker", None)
-        return str(sticker_file_id) if sticker_file_id else None
+    def _promotion_sticker_message_id() -> int | None:
+        value = get_promotion_sticker_message_id()
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
-    async def _send_promotion_sticker(self, target: str) -> bool:
+    async def _send_asset_sticker(self, target: str) -> bool:
         cycle_start = time.monotonic()
-        sticker_file_id = self._promotion_sticker_file_id()
-        sticker_path = self._promotion_sticker_path()
-        path_exists = bool(sticker_path and os.path.exists(sticker_path))
-        logger.info(
-            "PROMOTION STICKER CHECK: file_id_exists=%s path=%s path_exists=%s",
-            bool(sticker_file_id),
-            sticker_path,
-            path_exists,
-        )
-        if not sticker_file_id and not path_exists:
-            logger.warning("Skipping promotion sticker send because no sticker file_id or legacy file path is available")
+        asset_channel = self._promotion_asset_channel()
+        sticker_message_id = self._promotion_sticker_message_id()
+        if not asset_channel or not sticker_message_id:
+            logger.info("ASSET STICKER FORWARD FAILED target=%s reason=missing_asset_configuration", target)
+            record_operation(
+                "promotion_sticker",
+                (time.monotonic() - cycle_start) * 1000,
+                False,
+                "promotion",
+                {"target": target, "error": "missing_asset_configuration"},
+            )
             return False
         try:
             await self.telegram.ensure_connected()
-            entity = await self.telegram.resolve_entity(target)
+            target_entity = await self.telegram.resolve_entity(target)
+            asset_entity = await self.telegram.resolve_entity(asset_channel)
             client = self.telegram._ensure_client()
-            logger.info("Resolved promotion sticker entity=%s file_id_exists=%s", entity, bool(sticker_file_id))
-            if sticker_file_id:
-                await client.send_file(entity, sticker_file_id)
-            else:
-                await client.send_file(entity, sticker_path)
             logger.info(
-                "PROMOTION STICKER SENT SUCCESSFULLY target=%s delivery=%s",
+                "ASSET STICKER FORWARD START target=%s asset_channel=%s message_id=%s",
                 target,
-                "file_id" if sticker_file_id else "local_path",
+                asset_channel,
+                sticker_message_id,
+            )
+            await client.forward_messages(target_entity, sticker_message_id, from_peer=asset_entity)
+            logger.info(
+                "ASSET STICKER FORWARD SUCCESS target=%s asset_channel=%s message_id=%s",
+                target,
+                asset_channel,
+                sticker_message_id,
+            )
+            self.telegram.last_send_success = True
+            self.telegram.last_error = None
+            self.telegram.last_send_ms = (time.monotonic() - cycle_start) * 1000
+            record_operation(
+                "promotion_sticker",
+                self.telegram.last_send_ms,
+                True,
+                "promotion",
+                {"target": target, "asset_channel": asset_channel, "message_id": sticker_message_id},
             )
             metrics = CURRENT_CYCLE.get()
             if metrics is not None:
                 metrics.messages_sent += 1
-            logger.info("PROMOTION STICKER CYCLE target=%s total_elapsed_ms=%.2f success=True", target, (time.monotonic() - cycle_start) * 1000)
-            record_operation("promotion_sticker", (time.monotonic() - cycle_start) * 1000, True, "promotion", {"target": target, "delivery": "file_id" if sticker_file_id else "local_path"})
             return True
         except Exception as exc:
             logger.exception(
-                "PROMOTION STICKER SEND FAILED target=%s file_id_exists=%s path=%s error=%s",
+                "ASSET STICKER FORWARD FAILED target=%s asset_channel=%s message_id=%s error=%s",
                 target,
-                bool(sticker_file_id),
-                sticker_path,
+                asset_channel,
+                sticker_message_id,
                 exc,
             )
-            if sticker_file_id and path_exists:
-                try:
-                    client = self.telegram._ensure_client()
-                    entity = await self.telegram.resolve_entity(target)
-                    await client.send_file(entity, sticker_path)
-                    logger.info("PROMOTION STICKER FALLBACK SENT SUCCESSFULLY target=%s delivery=local_path", target)
-                    return True
-                except Exception as fallback_exc:
-                    logger.exception(
-                        "PROMOTION STICKER FALLBACK FAILED target=%s path=%s error=%s",
-                        target,
-                        sticker_path,
-                        fallback_exc,
-                    )
-            logger.info("PROMOTION STICKER CYCLE target=%s total_elapsed_ms=%.2f success=False", target, (time.monotonic() - cycle_start) * 1000)
-            record_operation("promotion_sticker", (time.monotonic() - cycle_start) * 1000, False, "promotion", {"target": target, "error": str(exc)})
+            self.telegram.last_send_success = False
+            self.telegram.last_error = str(exc)
+            self.telegram.last_send_ms = (time.monotonic() - cycle_start) * 1000
+            record_operation(
+                "promotion_sticker",
+                self.telegram.last_send_ms,
+                False,
+                "promotion",
+                {"target": target, "asset_channel": asset_channel, "message_id": sticker_message_id, "error": str(exc)},
+            )
             return False
+
+    async def _send_promotion_sticker(self, target: str) -> bool:
+        asset_sent = await self._send_asset_sticker(target)
+        if asset_sent:
+            return True
+        legacy_sticker_file_id = get_setting("promotion_sticker", None)
+        if legacy_sticker_file_id:
+            try:
+                await self.telegram.ensure_connected()
+                entity = await self.telegram.resolve_entity(target)
+                logger.info("LEGACY PROMOTION STICKER FALLBACK START target=%s", target)
+                await self.telegram._ensure_client().send_file(entity, str(legacy_sticker_file_id))
+                logger.info("LEGACY PROMOTION STICKER FALLBACK SUCCESS target=%s", target)
+                return True
+            except Exception as exc:
+                logger.exception("LEGACY PROMOTION STICKER FALLBACK FAILED target=%s error=%s", target, exc)
+                return False
+        return False
 
     async def _send_group_promotion(self, group: dict, message: dict) -> None:
         mode = self._promotion_mode()

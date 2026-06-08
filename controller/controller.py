@@ -32,11 +32,15 @@ from storage.db import (
     get_group,
     get_message,
     get_setting,
+    get_promotion_asset_channel,
+    get_promotion_sticker_message_id,
     is_bot_enabled,
     is_bot_paused,
     list_groups,
     list_messages,
     set_group_special_message,
+    set_promotion_asset_channel,
+    set_promotion_sticker_message_id,
     set_bot_enabled,
     set_bot_paused,
     set_group_status,
@@ -74,6 +78,8 @@ EDIT_BOT_SECURITY_TRIGGERS = 510
 EDIT_BOT_AFTER_MATCH_DELAY = 511
 EDIT_BOT_AFTER_CHAT_DELAY = 512
 SET_PROMOTION_STICKER = 600
+SET_PROMOTION_ASSET_CHANNEL = 601
+SET_PROMOTION_ASSET_CHANNEL = 601
 
 
 def _env(name: str, default: str = "") -> str:
@@ -325,8 +331,9 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
     promotion_mode = get_setting("promotion_mode", "message") or "message"
-    promotion_sticker = get_setting("promotion_sticker", None)
-    sticker_configured = "Yes" if promotion_sticker else "No"
+    promotion_asset_channel = get_promotion_asset_channel()
+    promotion_sticker_message_id = get_promotion_sticker_message_id()
+    sticker_configured = "Yes" if promotion_sticker_message_id else "No"
     mode_label = {
         "message": "Message",
         "sticker": "Sticker",
@@ -337,6 +344,8 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
         f"Status: {'ON' if enabled else 'OFF'}\n"
         f"Runtime state: {runtime_state}\n"
         f"Promotion Mode: {mode_label}\n"
+        f"Asset Channel Configured: {'Yes' if promotion_asset_channel else 'No'}\n"
+        f"Sticker Message ID: {promotion_sticker_message_id or 'N/A'}\n"
         f"Sticker Configured: {sticker_configured}\n"
         f"Paused: {'Yes' if paused else 'No'}\n"
         f"Start cmd: {bot.get('start_cmd', '-')}\n"
@@ -446,7 +455,8 @@ def _automation_status_text() -> str:
     active_bots = sum(1 for name in get_bots() if is_bot_enabled(name, False))
     last_execution_time = get_setting("automation_last_execution_time", "Never")
     promotion_mode = get_setting("promotion_mode", "message") or "message"
-    promotion_sticker = get_setting("promotion_sticker", None)
+    promotion_asset_channel = get_promotion_asset_channel()
+    promotion_sticker_message_id = get_promotion_sticker_message_id()
     mode_label = {
         "message": "Message",
         "sticker": "Sticker",
@@ -456,7 +466,8 @@ def _automation_status_text() -> str:
         f"Automation is {'running' if state == 'RUNNING' else 'paused' if state == 'PAUSED' else 'idle'}\n"
         f"Runtime state: {state}\n"
         f"Promotion Mode: {mode_label}\n"
-        f"Sticker Configured: {'Yes' if promotion_sticker else 'No'}\n"
+        f"Asset Channel Configured: {'Yes' if promotion_asset_channel else 'No'}\n"
+        f"Sticker Message ID: {promotion_sticker_message_id or 'N/A'}\n"
         f"Enabled groups: {enabled_groups}\n"
         f"Active messages: {messages_count}\n"
         f"Active bot count: {active_bots}\n"
@@ -474,11 +485,13 @@ def _promotion_mode_label(mode: str | None) -> str:
 
 def _promotion_settings_text() -> str:
     mode = get_setting("promotion_mode", "message") or "message"
-    sticker = get_setting("promotion_sticker", None)
+    asset_channel = get_promotion_asset_channel()
+    sticker_message_id = get_promotion_sticker_message_id()
     return (
         "Promotion Settings\n\n"
         f"Current Mode: {mode}\n"
-        f"Sticker Configured: {'Yes' if sticker else 'No'}\n\n"
+        f"Asset Channel Configured: {'Yes' if asset_channel else 'No'}\n"
+        f"Sticker Message ID: {sticker_message_id or 'N/A'}\n\n"
         "Choose an option."
     )
 
@@ -487,6 +500,7 @@ def _promotion_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Promotion Mode", callback_data="promotion:mode")],
+            [InlineKeyboardButton("Set Asset Channel", callback_data="promotion:set_channel")],
             [InlineKeyboardButton("Set Promotion Sticker", callback_data="promotion:set_sticker")],
             [InlineKeyboardButton("Remove Sticker", callback_data="promotion:remove_sticker")],
             [InlineKeyboardButton("Back", callback_data="menu:automation")],
@@ -559,6 +573,45 @@ async def promotion_mode_set_callback(update: Update, context: ContextTypes.DEFA
     await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
 
 
+async def promotion_asset_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    context.user_data.clear()
+    context.user_data["promotion_asset_channel_flow"] = True
+    await _send_or_edit(
+        update,
+        "Send the private Telegram channel @username or numeric channel id to use as the promotion asset repository.\n\nPress Cancel to abort.",
+        _cancel_menu(),
+    )
+
+
+async def promotion_asset_channel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await _safe_callback_answer(update.callback_query)
+    context.user_data.clear()
+    context.user_data["promotion_asset_channel_flow"] = True
+    await _send_or_edit(
+        update,
+        "Send the private Telegram channel @username or numeric channel id to use as the promotion asset repository.\n\nPress Cancel to abort.",
+        _cancel_menu(),
+    )
+    return SET_PROMOTION_ASSET_CHANNEL
+
+
+async def promotion_asset_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        await update.message.reply_text("Please send a channel username or channel id.")
+        return SET_PROMOTION_ASSET_CHANNEL
+    raw_value = update.message.text.strip()
+    if not raw_value:
+        await update.message.reply_text("Channel value cannot be empty.")
+        return SET_PROMOTION_ASSET_CHANNEL
+    set_promotion_asset_channel(raw_value)
+    context.user_data.clear()
+    await update.message.reply_text("Promotion asset channel updated successfully.")
+    await update.message.reply_text(_promotion_settings_text(), reply_markup=_promotion_settings_keyboard())
+    return ConversationHandler.END
+
+
 async def promotion_sticker_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await _safe_callback_answer(update.callback_query)
     context.user_data.clear()
@@ -579,29 +632,46 @@ async def promotion_sticker_handler(update: Update, context: ContextTypes.DEFAUL
     sticker_file_id = sticker.file_id
     sticker_unique_id = sticker.file_unique_id
     sticker_type = "video" if getattr(sticker, "is_video", False) else "animated" if getattr(sticker, "is_animated", False) else "static"
-    set_setting("promotion_sticker", sticker_file_id)
-    STICKER_DIR.mkdir(parents=True, exist_ok=True)
-    sticker_path = STICKER_DIR / "promotion.webp"
-    saved_path = None
+    asset_channel = get_promotion_asset_channel()
+    if not asset_channel:
+        await update.message.reply_text("Please configure the asset channel first.")
+        return SET_PROMOTION_STICKER
     if _application is None:
-        logger.warning("Promotion sticker upload skipped file download because application is unavailable")
+        logger.warning("Promotion sticker upload skipped because application is unavailable")
+        await update.message.reply_text("Bot application is not available right now.")
+        return SET_PROMOTION_STICKER
+    try:
+        logger.info("ASSET STICKER FORWARD START asset_channel=%s", asset_channel)
+        await telegram_service.ensure_connected()
+        client = telegram_service._ensure_client()
+        asset_entity = await telegram_service.resolve_entity(str(asset_channel))
+        forwarded = await client.forward_messages(
+            asset_entity,
+            update.message.message_id,
+            from_peer=update.effective_chat.id,
+        )
+        message_id = None
+        if isinstance(forwarded, list) and forwarded:
+            message_id = getattr(forwarded[0], "id", None) or getattr(forwarded[0], "message_id", None)
+        elif forwarded is not None:
+            message_id = getattr(forwarded, "id", None) or getattr(forwarded, "message_id", None)
+        if not message_id:
+            raise RuntimeError("Could not determine forwarded sticker message_id")
+        set_promotion_sticker_message_id(message_id)
+        set_setting("promotion_sticker", None)
         set_setting("promotion_sticker_path", None)
-    else:
-        try:
-            tg_file = await _application.bot.get_file(sticker_file_id)
-            await tg_file.download_to_drive(custom_path=str(sticker_path))
-            set_setting("promotion_sticker_path", str(sticker_path))
-            saved_path = str(sticker_path)
-        except Exception:
-            logger.exception("Failed to download promotion sticker to %s", sticker_path)
-            set_setting("promotion_sticker_path", None)
-    logger.info(
-        "promotion_sticker uploaded file_id=%s unique_id=%s type=%s saved_path=%s",
-        sticker_file_id,
-        sticker_unique_id,
-        sticker_type,
-        saved_path,
-    )
+        logger.info(
+            "ASSET STICKER FORWARD SUCCESS asset_channel=%s message_id=%s file_id=%s unique_id=%s type=%s",
+            asset_channel,
+            message_id,
+            sticker_file_id,
+            sticker_unique_id,
+            sticker_type,
+        )
+    except Exception:
+        logger.exception("ASSET STICKER FORWARD FAILED asset_channel=%s", asset_channel)
+        await update.message.reply_text("Failed to store sticker in the asset channel.")
+        return SET_PROMOTION_STICKER
     context.user_data.clear()
     await update.message.reply_text("Promotion sticker updated successfully.")
     await update.message.reply_text(
@@ -615,6 +685,8 @@ async def promotion_sticker_remove_callback(update: Update, context: ContextType
     await _safe_callback_answer(update.callback_query)
     set_setting("promotion_sticker", None)
     set_setting("promotion_sticker_path", None)
+    set_promotion_asset_channel(None)
+    set_promotion_sticker_message_id(None)
     await _send_or_edit(update, "Promotion sticker removed.", _promotion_settings_keyboard())
 
 
@@ -1404,6 +1476,9 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if promotion_sticker_flow:
         await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
         return ConversationHandler.END
+    if context.user_data.get("promotion_asset_channel_flow"):
+        await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
+        return ConversationHandler.END
     await _send_or_edit(update, "Cancelled.", _main_menu())
     return ConversationHandler.END
 
@@ -1440,6 +1515,7 @@ async def start_controller() -> None:
             CallbackQueryHandler(promotion_settings_callback, pattern="^promotion:settings$"),
             CallbackQueryHandler(promotion_mode_callback, pattern="^promotion:mode$"),
             CallbackQueryHandler(promotion_mode_set_callback, pattern="^promotion:mode:"),
+            CallbackQueryHandler(promotion_asset_channel_entry, pattern="^promotion:set_channel$"),
             CallbackQueryHandler(promotion_sticker_entry, pattern="^promotion:set_sticker$"),
             CallbackQueryHandler(promotion_sticker_remove_callback, pattern="^promotion:remove_sticker$"),
         ],
@@ -1471,6 +1547,7 @@ async def start_controller() -> None:
             SET_GROUP_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_set_message_handler)],
             EDIT_GROUP_TIME_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_start_handler)],
             EDIT_GROUP_TIME_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_end_handler)],
+            SET_PROMOTION_ASSET_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, promotion_asset_channel_handler)],
             SET_PROMOTION_STICKER: [MessageHandler(filters.ALL & ~filters.COMMAND, promotion_sticker_handler)],
         },
         fallbacks=[
