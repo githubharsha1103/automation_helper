@@ -583,9 +583,9 @@ class AutomationService:
 
     async def run_forever(self) -> None:
         loop_start_overall = time.monotonic()
-        self._running = bool(await aget_setting("automation_running", False))
-        self._paused = bool(await aget_setting("automation_paused", False))
         while True:
+            self._running = bool(await aget_setting("automation_running", False))
+            self._paused = bool(await aget_setting("automation_paused", False))
             delay_seconds = GROUP_LOOP_POLL_SECONDS
             cycle_start = time.monotonic()
             timings: list[tuple[str, float]] = []
@@ -610,7 +610,7 @@ class AutomationService:
                 groups = await alist_groups(enabled_only=True)
                 self._log_timing("DB READ list_groups", db_groups_start, timings)
                 db_messages_start = time.monotonic()
-                messages = await alist_messages()
+                messages = await alist_messages(active_only=True)
                 self._log_timing("DB READ list_messages", db_messages_start, timings)
                 self.last_active_messages_count = len(messages)
                 logger.warning("ACTIVE PROMOTION MESSAGES LOADED: count=%s", len(messages))
@@ -889,13 +889,34 @@ async def handle_bot_automation(event) -> None:
         metrics = CycleMetrics(timings=timings)
         token = CURRENT_CYCLE.set(metrics)
         chat = await event.get_chat()
-        bot_username = getattr(chat, "username", None)
+        sender = await event.get_sender()
+        chat_username = getattr(chat, "username", None)
+        sender_username = getattr(sender, "username", None)
+        sender_is_bot = bool(getattr(sender, "bot", False))
+        if not sender_is_bot:
+            logger.warning("BOT PROMOTION SKIP: sender_not_bot")
+            return
+        bot_username = sender_username
+        logger.warning(
+            "BOT LOOKUP SOURCE: chat_username=%s sender_username=%s sender_is_bot=%s lookup_username=%s",
+            chat_username,
+            sender_username,
+            sender_is_bot,
+            bot_username,
+        )
         if not bot_username:
             logger.warning("BOT PROMOTION SKIP: missing_username")
             return
 
         bots = await aget_bots()
         bot = bots.get(bot_username) or await aget_bot(bot_username)
+        enabled = is_bot_enabled(bot_username, False) if bot else None
+        logger.warning(
+            "BOT LOOKUP RESULT: username=%s exists=%s enabled=%s",
+            bot_username,
+            bool(bot),
+            enabled,
+        )
         if not bot or not is_bot_enabled(bot_username, False):
             logger.warning(
                 "BOT PROMOTION SKIP: bot_missing_or_disabled bot=%s exists=%s enabled=%s",

@@ -407,7 +407,8 @@ def _normalize_command(value: str) -> str:
 
 
 def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
-    existing_enabled = bool(bot.get("enabled", is_bot_enabled(bot_name, False)))
+    existing = get_bots().get(bot_name, {})
+    existing_enabled = bool(bot.get("enabled", existing.get("enabled", True)))
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
     return {
@@ -425,6 +426,7 @@ def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
 def _save_bot_config(bot_name: str, bot: dict) -> dict:
     normalized = _canonical_bot_config(bot_name, bot)
     add_bot(bot_name, normalized)
+    logger.warning("BOT SAVED: name=%s enabled=%s", bot_name, normalized.get("enabled"))
     set_bot_enabled(bot_name, normalized["enabled"])
     return normalized
 
@@ -824,7 +826,7 @@ async def bot_after_chat_delay_handler(update: Update, context: ContextTypes.DEF
     config["after_chat_delay"] = delay
     bot_name = config["username"]
     existing = get_bots().get(bot_name, {})
-    enabled = existing.get("enabled", False) if context.user_data.get("bot_flow_mode") == "edit" else False
+    enabled = existing.get("enabled", True) if context.user_data.get("bot_flow_mode") == "edit" else True
     saved_config = {
         **existing,
         "start_cmd": config["start_cmd"],

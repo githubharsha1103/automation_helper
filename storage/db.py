@@ -235,6 +235,7 @@ def _bots_collection():
 def add_bot(bot_name: str, config: dict[str, Any]) -> bool:
     _bots_collection().replace_one({"_id": bot_name}, {"_id": bot_name, **config, "updated_at": datetime.utcnow()}, upsert=True)
     _BOT_CACHE[bot_name] = dict(config)
+    logger.warning("BOT SAVED: name=%s enabled=%s", bot_name, config.get("enabled"))
     return True
 
 
@@ -483,15 +484,24 @@ def get_message(message_id: int) -> dict[str, Any] | None:
 
 def list_messages(active_only: bool = True) -> list[dict[str, Any]]:
     start = time.monotonic()
+    if active_only:
+        query = {"is_active": True}
+        messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _messages_collection().find(query).sort("id", 1)]
+        for message in messages:
+            message_id = int(message.get("id"))
+            _MESSAGE_CACHE[message_id] = dict(message)
+        elapsed_ms = (time.monotonic() - start) * 1000
+        _record_db_metric("list_messages", False, elapsed_ms)
+        record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": False, "active_only": active_only})
+        return messages
     if _MESSAGE_CACHE:
         messages = [dict(message) for message in _MESSAGE_CACHE.values()]
-        filtered = [message for message in messages if message.get("is_active", False)] if active_only else messages
-        result = sorted(filtered, key=lambda item: item.get("id", 0))
+        result = sorted(messages, key=lambda item: item.get("id", 0))
         elapsed_ms = (time.monotonic() - start) * 1000
         _record_db_metric("list_messages", True, elapsed_ms)
         record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": True, "active_only": active_only})
         return result
-    query = {"is_active": True} if active_only else {}
+    query = {}
     messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _messages_collection().find(query).sort("id", 1)]
     for message in messages:
         message_id = int(message.get("id"))
