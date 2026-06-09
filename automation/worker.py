@@ -276,6 +276,11 @@ class TelegramService:
             "last_send_ms": round(self.last_send_ms, 2),
             "last_send_success": self.last_send_success,
             "last_error": self.last_error,
+            "last_skip_reason": self.last_skip_reason,
+            "eligible_groups_count": self.last_eligible_groups_count,
+            "active_messages_count": self.last_active_messages_count,
+            "last_promotion_attempt": self.last_promotion_attempt,
+            "last_successful_promotion": self.last_successful_promotion,
         }
 
 @dataclass
@@ -290,6 +295,26 @@ class AutomationService:
         self._running = False
         self._paused = False
         self._wake_event = asyncio.Event()
+        self.last_skip_reason: str | None = None
+        self.last_eligible_groups_count = 0
+        self.last_active_messages_count = 0
+        self.last_promotion_attempt: dict[str, object] | None = None
+        self.last_successful_promotion: dict[str, object] | None = None
+
+    def _record_skip(self, reason: str, group: dict | None = None, message: dict | None = None, **extra: object) -> None:
+        self.last_skip_reason = reason
+        logger.warning(
+            "PROMOTION SKIPPED: reason=%s group=%s status=%s current_time=%s next_run_at=%s cooldown_until=%s promotion_mode=%s active_messages_count=%s extra=%s",
+            reason,
+            None if group is None else group.get("group_id"),
+            None if group is None else group.get("status"),
+            self._utc_now().isoformat(),
+            None if group is None else group.get("next_run_at"),
+            None if group is None else group.get("cooldown_until"),
+            self._promotion_mode(),
+            self.last_active_messages_count,
+            extra or {},
+        )
 
     @staticmethod
     def _log_timing(label: str, start: float, timings: list[tuple[str, float]]) -> None:
@@ -363,6 +388,12 @@ class AutomationService:
         cycle_start = time.monotonic()
         asset_channel = self._promotion_asset_channel()
         sticker_message_id = self._promotion_sticker_message_id()
+        logger.warning(
+            "BEFORE _send_asset_sticker(): target=%s asset_channel=%s message_id=%s",
+            target,
+            asset_channel,
+            sticker_message_id,
+        )
         if not asset_channel or not sticker_message_id:
             logger.info("ASSET STICKER NOT CONFIGURED target=%s asset_channel=%s message_id=%s", target, asset_channel, sticker_message_id)
             record_operation(
@@ -387,6 +418,12 @@ class AutomationService:
             await client.forward_messages(target_entity, sticker_message_id, from_peer=asset_entity)
             logger.info(
                 "ASSET STICKER FORWARD SUCCESS target=%s asset_channel=%s message_id=%s",
+                target,
+                asset_channel,
+                sticker_message_id,
+            )
+            logger.warning(
+                "AFTER _send_asset_sticker(): target=%s asset_channel=%s message_id=%s",
                 target,
                 asset_channel,
                 sticker_message_id,
@@ -431,32 +468,67 @@ class AutomationService:
 
     async def _send_group_promotion(self, group: dict, message: dict) -> None:
         mode = self._promotion_mode()
+        self.last_promotion_attempt = {
+            "group_id": group.get("group_id"),
+            "message_id": message.get("id"),
+            "promotion_mode": mode,
+            "current_time": self._utc_now().isoformat(),
+        }
+        logger.warning(
+            "GROUP PROMOTION DISPATCH: group_id=%s group_status=%s next_run_at=%s cooldown_until=%s mode=%s message_id=%s",
+            group.get("group_id"),
+            group.get("status"),
+            group.get("next_run_at"),
+            group.get("cooldown_until"),
+            mode,
+            message.get("id"),
+        )
         if mode in {"sticker", "both"}:
             sticker_sent = await self._send_promotion_sticker(group["group_id"])
             if mode == "sticker":
+                if sticker_sent:
+                    self.last_successful_promotion = dict(self.last_promotion_attempt)
                 return
             if sticker_sent:
                 await asyncio.sleep(1)
             if group.get("special_message"):
+                logger.warning("BEFORE send_text(): group_id=%s", group.get("group_id"))
                 await self.telegram.send_text(group["group_id"], group["special_message"])
+                logger.warning("AFTER send_text(): group_id=%s", group.get("group_id"))
             else:
+                logger.warning("BEFORE send_saved_message(): group_id=%s message_id=%s", group.get("group_id"), message.get("id"))
                 await self.telegram.send_saved_message(group["group_id"], message)
+                logger.warning("AFTER send_saved_message(): group_id=%s message_id=%s", group.get("group_id"), message.get("id"))
+            self.last_successful_promotion = dict(self.last_promotion_attempt)
             return
         if group.get("special_message"):
+            logger.warning("BEFORE send_text(): group_id=%s", group.get("group_id"))
             await self.telegram.send_text(group["group_id"], group["special_message"])
+            logger.warning("AFTER send_text(): group_id=%s", group.get("group_id"))
         else:
+            logger.warning("BEFORE send_saved_message(): group_id=%s message_id=%s", group.get("group_id"), message.get("id"))
             await self.telegram.send_saved_message(group["group_id"], message)
+            logger.warning("AFTER send_saved_message(): group_id=%s message_id=%s", group.get("group_id"), message.get("id"))
+        self.last_successful_promotion = dict(self.last_promotion_attempt)
 
     async def _send_bot_promotion(self, bot_username: str, message: dict) -> None:
         mode = self._promotion_mode()
+        logger.warning(
+            "BOT PROMOTION DISPATCH: bot=%s mode=%s message_id=%s",
+            bot_username,
+            mode,
+            message.get("id"),
+        )
         if mode in {"sticker", "both"}:
             sticker_sent = await self._send_promotion_sticker(bot_username)
             if mode == "sticker":
                 return
             if sticker_sent:
                 await asyncio.sleep(1)
+            logger.warning("BEFORE send_saved_payload(): bot=%s message_id=%s", bot_username, message.get("id"))
             await self.telegram.send_saved_payload(bot_username, message)
             return
+        logger.warning("BEFORE send_saved_payload(): bot=%s message_id=%s", bot_username, message.get("id"))
         await self.telegram.send_saved_payload(bot_username, message)
 
     def _advance_snapshot(
@@ -523,11 +595,13 @@ class AutomationService:
                 logger.info("[LOOP START] running=%s paused=%s", self._running, self._paused)
 
                 if not self._running:
+                    logger.warning("WORKER LOOP EARLY RETURN: running=False")
                     self._wake_event.clear()
                     await self._wake_event.wait()
                     continue
 
                 if self._paused:
+                    logger.warning("WORKER LOOP EARLY RETURN: paused=True")
                     self._wake_event.clear()
                     await self._wake_event.wait()
                     continue
@@ -538,8 +612,18 @@ class AutomationService:
                 db_messages_start = time.monotonic()
                 messages = await alist_messages()
                 self._log_timing("DB READ list_messages", db_messages_start, timings)
+                self.last_active_messages_count = len(messages)
+                logger.warning("ACTIVE PROMOTION MESSAGES LOADED: count=%s", len(messages))
+                for item in messages:
+                    logger.warning(
+                        "ACTIVE PROMOTION MESSAGE DETAIL: message_id=%s is_active=%s content_length=%s",
+                        item.get("id"),
+                        item.get("is_active"),
+                        len(str(item.get("content", ""))),
+                    )
                 group_ids = [group.get("group_id") for group in groups]
                 metrics.groups = len(groups)
+                self.last_eligible_groups_count = len(groups)
 
                 logger.info(
                     "automation_groups_loaded total=%s ids=%s",
@@ -548,6 +632,12 @@ class AutomationService:
                 )
 
                 if not groups or not messages:
+                    self._record_skip("missing_groups_or_messages", groups=len(groups), messages=len(messages))
+                    logger.warning(
+                        "WORKER LOOP SKIP: groups_or_messages_missing groups=%s messages=%s",
+                        len(groups),
+                        len(messages),
+                    )
                     logger.info("Automation paused because groups or messages are missing")
                     self._wake_event.clear()
                     try:
@@ -565,6 +655,15 @@ class AutomationService:
                     message = messages[snapshot.message_index % len(messages)]
                     cooldown_until = self._parse_timestamp(group.get("cooldown_until"))
                     next_run_at = self._parse_timestamp(group.get("next_run_at"))
+                    logger.warning(
+                        "GROUP ELIGIBILITY CHECK group_id=%s offset=%s snapshot_group_index=%s message_id=%s next_run_at=%s cooldown_until=%s",
+                        group.get("group_id"),
+                        offset,
+                        snapshot.group_index,
+                        message.get("id"),
+                        group.get("next_run_at"),
+                        group.get("cooldown_until"),
+                    )
 
                     logger.info(
                         "automation_group_processing index=%s total=%s group_id=%s group_name=%s message_id=%s next_run_at=%s",
@@ -578,14 +677,30 @@ class AutomationService:
 
                     if next_run_at is None:
                         next_run_at = now
+                        logger.warning(
+                            "WORKER LOOP SKIP CONDITION: next_run_at_missing group_id=%s setting_now=%s",
+                            group.get("group_id"),
+                            next_run_at.isoformat(),
+                        )
                         await aupdate_group_runtime(group["group_id"], next_run_at=next_run_at.isoformat())
 
-                    if now < next_run_at:
-                        continue
+                    logger.warning(
+                        "NEXT_RUN_AT BYPASS ACTIVE: group_id=%s now=%s next_run_at=%s",
+                        group.get("group_id"),
+                        now.isoformat(),
+                        next_run_at.isoformat(),
+                    )
 
                     due_processed = True
 
                     if cooldown_until and now < cooldown_until:
+                        self._record_skip("cooldown", group=group, message=message)
+                        logger.warning(
+                            "WORKER LOOP SKIP CONDITION: cooldown group_id=%s now=%s cooldown_until=%s",
+                            group.get("group_id"),
+                            now.isoformat(),
+                            cooldown_until.isoformat(),
+                        )
                         scheduled_next_run = self._compute_next_run_at(group, message, now)
                         await aupdate_group_runtime(
                             group["group_id"],
@@ -605,6 +720,14 @@ class AutomationService:
                         continue
 
                     if not self._is_within_active_window(group, now):
+                        self._record_skip("inactive_window", group=group, message=message)
+                        logger.warning(
+                            "WORKER LOOP SKIP CONDITION: inactive_window group_id=%s now_hour=%s active_start=%s active_end=%s",
+                            group.get("group_id"),
+                            now.hour,
+                            group.get("active_start_hour"),
+                            group.get("active_end_hour"),
+                        )
                         existing_next_run_at = self._parse_timestamp(group.get("next_run_at"))
                         next_run_candidate = now + timedelta(minutes=5)
                         if existing_next_run_at is not None:
@@ -621,10 +744,20 @@ class AutomationService:
                         continue
 
                     try:
+                        logger.warning(
+                            "BEFORE _send_group_promotion(): group_id=%s message_id=%s",
+                            group.get("group_id"),
+                            message.get("id"),
+                        )
                         bots_start = time.monotonic()
                         metrics.bots = len(await aget_bots())
                         self._log_timing("DB READ get_bots", bots_start, timings)
                         await self._send_group_promotion(group, message)
+                        logger.warning(
+                            "AFTER _send_group_promotion(): group_id=%s message_id=%s",
+                            group.get("group_id"),
+                            message.get("id"),
+                        )
                         next_run_at_value = self._compute_next_run_at(group, message, now)
                         await aupdate_group_runtime(
                             group["group_id"],
@@ -710,6 +843,8 @@ class AutomationService:
                     logger.info("[CYCLE COMPLETE] result=success group_id=%s", group.get("group_id"))
 
                 if not due_processed:
+                    self._record_skip("no_due_groups")
+                    logger.warning("WORKER LOOP EARLY RETURN: no_due_groups")
                     logger.info("[CYCLE COMPLETE] result=no_due_groups")
             except Exception as exc:
                 logger.exception("[LOOP ERROR] %s", exc)
@@ -756,11 +891,18 @@ async def handle_bot_automation(event) -> None:
         chat = await event.get_chat()
         bot_username = getattr(chat, "username", None)
         if not bot_username:
+            logger.warning("BOT PROMOTION SKIP: missing_username")
             return
 
         bots = await aget_bots()
         bot = bots.get(bot_username) or await aget_bot(bot_username)
         if not bot or not is_bot_enabled(bot_username, False):
+            logger.warning(
+                "BOT PROMOTION SKIP: bot_missing_or_disabled bot=%s exists=%s enabled=%s",
+                bot_username,
+                bool(bot),
+                is_bot_enabled(bot_username, False) if bot else None,
+            )
             return
 
         text = (event.raw_text or "").lower()
@@ -777,50 +919,88 @@ async def handle_bot_automation(event) -> None:
             return
 
         if is_bot_paused(bot_username, False):
+            logger.warning("BOT PROMOTION SKIP: paused bot=%s", bot_username)
             return
 
         match_triggers = [item.lower() for item in (bot.get("match_triggers") or bot.get("triggers") or [])]
         if not any(trigger in text for trigger in match_triggers):
+            logger.warning(
+                "BOT PROMOTION SKIP: no_match bot=%s triggers=%s text=%s",
+                bot_username,
+                match_triggers,
+                text,
+            )
             return
 
         after_match_delay = float(bot.get("after_match_delay", 1) or 0)
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
-        messages = await alist_messages(active_only=False)
+        messages = await alist_messages(active_only=True)
         promotion_mode = str(await aget_setting("promotion_mode", "message") or "message").strip().lower()
+        logger.warning(
+            "PROMOTION MODE: bot=%s mode=%s active_messages=%s",
+            bot_username,
+            promotion_mode,
+            len(messages),
+        )
+        for item in messages:
+            logger.warning(
+                "ACTIVE PROMOTION MESSAGE DETAIL: message_id=%s is_active=%s content_length=%s",
+                item.get("id"),
+                item.get("is_active"),
+                len(str(item.get("content", ""))),
+            )
         logger.info(
             "PROMOTION STICKER CHECK: asset_channel=%s sticker_message_id=%s",
             get_promotion_asset_channel(),
             get_promotion_sticker_message_id(),
         )
         if promotion_mode not in {"message", "sticker", "both"}:
+            logger.warning("BOT PROMOTION SKIP: invalid_mode bot=%s mode=%s forcing_message", bot_username, promotion_mode)
             promotion_mode = "message"
 
         if after_match_delay:
             await asyncio.sleep(after_match_delay)
         if messages:
             selected_message = random.choice(messages)
+            logger.warning("SELECTED PROMOTION MESSAGE ID: bot=%s message_id=%s", bot_username, selected_message.get("id"))
             try:
                 if promotion_mode == "sticker":
-                    if await automation_service._send_promotion_sticker(bot_username):
+                    logger.warning("BEFORE STICKER SEND: bot=%s mode=sticker", bot_username)
+                    sticker_sent = await automation_service._send_promotion_sticker(bot_username)
+                    logger.warning("AFTER STICKER SEND: bot=%s mode=sticker sent=%s", bot_username, sticker_sent)
+                    if sticker_sent:
                         pass
                 elif promotion_mode == "both":
-                    if await automation_service._send_promotion_sticker(bot_username):
+                    logger.warning("BEFORE STICKER SEND: bot=%s mode=both", bot_username)
+                    sticker_sent = await automation_service._send_promotion_sticker(bot_username)
+                    logger.warning("AFTER STICKER SEND: bot=%s mode=both sent=%s", bot_username, sticker_sent)
+                    if sticker_sent:
                         await asyncio.sleep(1)
+                        logger.warning("BEFORE send_saved_payload(): bot=%s message_id=%s", bot_username, selected_message.get("id"))
                         await telegram_service.send_saved_payload(bot_username, selected_message)
+                        logger.warning("AFTER send_saved_payload(): bot=%s message_id=%s", bot_username, selected_message.get("id"))
                         metrics.messages_sent += 1
                 else:
+                    logger.warning("BEFORE send_saved_payload(): bot=%s message_id=%s", bot_username, selected_message.get("id"))
                     await telegram_service.send_saved_payload(bot_username, selected_message)
+                    logger.warning("AFTER send_saved_payload(): bot=%s message_id=%s", bot_username, selected_message.get("id"))
                     metrics.messages_sent += 1
+                logger.warning("AFTER MESSAGE SEND: bot=%s mode=%s", bot_username, promotion_mode)
             except Exception:
                 logger.exception("Failed to send promotion payload to %s", bot_username)
+        else:
+            logger.warning("BOT PROMOTION SKIP: no_active_messages bot=%s", bot_username)
+            return
         stop_cmd = _normalize_command(bot.get("stop_cmd"))
         if stop_cmd:
+            logger.warning("BEFORE STOP COMMAND: bot=%s stop_cmd=%s", bot_username, stop_cmd)
             await telegram_service.client.send_message(bot_username, stop_cmd)
 
         if after_chat_delay:
             await asyncio.sleep(after_chat_delay)
         start_cmd = _normalize_command(bot.get("start_cmd"))
         if start_cmd and is_bot_enabled(bot_username, False):
+            logger.warning("BEFORE START COMMAND: bot=%s start_cmd=%s", bot_username, start_cmd)
             await telegram_service.client.send_message(bot_username, start_cmd)
             logger.info("Automation cycled for %s", bot_username)
         logger.info(
