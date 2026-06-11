@@ -945,6 +945,12 @@ class AutomationService:
             timings: list[tuple[str, float]] = []
             metrics = CycleMetrics(timings=timings)
             token = CURRENT_CYCLE.set(metrics)
+            bots: list[dict[str, object]] = []
+            groups: list[dict[str, object]] = []
+            messages: list[dict[str, object]] = []
+            enabled_bots_count = 0
+            enabled_groups_count = 0
+            active_messages_count = 0
             try:
                 self._running = True
                 self._paused = False
@@ -952,35 +958,47 @@ class AutomationService:
 
                 db_bots_start = time.monotonic()
                 bots = list_enabled_bots()
+                enabled_bots_count = len(bots)
                 self._log_timing("DB READ list_enabled_bots", db_bots_start, timings)
                 if not bots:
                     self.last_active_messages_count = 0
                     self.last_eligible_groups_count = 0
                     self.last_promotion_summary = {"enabled_bots": 0, "enabled_groups": 0, "active_messages": 0}
                     self._record_skip("no_enabled_bots")
+                    logger.warning("GROUP WORKER IDLE: enabled_bots=0")
                     logger.warning("WORKER LOOP SKIP: enabled_bots=0, skipping group/message reads")
+                    enabled_groups_count = 0
+                    active_messages_count = 0
                     continue
                 db_groups_start = time.monotonic()
                 groups = list_enabled_groups()
+                enabled_groups_count = len(groups)
                 self._log_timing("DB READ list_enabled_groups", db_groups_start, timings)
                 db_messages_start = time.monotonic()
                 messages = await alist_messages(active_only=True)
+                active_messages_count = len(messages)
                 self._log_timing("DB READ list_messages", db_messages_start, timings)
                 mongo_total_ms = sum(elapsed for label, elapsed in timings if label.startswith("DB READ"))
-                logger.info("WORKER MONGO TOTAL elapsed_ms=%.2f enabled_bots=%s enabled_groups=%s active_messages=%s", mongo_total_ms, len(bots), len(groups), len(messages))
+                logger.info(
+                    "WORKER MONGO TOTAL elapsed_ms=%.2f enabled_bots=%s enabled_groups=%s active_messages=%s",
+                    mongo_total_ms,
+                    enabled_bots_count,
+                    enabled_groups_count,
+                    active_messages_count,
+                )
                 self.last_promotion_summary = {
-                    "enabled_bots": len(bots),
-                    "enabled_groups": len(groups),
-                    "active_messages": len(messages),
+                    "enabled_bots": enabled_bots_count,
+                    "enabled_groups": enabled_groups_count,
+                    "active_messages": active_messages_count,
                 }
                 logger.warning(
                     "PROMOTION SCHEDULER LOAD: enabled_bots=%s enabled_groups=%s active_messages=%s",
-                    len(bots),
-                    len(groups),
-                    len(messages),
+                    enabled_bots_count,
+                    enabled_groups_count,
+                    active_messages_count,
                 )
-                self.last_active_messages_count = len(messages)
-                logger.warning("ACTIVE PROMOTION MESSAGES LOADED: count=%s", len(messages))
+                self.last_active_messages_count = active_messages_count
+                logger.warning("ACTIVE PROMOTION MESSAGES LOADED: count=%s", active_messages_count)
                 for item in messages:
                     logger.warning(
                         "ACTIVE PROMOTION MESSAGE DETAIL: message_id=%s is_active=%s content_length=%s",
@@ -989,22 +1007,22 @@ class AutomationService:
                         len(str(item.get("content", ""))),
                     )
                 group_ids = [group.get("group_id") for group in groups]
-                metrics.groups = len(groups)
-                self.last_eligible_groups_count = len(groups)
+                metrics.groups = enabled_groups_count
+                self.last_eligible_groups_count = enabled_groups_count
 
                 logger.info(
                     "automation_groups_loaded total=%s ids=%s",
-                    len(groups),
+                    enabled_groups_count,
                     group_ids,
                 )
 
                 if not groups or not messages or not bots:
-                    self._record_skip("missing_groups_or_messages", groups=len(groups), messages=len(messages), bots=len(bots))
+                    self._record_skip("missing_groups_or_messages", groups=enabled_groups_count, messages=active_messages_count, bots=enabled_bots_count)
                     logger.warning(
                         "WORKER LOOP SKIP: groups_or_messages_missing groups=%s messages=%s bots=%s",
-                        len(groups),
-                        len(messages),
-                        len(bots),
+                        enabled_groups_count,
+                        active_messages_count,
+                        enabled_bots_count,
                     )
                     continue
 
@@ -1012,6 +1030,7 @@ class AutomationService:
                 now = self._utc_now()
                 for offset in range(len(groups)):
                     group = groups[(snapshot.group_index + offset) % len(groups)]
+                    current_message = messages[snapshot.message_index % len(messages)]
                     assigned_bot_name = str(group.get("assigned_bot") or group.get("bot_username") or "").strip().lstrip("@")
                     logger.warning(
                         "GROUP BOT ASSIGNMENT: group_id=%s group_username=%s assigned_bot=%s",
@@ -1056,7 +1075,7 @@ class AutomationService:
                         len(groups),
                         group.get("group_id"),
                         group.get("group_name"),
-                        message.get("id"),
+                        current_message.get("id"),
                         group.get("next_run_at"),
                     )
 
@@ -1128,21 +1147,20 @@ class AutomationService:
                         continue
 
                     try:
-                        message = messages[snapshot.message_index % len(messages)]
                         logger.warning(
                             "BEFORE _send_group_promotion(): group_id=%s bot=%s message_id=%s",
                             group.get("group_id"),
                             assigned_bot_name,
-                            message.get("id"),
+                            current_message.get("id"),
                         )
-                        await self._send_group_promotion(group, message)
+                        await self._send_group_promotion(group, current_message)
                         logger.warning(
                             "AFTER _send_group_promotion(): group_id=%s bot=%s message_id=%s",
                             group.get("group_id"),
                             assigned_bot_name,
-                            message.get("id"),
+                            current_message.get("id"),
                         )
-                        next_run_at_value = self._compute_next_run_at(group, message, now)
+                        next_run_at_value = self._compute_next_run_at(group, current_message, now)
                         await aupdate_group_runtime(
                             group["group_id"],
                             last_status="success",
@@ -1160,7 +1178,7 @@ class AutomationService:
                         self.last_successful_promotion = {
                             "group_id": group.get("group_id"),
                             "bot": assigned_bot_name,
-                            "message_id": message.get("id"),
+                            "message_id": current_message.get("id"),
                             "next_run_at": next_run_at_value,
                         }
                         self.last_failure_summary = None
@@ -1251,10 +1269,10 @@ class AutomationService:
                 failures = 0 if self.last_failure_summary is None else 1
                 logger.warning(
                     "SCHEDULER SUMMARY: enabled_bots=%s enabled_groups=%s eligible_groups=%s active_messages=%s promotions_sent=%s failures=%s",
-                    len(bots),
-                    len(groups),
-                    len(groups),
-                    len(messages),
+                    enabled_bots_count,
+                    enabled_groups_count,
+                    enabled_groups_count,
+                    active_messages_count,
                     promotions_sent,
                     failures,
                 )
