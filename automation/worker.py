@@ -89,7 +89,7 @@ SESSION_NAME = _env("TG_SESSION", "session")
 SESSION_STRING = _env("SESSION_STRING")
 GROUP_FAILURE_THRESHOLD = int(_env("GROUP_FAILURE_THRESHOLD", "3") or "3")
 GROUP_FAILURE_COOLDOWN_MINUTES = int(_env("GROUP_FAILURE_COOLDOWN_MINUTES", "10") or "10")
-GROUP_LOOP_POLL_SECONDS = 2
+GROUP_LOOP_POLL_SECONDS = 5
 
 
 class TelegramService:
@@ -954,7 +954,7 @@ class AutomationService:
             try:
                 self._running = True
                 self._paused = False
-                logger.info("[LOOP START] running=%s paused=%s", self._running, self._paused)
+                logger.debug("[LOOP START] running=%s paused=%s", self._running, self._paused)
 
                 db_bots_start = time.monotonic()
                 bots = list_enabled_bots()
@@ -991,21 +991,14 @@ class AutomationService:
                     "enabled_groups": enabled_groups_count,
                     "active_messages": active_messages_count,
                 }
-                logger.warning(
+                logger.info(
                     "PROMOTION SCHEDULER LOAD: enabled_bots=%s enabled_groups=%s active_messages=%s",
                     enabled_bots_count,
                     enabled_groups_count,
                     active_messages_count,
                 )
                 self.last_active_messages_count = active_messages_count
-                logger.warning("ACTIVE PROMOTION MESSAGES LOADED: count=%s", active_messages_count)
-                for item in messages:
-                    logger.warning(
-                        "ACTIVE PROMOTION MESSAGE DETAIL: message_id=%s is_active=%s content_length=%s",
-                        item.get("id"),
-                        item.get("is_active"),
-                        len(str(item.get("content", ""))),
-                    )
+                logger.debug("ACTIVE PROMOTION MESSAGES LOADED: count=%s", active_messages_count)
                 group_ids = [group.get("group_id") for group in groups]
                 metrics.groups = enabled_groups_count
                 self.last_eligible_groups_count = enabled_groups_count
@@ -1032,7 +1025,7 @@ class AutomationService:
                     group = groups[(snapshot.group_index + offset) % len(groups)]
                     current_message = messages[snapshot.message_index % len(messages)]
                     assigned_bot_name = str(group.get("assigned_bot") or group.get("bot_username") or "").strip().lstrip("@")
-                    logger.warning(
+                    logger.debug(
                         "GROUP BOT ASSIGNMENT: group_id=%s group_username=%s assigned_bot=%s",
                         group.get("group_id"),
                         group.get("group_name"),
@@ -1059,7 +1052,7 @@ class AutomationService:
                         continue
                     cooldown_until = self._parse_timestamp(group.get("cooldown_until"))
                     next_run_at = self._parse_timestamp(group.get("next_run_at"))
-                    logger.warning(
+                    logger.debug(
                         "GROUP ELIGIBILITY CHECK group_id=%s offset=%s snapshot_group_index=%s message_id=%s next_run_at=%s cooldown_until=%s",
                         group.get("group_id"),
                         offset,
@@ -1085,7 +1078,7 @@ class AutomationService:
                     if cooldown_until is None:
                         cooldown_until = now
                         await aupdate_group_runtime(group["group_id"], cooldown_until=cooldown_until.isoformat())
-                    logger.warning(
+                    logger.debug(
                         "PROMOTION ELIGIBILITY: group_id=%s status=%s next_run_at=%s cooldown_until=%s eligible=%s",
                         group.get("group_id"),
                         group.get("status"),
@@ -1267,7 +1260,7 @@ class AutomationService:
                 )
                 promotions_sent = metrics.messages_sent
                 failures = 0 if self.last_failure_summary is None else 1
-                logger.warning(
+                logger.info(
                     "SCHEDULER SUMMARY: enabled_bots=%s enabled_groups=%s eligible_groups=%s active_messages=%s promotions_sent=%s failures=%s",
                     enabled_bots_count,
                     enabled_groups_count,
@@ -1284,7 +1277,7 @@ class AutomationService:
                     metrics.messages_sent,
                     cycle_duration_ms,
                 )
-                logger.info("[SLEEPING FOR %s SECONDS]", delay_seconds)
+                logger.debug("[SLEEPING FOR %s SECONDS]", delay_seconds)
                 await asyncio.sleep(delay_seconds)
 
 
@@ -1310,11 +1303,13 @@ async def handle_bot_automation(event) -> None:
             return
 
         bot = get_bot(bot_name) or await aget_bot(bot_name)
-        if not bot or not is_bot_enabled(bot_name, False):
-            logger.debug("BOT EVENT SKIP bot=%s exists=%s enabled=%s", bot_name, bool(bot), is_bot_enabled(bot_name, False) if bot else None)
+        enabled = bool(bot and bot.get("enabled", False))
+        if not bot or not enabled:
+            logger.debug("BOT EVENT SKIP bot=%s exists=%s enabled=%s", bot_name, bool(bot), enabled if bot else None)
             return
 
-        if any(trigger in text for trigger in [item.lower() for item in bot.get("security_triggers", [])]):
+        security_triggers = [item.lower() for item in bot.get("security_triggers", [])]
+        if any(trigger in text for trigger in security_triggers):
             set_bot_paused(bot_name, True)
             logger.warning("Security trigger hit for %s", bot_name)
             try:

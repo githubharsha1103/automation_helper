@@ -112,6 +112,28 @@ def _env(name: str, default: str = "") -> str:
 TOKEN = _env("CONTROL_BOT_TOKEN")
 ALLOWED_USER_ID = int(_env("ALLOWED_USER_ID", "0") or "0")
 _application: Application | None = None
+_VIEW_CACHE: dict[str, tuple[float, object]] = {}
+_VIEW_CACHE_TTL_SECONDS = 2.0
+
+
+def _cached_view(key: str, factory):
+    now = time.monotonic()
+    cached = _VIEW_CACHE.get(key)
+    if cached is not None:
+        cached_at, value = cached
+        if now - cached_at <= _VIEW_CACHE_TTL_SECONDS:
+            return value
+    value = factory()
+    _VIEW_CACHE[key] = (now, value)
+    return value
+
+
+def _invalidate_view_cache(*prefixes: str) -> None:
+    if not prefixes:
+        _VIEW_CACHE.clear()
+        return
+    for key in [key for key in _VIEW_CACHE if any(key.startswith(prefix) for prefix in prefixes)]:
+        _VIEW_CACHE.pop(key, None)
 
 
 def _is_allowed(update: Update) -> bool:
@@ -209,17 +231,20 @@ def _cancel_menu() -> InlineKeyboardMarkup:
 
 
 def _group_rows() -> list[list[InlineKeyboardButton]]:
-    rows: list[list[InlineKeyboardButton]] = []
-    for group in list_groups():
-        status = "ON" if group["status"] == "enabled" else "OFF"
-        rows.append(
-            [InlineKeyboardButton(f"{status} {group['group_name']}", callback_data=f"group:view:{group['group_id']}")]
-        )
-    if not rows:
-        rows.append([InlineKeyboardButton("No groups saved", callback_data="noop")])
-    rows.append([InlineKeyboardButton("Add Group", callback_data="group:add")])
-    rows.append([InlineKeyboardButton("Back", callback_data="menu:groups")])
-    return rows
+    def build() -> list[list[InlineKeyboardButton]]:
+        rows: list[list[InlineKeyboardButton]] = []
+        for group in list_groups():
+            status = "ON" if group["status"] == "enabled" else "OFF"
+            rows.append(
+                [InlineKeyboardButton(f"{status} {group['group_name']}", callback_data=f"group:view:{group['group_id']}")]
+            )
+        if not rows:
+            rows.append([InlineKeyboardButton("No groups saved", callback_data="noop")])
+        rows.append([InlineKeyboardButton("Add Group", callback_data="group:add")])
+        rows.append([InlineKeyboardButton("Back", callback_data="menu:groups")])
+        return rows
+
+    return _cached_view("group_rows", build)
 
 
 def _group_details_text(group: dict) -> str:
@@ -334,65 +359,71 @@ def _category_back_target(category: str) -> str:
 
 
 def _category_rows(category: str) -> list[list[InlineKeyboardButton]]:
-    rows: list[list[InlineKeyboardButton]] = []
-    messages = list_category_messages(category, active_only=False)
-    top_message = None
-    top_reply_rate = -1.0
-    if category == "conversational_messages":
-        for message in messages:
-            perf = get_message_performance(category, int(message["id"]))
-            sent = int(perf.get("times_sent", 0) or 0)
-            replies = int(perf.get("replies_received", 0) or 0)
-            reply_rate = (replies / sent) if sent else 0.0
-            if reply_rate > top_reply_rate:
-                top_reply_rate = reply_rate
-                top_message = message
-    for message in messages:
-        enabled = bool(message.get("enabled", True))
-        status = "Enabled" if enabled else "Disabled"
-        if category == "promotion_stickers":
-            label = f"#{message['id']} Sticker"
-        else:
-            snippet = str(message.get("content", "")).replace("\n", " ")[:28]
-            label = f"#{message['id']} {snippet}\nStatus: {status}"
-            if category == "conversational_messages":
+    def build() -> list[list[InlineKeyboardButton]]:
+        rows: list[list[InlineKeyboardButton]] = []
+        messages = list_category_messages(category, active_only=False)
+        top_message = None
+        top_reply_rate = -1.0
+        perf_cache: dict[int, dict[str, int]] = {}
+        if category == "conversational_messages":
+            for message in messages:
                 perf = get_message_performance(category, int(message["id"]))
+                perf_cache[int(message["id"])] = perf
                 sent = int(perf.get("times_sent", 0) or 0)
                 replies = int(perf.get("replies_received", 0) or 0)
-                reply_rate = f"{(replies / sent * 100):.1f}%" if sent else "0.0%"
-                label = f"{label}\nSent: {sent}\nReplies: {replies}\nReply Rate: {reply_rate}"
-            elif category == "bot_messages":
-                perf = get_message_performance(category, int(message["id"]))
-                sent = int(perf.get("times_sent", 0) or 0)
-                label = f"{label}\nSent: {sent}"
-        action_buttons = [InlineKeyboardButton(label, callback_data=f"msg:{category}:view:{message['id']}")]
-        if category in {"conversational_messages", "bot_messages"}:
-            if enabled:
-                action_buttons.append(InlineKeyboardButton("Disable", callback_data=f"msg:{category}:disable:{message['id']}"))
+                reply_rate = (replies / sent) if sent else 0.0
+                if reply_rate > top_reply_rate:
+                    top_reply_rate = reply_rate
+                    top_message = message
+        for message in messages:
+            enabled = bool(message.get("enabled", True))
+            status = "Enabled" if enabled else "Disabled"
+            if category == "promotion_stickers":
+                label = f"#{message['id']} Sticker"
             else:
-                action_buttons.append(InlineKeyboardButton("Enable", callback_data=f"msg:{category}:enable:{message['id']}"))
-        rows.append(action_buttons)
-    if not rows:
-        rows.append([InlineKeyboardButton("No messages saved", callback_data="noop")])
-    if category == "conversational_messages" and top_message:
-        rows.insert(0, [InlineKeyboardButton(f"Top Performer: #{top_message['id']}", callback_data=f"msg:{category}:view:{top_message['id']}")])
-    rows.append([InlineKeyboardButton("Add", callback_data=f"msg:{category}:add")])
-    rows.append([InlineKeyboardButton("Back", callback_data=_category_back_target(category))])
-    return rows
+                snippet = str(message.get("content", "")).replace("\n", " ")[:28]
+                label = f"#{message['id']} {snippet}\nStatus: {status}"
+                if category == "conversational_messages":
+                    perf = perf_cache.get(int(message["id"])) or get_message_performance(category, int(message["id"]))
+                    sent = int(perf.get("times_sent", 0) or 0)
+                    replies = int(perf.get("replies_received", 0) or 0)
+                    reply_rate = f"{(replies / sent * 100):.1f}%" if sent else "0.0%"
+                    label = f"{label}\nSent: {sent}\nReplies: {replies}\nReply Rate: {reply_rate}"
+                elif category == "bot_messages":
+                    perf = get_message_performance(category, int(message["id"]))
+                    sent = int(perf.get("times_sent", 0) or 0)
+                    label = f"{label}\nSent: {sent}"
+            action_buttons = [InlineKeyboardButton(label, callback_data=f"msg:{category}:view:{message['id']}")]
+            if category in {"conversational_messages", "bot_messages"}:
+                if enabled:
+                    action_buttons.append(InlineKeyboardButton("Disable", callback_data=f"msg:{category}:disable:{message['id']}"))
+                else:
+                    action_buttons.append(InlineKeyboardButton("Enable", callback_data=f"msg:{category}:enable:{message['id']}"))
+            rows.append(action_buttons)
+        if not rows:
+            rows.append([InlineKeyboardButton("No messages saved", callback_data="noop")])
+        if category == "conversational_messages" and top_message:
+            rows.insert(0, [InlineKeyboardButton(f"Top Performer: #{top_message['id']}", callback_data=f"msg:{category}:view:{top_message['id']}")])
+        rows.append([InlineKeyboardButton("Add", callback_data=f"msg:{category}:add")])
+        rows.append([InlineKeyboardButton("Back", callback_data=_category_back_target(category))])
+        return rows
+
+    return _cached_view(f"category_rows:{category}", build)
 
 
 def _bot_rows() -> list[list[InlineKeyboardButton]]:
-    rows: list[list[InlineKeyboardButton]] = []
-    for bot_name, bot in get_bots().items():
-        enabled = is_bot_enabled(bot_name, False)
-        status = "ON" if enabled else "OFF"
-        rows.append(
-            [InlineKeyboardButton(f"{status} {bot_name}", callback_data=f"bot:view:{bot_name}")]
-        )
-    if not rows:
-        rows.append([InlineKeyboardButton("No bots saved", callback_data="noop")])
-    rows.append([InlineKeyboardButton("Back", callback_data="menu:bots")])
-    return rows
+    def build() -> list[list[InlineKeyboardButton]]:
+        rows: list[list[InlineKeyboardButton]] = []
+        for bot_name, bot in get_bots().items():
+            enabled = is_bot_enabled(bot_name, False)
+            status = "ON" if enabled else "OFF"
+            rows.append([InlineKeyboardButton(f"{status} {bot_name}", callback_data=f"bot:view:{bot_name}")])
+        if not rows:
+            rows.append([InlineKeyboardButton("No bots saved", callback_data="noop")])
+        rows.append([InlineKeyboardButton("Back", callback_data="menu:bots")])
+        return rows
+
+    return _cached_view("bot_rows", build)
 
 
 def _bot_details_text(bot_name: str, bot: dict) -> str:
@@ -569,6 +600,7 @@ async def _audit_state_handler(
     user_id = getattr(getattr(update, "effective_user", None), "id", None)
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
     logger.info("ENTER STATE %s user_id=%s chat_id=%s", state_label, user_id, chat_id)
+    start = time.monotonic()
     try:
         user_message = getattr(getattr(update, "message", None), "text", None) or getattr(getattr(update, "message", None), "caption", None) or ""
         logger.info("RECEIVED USER MESSAGE %s text=%s", state_label, user_message)
@@ -581,6 +613,8 @@ async def _audit_state_handler(
         logger.exception("ERROR state=%s user_id=%s chat_id=%s", state_label, user_id, chat_id)
         raise
     finally:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info("HANDLER TIMING state=%s elapsed_ms=%.2f", state_label, elapsed_ms)
         logger.info("EXIT STATE %s", state_label)
 
 
@@ -643,30 +677,33 @@ async def _render_bot_settings(update: Update, bot_name: str) -> None:
 
 
 def _automation_status_text() -> str:
-    state = get_setting("automation_state", "IDLE")
-    enabled_groups = len(list_groups(enabled_only=True))
-    messages_count = len(list_messages())
-    active_bots = sum(1 for name in get_bots() if is_bot_enabled(name, False))
-    last_execution_time = get_setting("automation_last_execution_time", "Never")
-    promotion_mode = get_setting("promotion_mode", "message") or "message"
-    promotion_asset_channel = get_promotion_asset_channel()
-    promotion_sticker_message_id = get_promotion_sticker_message_id()
-    mode_label = {
-        "message": "Message",
-        "sticker": "Sticker",
-        "both": "Message + Sticker",
-    }.get(str(promotion_mode), "Message")
-    return (
-        f"Automation is {'running' if state == 'RUNNING' else 'paused' if state == 'PAUSED' else 'idle'}\n"
-        f"Runtime state: {state}\n"
-        f"Promotion Mode: {mode_label}\n"
-        f"Asset Channel Configured: {'Yes' if promotion_asset_channel else 'No'}\n"
-        f"Sticker Message ID: {promotion_sticker_message_id or 'N/A'}\n"
-        f"Enabled groups: {enabled_groups}\n"
-        f"Active messages: {messages_count}\n"
-        f"Active bot count: {active_bots}\n"
-        f"Last execution time: {last_execution_time}"
-    )
+    def build() -> str:
+        state = get_setting("automation_state", "IDLE")
+        enabled_groups = len(list_groups(enabled_only=True))
+        messages_count = len(list_messages())
+        active_bots = sum(1 for name in get_bots() if is_bot_enabled(name, False))
+        last_execution_time = get_setting("automation_last_execution_time", "Never")
+        promotion_mode = get_setting("promotion_mode", "message") or "message"
+        promotion_asset_channel = get_promotion_asset_channel()
+        promotion_sticker_message_id = get_promotion_sticker_message_id()
+        mode_label = {
+            "message": "Message",
+            "sticker": "Sticker",
+            "both": "Message + Sticker",
+        }.get(str(promotion_mode), "Message")
+        return (
+            f"Automation is {'running' if state == 'RUNNING' else 'paused' if state == 'PAUSED' else 'idle'}\n"
+            f"Runtime state: {state}\n"
+            f"Promotion Mode: {mode_label}\n"
+            f"Asset Channel Configured: {'Yes' if promotion_asset_channel else 'No'}\n"
+            f"Sticker Message ID: {promotion_sticker_message_id or 'N/A'}\n"
+            f"Enabled groups: {enabled_groups}\n"
+            f"Active messages: {messages_count}\n"
+            f"Active bot count: {active_bots}\n"
+            f"Last execution time: {last_execution_time}"
+        )
+
+    return _cached_view("automation_status", build)
 
 
 def _promotion_mode_label(mode: str | None) -> str:
@@ -678,17 +715,20 @@ def _promotion_mode_label(mode: str | None) -> str:
 
 
 def _promotion_settings_text() -> str:
-    mode = get_setting("promotion_mode", "message") or "message"
-    asset_channel = get_promotion_asset_channel()
-    sticker_message_id = get_promotion_sticker_message_id()
-    return (
-        "Promotion Settings\n\n"
-        f"Current Mode: {mode}\n"
-        f"Asset Channel Configured: {'Yes' if asset_channel else 'No'}\n"
-        f"Asset Channel ID: {asset_channel or 'N/A'}\n"
-        f"Sticker Message ID: {sticker_message_id or 'N/A'}\n\n"
-        "Choose an option."
-    )
+    def build() -> str:
+        mode = get_setting("promotion_mode", "message") or "message"
+        asset_channel = get_promotion_asset_channel()
+        sticker_message_id = get_promotion_sticker_message_id()
+        return (
+            "Promotion Settings\n\n"
+            f"Current Mode: {mode}\n"
+            f"Asset Channel Configured: {'Yes' if asset_channel else 'No'}\n"
+            f"Asset Channel ID: {asset_channel or 'N/A'}\n"
+            f"Sticker Message ID: {sticker_message_id or 'N/A'}\n\n"
+            "Choose an option."
+        )
+
+    return _cached_view("promotion_settings", build)
 
 
 def _promotion_settings_keyboard() -> InlineKeyboardMarkup:
@@ -705,12 +745,15 @@ def _promotion_settings_keyboard() -> InlineKeyboardMarkup:
 
 
 def _promotion_mode_text() -> str:
-    mode = get_setting("promotion_mode", "message") or "message"
-    return (
-        "Promotion Mode\n\n"
-        f"Current Mode: {mode}\n\n"
-        "Choose Promotion Type"
-    )
+    def build() -> str:
+        mode = get_setting("promotion_mode", "message") or "message"
+        return (
+            "Promotion Mode\n\n"
+            f"Current Mode: {mode}\n\n"
+            "Choose Promotion Type"
+        )
+
+    return _cached_view("promotion_mode", build)
 
 
 def _promotion_mode_keyboard() -> InlineKeyboardMarkup:
@@ -774,6 +817,7 @@ async def promotion_mode_set_callback(update: Update, context: ContextTypes.DEFA
     await _safe_callback_answer(query)
     mode = query.data.split(":", 2)[2]
     set_setting("promotion_mode", mode)
+    _invalidate_view_cache("promotion_")
     await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
 
 
@@ -811,6 +855,7 @@ async def promotion_asset_channel_handler(update: Update, context: ContextTypes.
         return SET_PROMOTION_ASSET_CHANNEL
     set_promotion_asset_channel(raw_value)
     context.user_data.clear()
+    _invalidate_view_cache("promotion_")
     await update.message.reply_text("Promotion asset channel updated successfully.")
     await update.message.reply_text(_promotion_settings_text(), reply_markup=_promotion_settings_keyboard())
     return ConversationHandler.END
@@ -844,6 +889,7 @@ async def promotion_sticker_message_id_handler(update: Update, context: ContextT
         return SET_PROMOTION_STICKER
     set_promotion_sticker_message_id(message_id)
     context.user_data.clear()
+    _invalidate_view_cache("promotion_")
     await update.message.reply_text("Sticker message ID updated successfully.")
     await update.message.reply_text(_promotion_settings_text(), reply_markup=_promotion_settings_keyboard())
     return ConversationHandler.END
@@ -969,6 +1015,7 @@ async def botmsg_mode_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data["edit_bot_name"] = bot_name
     context.user_data["state"] = SET_BOT_PROMOTION_MODE
     await _send_or_edit(update, "Send promotion mode: MESSAGE, STICKER, BOTH, RANDOM, or DISABLED.", _cancel_menu())
+    logger.info("ENTERING CONVERSATION STATE %s FROM %s", SET_BOT_PROMOTION_MODE, "botmsg_mode_entry")
     return SET_BOT_PROMOTION_MODE
 
 
@@ -994,6 +1041,7 @@ async def botmsg_value_entry(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.user_data["botmsg_field"] = field
     context.user_data["state"] = state
     await _send_or_edit(update, prompt, _cancel_menu())
+    logger.info("ENTERING CONVERSATION STATE %s FROM %s", state, "botmsg_value_entry")
     return state
 
 
@@ -1049,6 +1097,7 @@ async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEF
 
 async def botmsg_generic_value_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     state = int(context.user_data.get("state", ConversationHandler.END))
+    logger.info("TEXT RECEIVED FOR STATE %s", state)
     return await _audit_state_handler(update, context, state, botmsg_generic_value_handler)
 
 
@@ -2081,6 +2130,13 @@ async def start_controller() -> None:
             CallbackQueryHandler(group_set_message_entry, pattern="^group:set_message:"),
             CallbackQueryHandler(group_time_start_entry, pattern="^group:time_start:"),
             CallbackQueryHandler(group_time_end_entry, pattern="^group:time_end:"),
+            CallbackQueryHandler(botmsg_mode_entry, pattern="^botmsg:mode:"),
+            CallbackQueryHandler(botmsg_sequence_entry, pattern="^botmsg:sequence:"),
+            CallbackQueryHandler(botmsg_timeout_entry, pattern="^botmsg:timeout:"),
+            CallbackQueryHandler(botmsg_conv_min_entry, pattern="^botmsg:conv_min:"),
+            CallbackQueryHandler(botmsg_conv_max_entry, pattern="^botmsg:conv_max:"),
+            CallbackQueryHandler(botmsg_promo_min_entry, pattern="^botmsg:promo_min:"),
+            CallbackQueryHandler(botmsg_promo_max_entry, pattern="^botmsg:promo_max:"),
             CallbackQueryHandler(bot_settings_start_cmd_entry, pattern="^botcfg:start:"),
             CallbackQueryHandler(bot_settings_stop_cmd_entry, pattern="^botcfg:stop:"),
             CallbackQueryHandler(bot_settings_match_entry, pattern="^botcfg:match:"),
@@ -2209,13 +2265,6 @@ async def start_controller() -> None:
     _application.add_handler(CallbackQueryHandler(bypass_bot_callback, pattern="^bot:bypass:"))
     _application.add_handler(CallbackQueryHandler(delete_bot_callback, pattern="^bot:delete:"))
     _application.add_handler(CallbackQueryHandler(bot_message_settings_callback, pattern="^botmsg:view:"))
-    _application.add_handler(CallbackQueryHandler(botmsg_mode_entry, pattern="^botmsg:mode:"))
-    _application.add_handler(CallbackQueryHandler(botmsg_sequence_entry, pattern="^botmsg:sequence:"))
-    _application.add_handler(CallbackQueryHandler(botmsg_timeout_entry, pattern="^botmsg:timeout:"))
-    _application.add_handler(CallbackQueryHandler(botmsg_conv_min_entry, pattern="^botmsg:conv_min:"))
-    _application.add_handler(CallbackQueryHandler(botmsg_conv_max_entry, pattern="^botmsg:conv_max:"))
-    _application.add_handler(CallbackQueryHandler(botmsg_promo_min_entry, pattern="^botmsg:promo_min:"))
-    _application.add_handler(CallbackQueryHandler(botmsg_promo_max_entry, pattern="^botmsg:promo_max:"))
     _application.add_handler(CallbackQueryHandler(list_groups_callback, pattern="^group:list$"))
     _application.add_handler(CallbackQueryHandler(view_group_callback, pattern="^group:view:"))
     _application.add_handler(CallbackQueryHandler(toggle_group_callback, pattern="^group:toggle:"))

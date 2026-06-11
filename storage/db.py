@@ -117,6 +117,21 @@ def _record_db_metric(name: str, cache_hit: bool, elapsed_ms: float) -> None:
     _DB_LAST_TIMINGS[name] = elapsed_ms
 
 
+def _timed_db_call(name: str, fn, *args: Any, **kwargs: Any):
+    start = time.monotonic()
+    try:
+        result = fn(*args, **kwargs)
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info("DB OP %s elapsed_ms=%.2f success=True", name, elapsed_ms)
+        record_operation(name, elapsed_ms, True, "mongo", {"timed": True})
+        return result
+    except Exception as exc:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.exception("DB OP %s elapsed_ms=%.2f success=False error=%s", name, elapsed_ms, exc)
+        record_operation(name, elapsed_ms, False, "mongo", {"timed": True, "error": str(exc)})
+        raise
+
+
 def _set_message_list_cache(messages: list[dict[str, Any]], active_only: bool) -> None:
     _MESSAGE_LIST_CACHE["ts"] = time.monotonic()
     _MESSAGE_LIST_CACHE["active_only"] = active_only
@@ -726,7 +741,7 @@ def get_bot(bot_name: str) -> dict[str, Any] | None:
         _record_db_metric("get_bot", True, elapsed_ms)
         record_operation("get_bot", elapsed_ms, True, "mongo", {"cache_hit": True})
         return bot
-    doc = _bots_collection().find_one({"_id": bot_name})
+    doc = _timed_db_call("get_bot_find_one", _bots_collection().find_one, {"_id": bot_name})
     if not doc:
         elapsed_ms = (time.monotonic() - start) * 1000
         _record_db_metric("get_bot", False, elapsed_ms)
@@ -763,9 +778,10 @@ def delete_bot(bot_name: str) -> bool:
 def get_bots() -> dict[str, dict[str, Any]]:
     if _BOT_CACHE:
         return {name: dict(config) for name, config in sorted(_BOT_CACHE.items(), key=lambda item: item[0])}
+    docs = _timed_db_call("get_bots_find", lambda: list(_bots_collection().find().sort("_id", 1)))
     bots = {
         str(doc["_id"]): {k: v for k, v in doc.items() if k != "_id"}
-        for doc in _bots_collection().find().sort("_id", 1)
+        for doc in docs
     }
     _BOT_CACHE.update({name: dict(config) for name, config in bots.items()})
     return bots
@@ -849,7 +865,8 @@ def list_groups(enabled_only: bool = False) -> list[dict[str, Any]]:
         record_operation("list_groups", elapsed_ms, True, "mongo", {"cache_hit": True, "enabled_only": enabled_only})
         return result
     query = {"status": "enabled"} if enabled_only else {}
-    groups = [{k: v for k, v in doc.items() if k != "_id"} for doc in _groups_collection().find(query).sort("updated_at", 1)]
+    docs = _timed_db_call("list_groups_find", lambda: list(_groups_collection().find(query).sort("updated_at", 1)))
+    groups = [{k: v for k, v in doc.items() if k != "_id"} for doc in docs]
     for group in groups:
         group_id = str(group.get("group_id"))
         if group_id:
@@ -1000,7 +1017,8 @@ def list_messages(active_only: bool = True) -> list[dict[str, Any]]:
         return cached
     if active_only:
         query = {"is_active": True}
-        messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _collection("bot_messages").find(query).sort("id", 1)]
+        docs = _timed_db_call("list_messages_find_active", lambda: list(_collection("bot_messages").find(query).sort("id", 1)))
+        messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in docs]
         for message in messages:
             message_id = int(message.get("id"))
             message.setdefault("enabled", True)
@@ -1019,7 +1037,8 @@ def list_messages(active_only: bool = True) -> list[dict[str, Any]]:
         record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": True, "active_only": active_only})
         return result
     query = {}
-    messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _collection("bot_messages").find(query).sort("id", 1)]
+    docs = _timed_db_call("list_messages_find_all", lambda: list(_collection("bot_messages").find(query).sort("id", 1)))
+    messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in docs]
     for message in messages:
         message_id = int(message.get("id"))
         message.setdefault("enabled", True)
