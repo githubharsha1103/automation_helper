@@ -309,6 +309,7 @@ class AutomationService:
         self._running = False
         self._paused = False
         self._wake_event = asyncio.Event()
+        self.has_enabled_bots = False
         self.last_skip_reason: str | None = None
         self.last_eligible_groups_count = 0
         self.last_active_messages_count = 0
@@ -1309,9 +1310,11 @@ async def handle_bot_automation(event) -> None:
             logger.debug("BOT EVENT SKIP reason=no_bot_name chat=%s sender=%s", chat_username, sender_username)
             return
 
+        if not automation_service.has_enabled_bots:
+            return
+
         bot = get_bot(bot_name) or await aget_bot(bot_name)
-        if not bot or not is_bot_enabled(bot_name, False):
-            logger.debug("BOT EVENT SKIP bot=%s exists=%s enabled=%s", bot_name, bool(bot), is_bot_enabled(bot_name, False) if bot else None)
+        if not bot or not bool(bot.get("enabled", False)):
             return
 
         if any(trigger in text for trigger in [item.lower() for item in bot.get("security_triggers", [])]):
@@ -1395,9 +1398,10 @@ async def start_worker() -> None:
             bots = await aget_bots()
             logger.debug("DB READ get_bots elapsed_ms=%.2f", (time.monotonic() - db_start) * 1000)
             metrics.bots = len(bots)
+            automation_service.has_enabled_bots = any(bool(config.get("enabled", False)) for config in bots.values())
             for bot_name, config in bots.items():
                 start_cmd = _normalize_command(config.get("start_cmd"))
-                if is_bot_enabled(bot_name, False) and start_cmd:
+                if bool(config.get("enabled", False)) and start_cmd:
                     try:
                         await client.send_message(bot_name, start_cmd)
                         metrics.messages_sent += 1

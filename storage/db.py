@@ -440,6 +440,7 @@ def get_bot_settings(bot_name: str) -> dict[str, Any]:
 
 
 def set_bot_settings(bot_name: str, **changes: Any) -> bool:
+    changes.pop("bot_name", None)
     current = get_bot_settings(bot_name)
     current.update(changes)
     current["bot_name"] = bot_name

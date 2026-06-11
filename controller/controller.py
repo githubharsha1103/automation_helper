@@ -384,7 +384,7 @@ def _category_rows(category: str) -> list[list[InlineKeyboardButton]]:
 def _bot_rows() -> list[list[InlineKeyboardButton]]:
     rows: list[list[InlineKeyboardButton]] = []
     for bot_name, bot in get_bots().items():
-        enabled = is_bot_enabled(bot_name, False)
+        enabled = bool(bot.get("enabled", False))
         status = "ON" if enabled else "OFF"
         rows.append(
             [InlineKeyboardButton(f"{status} {bot_name}", callback_data=f"bot:view:{bot_name}")]
@@ -396,8 +396,8 @@ def _bot_rows() -> list[list[InlineKeyboardButton]]:
 
 
 def _bot_details_text(bot_name: str, bot: dict) -> str:
-    enabled = is_bot_enabled(bot_name, False)
-    paused = is_bot_paused(bot_name, False)
+    enabled = bool(bot.get("enabled", False))
+    paused = bool(get_setting(f"bot_paused_{bot_name}", False))
     runtime_state = "RUNNING" if enabled and not paused else "IDLE"
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
@@ -646,7 +646,7 @@ def _automation_status_text() -> str:
     state = get_setting("automation_state", "IDLE")
     enabled_groups = len(list_groups(enabled_only=True))
     messages_count = len(list_messages())
-    active_bots = sum(1 for name in get_bots() if is_bot_enabled(name, False))
+    active_bots = sum(1 for bot in get_bots().values() if bool(bot.get("enabled", False)))
     last_execution_time = get_setting("automation_last_execution_time", "Never")
     promotion_mode = get_setting("promotion_mode", "message") or "message"
     promotion_asset_channel = get_promotion_asset_channel()
@@ -889,8 +889,15 @@ async def list_groups_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def list_bots_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _safe_callback_answer(update.callback_query)
-    await _send_or_edit(update, "Saved bots", InlineKeyboardMarkup(_bot_rows()))
+    try:
+        logger.warning("LIST_BOTS_CALLBACK_ENTERED")
+        logger.warning("LIST_BOTS_CALLBACK_AFTER_DB")
+        await _safe_callback_answer(update.callback_query)
+        logger.warning("LIST_BOTS_CALLBACK_BEFORE_RENDER")
+        await _send_or_edit(update, "Saved bots", InlineKeyboardMarkup(_bot_rows()))
+    except Exception:
+        logger.exception("LIST_BOTS_CALLBACK_FAILED")
+        raise
 
 
 async def view_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -915,7 +922,7 @@ async def toggle_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not bot:
         await _send_or_edit(update, "Bot not found", InlineKeyboardMarkup(_bot_rows()))
         return
-    new_enabled = not is_bot_enabled(bot_name, False)
+    new_enabled = not bool(bot.get("enabled", False))
     set_bot_enabled(bot_name, new_enabled)
     if not new_enabled:
         set_bot_paused(bot_name, False)
@@ -1002,9 +1009,7 @@ async def botmsg_sequence_entry(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def botmsg_timeout_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    state = await botmsg_value_entry(update, context, "no_response_timeout", "Send no-response timeout in seconds.", SET_BOT_NO_RESPONSE_TIMEOUT)
-    logger.warning("TIMEOUT ENTRY RETURNING STATE=%s", state)
-    return state
+    return await botmsg_value_entry(update, context, "no_response_timeout", "Send no-response timeout in seconds.", SET_BOT_NO_RESPONSE_TIMEOUT)
 
 
 async def botmsg_conv_min_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1028,8 +1033,6 @@ async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEF
     field = context.user_data.get("botmsg_field")
     if not bot_name or not field:
         return ConversationHandler.END
-    if field == "no_response_timeout":
-        logger.warning("TIMEOUT HANDLER RECEIVED TEXT=%s", getattr(getattr(update, "message", None), "text", None))
     raw = update.message.text.strip()
     if field == "conversation_sequence":
         try:
@@ -1045,6 +1048,7 @@ async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEF
             return context.user_data.get("state", ConversationHandler.END)
     settings = get_bot_settings(bot_name)
     settings[field] = value
+    settings.pop("bot_name", None)
     set_bot_settings(bot_name, **settings)
     context.user_data.clear()
     await update.message.reply_text(_bot_message_settings_text(bot_name), reply_markup=_bot_message_settings_keyboard(bot_name))
@@ -1067,6 +1071,7 @@ async def _set_bot_setting_value(update: Update, context: ContextTypes.DEFAULT_T
         return context.user_data.get("state", ConversationHandler.END)
     settings = get_bot_settings(bot_name)
     settings[field] = value
+    settings.pop("bot_name", None)
     set_bot_settings(bot_name, **settings)
     context.user_data.clear()
     await update.message.reply_text(_bot_message_settings_text(bot_name), reply_markup=_bot_message_settings_keyboard(bot_name))
@@ -1923,7 +1928,7 @@ async def bypass_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     set_bot_paused(bot_name, False)
     bot = get_bots().get(bot_name)
     start_cmd = _normalize_command(bot.get("start_cmd")) if bot else None
-    if bot and is_bot_enabled(bot_name, False) and start_cmd:
+    if bot and bool(bot.get("enabled", False)) and start_cmd:
         try:
             await telegram_service.client.send_message(bot_name, start_cmd)
         except Exception:
