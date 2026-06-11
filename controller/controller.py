@@ -96,7 +96,6 @@ EDIT_BOT_AFTER_CHAT_DELAY = 512
 SET_PROMOTION_STICKER = 600
 SET_PROMOTION_ASSET_CHANNEL = 601
 TEST_PROMOTION_STICKER = 602
-SET_PROMOTION_ASSET_CHANNEL = 601
 SET_BOT_PROMOTION_MODE = 700
 SET_BOT_CONVERSATION_SEQUENCE = 701
 SET_BOT_NO_RESPONSE_TIMEOUT = 702
@@ -523,6 +522,72 @@ def _normalize_command(value: str) -> str:
     return cleaned if cleaned.startswith("/") else f"/{cleaned}"
 
 
+def _state_name(state: int) -> str:
+    state_names = {
+        ADD_CATEGORY_MESSAGE_CONTENT: "ADD_CATEGORY_MESSAGE_CONTENT",
+        ADD_CATEGORY_MESSAGE_DELAY: "ADD_CATEGORY_MESSAGE_DELAY",
+        EDIT_CATEGORY_MESSAGE_CONTENT: "EDIT_CATEGORY_MESSAGE_CONTENT",
+        EDIT_CATEGORY_MESSAGE_DELAY: "EDIT_CATEGORY_MESSAGE_DELAY",
+        ADD_BOT_USERNAME: "ADD_BOT_USERNAME",
+        ADD_BOT_START_CMD: "ADD_BOT_START_CMD",
+        ADD_BOT_STOP_CMD: "ADD_BOT_STOP_CMD",
+        ADD_BOT_MATCH_TRIGGERS: "ADD_BOT_MATCH_TRIGGERS",
+        ADD_BOT_SECURITY_TRIGGERS: "ADD_BOT_SECURITY_TRIGGERS",
+        ADD_BOT_AFTER_MATCH_DELAY: "ADD_BOT_AFTER_MATCH_DELAY",
+        ADD_BOT_AFTER_CHAT_DELAY: "ADD_BOT_AFTER_CHAT_DELAY",
+        EDIT_BOT_START_CMD: "EDIT_BOT_START_CMD",
+        EDIT_BOT_STOP_CMD: "EDIT_BOT_STOP_CMD",
+        EDIT_BOT_MATCH_TRIGGERS: "EDIT_BOT_MATCH_TRIGGERS",
+        EDIT_BOT_SECURITY_TRIGGERS: "EDIT_BOT_SECURITY_TRIGGERS",
+        EDIT_BOT_AFTER_MATCH_DELAY: "EDIT_BOT_AFTER_MATCH_DELAY",
+        EDIT_BOT_AFTER_CHAT_DELAY: "EDIT_BOT_AFTER_CHAT_DELAY",
+        SET_BOT_PROMOTION_MODE: "SET_BOT_PROMOTION_MODE",
+        SET_BOT_CONVERSATION_SEQUENCE: "SET_BOT_CONVERSATION_SEQUENCE",
+        SET_BOT_NO_RESPONSE_TIMEOUT: "SET_BOT_NO_RESPONSE_TIMEOUT",
+        SET_BOT_CONV_DELAY_MIN: "SET_BOT_CONV_DELAY_MIN",
+        SET_BOT_CONV_DELAY_MAX: "SET_BOT_CONV_DELAY_MAX",
+        SET_BOT_PROMO_DELAY_MIN: "SET_BOT_PROMO_DELAY_MIN",
+        SET_BOT_PROMO_DELAY_MAX: "SET_BOT_PROMO_DELAY_MAX",
+        SET_GROUP_MESSAGE: "SET_GROUP_MESSAGE",
+        EDIT_GROUP_NAME: "EDIT_GROUP_NAME",
+        EDIT_GROUP_DELAY: "EDIT_GROUP_DELAY",
+        EDIT_GROUP_TIME_START: "EDIT_GROUP_TIME_START",
+        EDIT_GROUP_TIME_END: "EDIT_GROUP_TIME_END",
+        SET_PROMOTION_ASSET_CHANNEL: "SET_PROMOTION_ASSET_CHANNEL",
+        SET_PROMOTION_STICKER: "SET_PROMOTION_STICKER",
+    }
+    return state_names.get(state, f"STATE_{state}")
+
+
+async def _audit_state_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: int,
+    handler,
+) -> int:
+    state_label = _state_name(state)
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    logger.info("ENTER STATE %s user_id=%s chat_id=%s", state_label, user_id, chat_id)
+    try:
+        user_message = getattr(getattr(update, "message", None), "text", None) or getattr(getattr(update, "message", None), "caption", None) or ""
+        logger.info("RECEIVED USER MESSAGE %s text=%s", state_label, user_message)
+        logger.info("HANDLER EXECUTED %s handler=%s", state_label, getattr(handler, "__name__", str(handler)))
+        result = await handler(update, context)
+        logger.info("SAVE SUCCESS %s result=%s", state_label, result)
+        logger.info("STATE TRANSITION state=%s next_state=%s", state_label, "END" if result == ConversationHandler.END else _state_name(result) if isinstance(result, int) else result)
+        return result
+    except Exception:
+        logger.exception("ERROR state=%s user_id=%s chat_id=%s", state_label, user_id, chat_id)
+        raise
+    finally:
+        logger.info("EXIT STATE %s", state_label)
+
+
+def _audit_state_transition(state: int, next_state: int | None) -> None:
+    logger.info("STATE TRANSITION state=%s next_state=%s", _state_name(state), "END" if next_state == ConversationHandler.END else _state_name(next_state) if next_state is not None else "None")
+
+
 def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
     existing = get_bots().get(bot_name, {})
     existing_enabled = bool(bot.get("enabled", existing.get("enabled", True)))
@@ -751,6 +816,10 @@ async def promotion_asset_channel_handler(update: Update, context: ContextTypes.
     return ConversationHandler.END
 
 
+async def promotion_asset_channel_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, SET_PROMOTION_ASSET_CHANNEL, promotion_asset_channel_handler)
+
+
 async def promotion_sticker_message_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await _safe_callback_answer(update.callback_query)
     context.user_data.clear()
@@ -778,6 +847,10 @@ async def promotion_sticker_message_id_handler(update: Update, context: ContextT
     await update.message.reply_text("Sticker message ID updated successfully.")
     await update.message.reply_text(_promotion_settings_text(), reply_markup=_promotion_settings_keyboard())
     return ConversationHandler.END
+
+
+async def promotion_sticker_message_id_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, SET_PROMOTION_STICKER, promotion_sticker_message_id_handler)
 
 
 async def promotion_asset_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -974,6 +1047,11 @@ async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEF
     return ConversationHandler.END
 
 
+async def botmsg_generic_value_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    state = int(context.user_data.get("state", ConversationHandler.END))
+    return await _audit_state_handler(update, context, state, botmsg_generic_value_handler)
+
+
 async def _set_bot_setting_value(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, field: str, cast=str) -> int:
     bot_name = context.user_data.get("edit_bot_name")
     if not bot_name:
@@ -1094,6 +1172,34 @@ async def bot_after_chat_delay_handler(update: Update, context: ContextTypes.DEF
         reply_markup=_bot_details_keyboard(bot_name, is_bot_enabled(bot_name, False)),
     )
     return ConversationHandler.END
+
+
+async def bot_username_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_BOT_USERNAME, bot_username_handler)
+
+
+async def bot_start_cmd_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_BOT_START_CMD, bot_start_cmd_handler)
+
+
+async def bot_stop_cmd_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_BOT_STOP_CMD, bot_stop_cmd_handler)
+
+
+async def bot_match_triggers_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_BOT_MATCH_TRIGGERS, bot_match_triggers_handler)
+
+
+async def bot_security_triggers_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_BOT_SECURITY_TRIGGERS, bot_security_triggers_handler)
+
+
+async def bot_after_match_delay_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_BOT_AFTER_MATCH_DELAY, bot_after_match_delay_handler)
+
+
+async def bot_after_chat_delay_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_BOT_AFTER_CHAT_DELAY, bot_after_chat_delay_handler)
 
 
 def _get_bot_or_end(context: ContextTypes.DEFAULT_TYPE) -> str | None:
@@ -1269,6 +1375,54 @@ async def bot_settings_after_chat_handler(update: Update, context: ContextTypes.
     return ConversationHandler.END
 
 
+async def botmsg_mode_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, SET_BOT_PROMOTION_MODE, botmsg_mode_handler)
+
+
+async def bot_settings_start_cmd_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_BOT_START_CMD, bot_settings_start_cmd_handler)
+
+
+async def bot_settings_stop_cmd_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_BOT_STOP_CMD, bot_settings_stop_cmd_handler)
+
+
+async def bot_settings_match_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_BOT_MATCH_TRIGGERS, bot_settings_match_handler)
+
+
+async def bot_settings_security_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_BOT_SECURITY_TRIGGERS, bot_settings_security_handler)
+
+
+async def bot_settings_after_match_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_BOT_AFTER_MATCH_DELAY, bot_settings_after_match_handler)
+
+
+async def bot_settings_after_chat_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_BOT_AFTER_CHAT_DELAY, bot_settings_after_chat_handler)
+
+
+async def botmsg_timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_generic_value_handler(update, context)
+
+
+async def botmsg_conv_min_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_generic_value_handler(update, context)
+
+
+async def botmsg_conv_max_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_generic_value_handler(update, context)
+
+
+async def botmsg_promo_min_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_generic_value_handler(update, context)
+
+
+async def botmsg_promo_max_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_generic_value_handler(update, context)
+
+
 async def view_group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_callback_answer(query)
@@ -1328,6 +1482,10 @@ async def group_edit_name_handler(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
+async def group_edit_name_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_GROUP_NAME, group_edit_name_handler)
+
+
 async def group_edit_delay_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await _safe_callback_answer(query)
@@ -1361,6 +1519,10 @@ async def group_edit_delay_handler(update: Update, context: ContextTypes.DEFAULT
         reply_markup=_group_details_keyboard(group_id, group["status"] == "enabled"),
     )
     return ConversationHandler.END
+
+
+async def group_edit_delay_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_GROUP_DELAY, group_edit_delay_handler)
 
 
 async def group_time_window_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1403,6 +1565,10 @@ async def group_time_start_handler(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
+async def group_time_start_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_GROUP_TIME_START, group_time_start_handler)
+
+
 async def group_time_end_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await _safe_callback_answer(query)
@@ -1431,6 +1597,10 @@ async def group_time_end_handler(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text("End hour saved.")
     await _render_group_time_window(update, group_id)
     return ConversationHandler.END
+
+
+async def group_time_end_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, EDIT_GROUP_TIME_END, group_time_end_handler)
 
 
 async def group_time_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1473,6 +1643,10 @@ async def group_set_message_handler(update: Update, context: ContextTypes.DEFAUL
     return ConversationHandler.END
 
 
+async def group_set_message_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, SET_GROUP_MESSAGE, group_set_message_handler)
+
+
 async def clear_group_message_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_callback_answer(query)
@@ -1511,6 +1685,10 @@ async def add_group_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         reply_markup=InlineKeyboardMarkup(_group_rows()),
     )
     return ConversationHandler.END
+
+
+async def add_group_chat_id_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_GROUP_CHAT_ID, add_group_chat_id)
 
 
 def set_group_assigned_bot(group_id: str, bot_name: str | None) -> bool:
@@ -1599,6 +1777,10 @@ async def _message_content_handler(update: Update, context: ContextTypes.DEFAULT
     return ADD_CATEGORY_MESSAGE_DELAY
 
 
+async def _message_content_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_CONTENT, _message_content_handler)
+
+
 async def _message_delay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         delay_minutes = int(update.message.text.strip())
@@ -1617,6 +1799,10 @@ async def _message_delay_handler(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data.clear()
     await update.message.reply_text("Message saved.")
     return ConversationHandler.END
+
+
+async def _message_delay_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_DELAY, _message_delay_handler)
 
 
 async def messages_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1655,6 +1841,14 @@ async def add_message_content(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def add_message_delay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await _message_delay_handler(update, context)
+
+
+async def add_message_content_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_CONTENT, _message_content_handler)
+
+
+async def add_message_delay_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_DELAY, _message_delay_handler)
 
 
 async def delete_message_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1760,6 +1954,88 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 
+def _conversation_state_map() -> list[tuple[int, str]]:
+    return [
+        (ADD_GROUP_CHAT_ID, "add_group_chat_id_audited"),
+        (ADD_CATEGORY_MESSAGE_CONTENT, "add_message_content_audited"),
+        (ADD_CATEGORY_MESSAGE_DELAY, "add_message_delay_audited"),
+        (ADD_BOT_USERNAME, "bot_username_handler_audited"),
+        (ADD_BOT_START_CMD, "bot_start_cmd_handler_audited"),
+        (ADD_BOT_STOP_CMD, "bot_stop_cmd_handler_audited"),
+        (ADD_BOT_MATCH_TRIGGERS, "bot_match_triggers_handler_audited"),
+        (ADD_BOT_SECURITY_TRIGGERS, "bot_security_triggers_handler_audited"),
+        (ADD_BOT_AFTER_MATCH_DELAY, "bot_after_match_delay_handler_audited"),
+        (ADD_BOT_AFTER_CHAT_DELAY, "bot_after_chat_delay_handler_audited"),
+        (EDIT_BOT_START_CMD, "bot_settings_start_cmd_handler_audited"),
+        (EDIT_BOT_STOP_CMD, "bot_settings_stop_cmd_handler_audited"),
+        (EDIT_BOT_MATCH_TRIGGERS, "bot_settings_match_handler_audited"),
+        (EDIT_BOT_SECURITY_TRIGGERS, "bot_settings_security_handler_audited"),
+        (EDIT_BOT_AFTER_MATCH_DELAY, "bot_settings_after_match_handler_audited"),
+        (EDIT_BOT_AFTER_CHAT_DELAY, "bot_settings_after_chat_handler_audited"),
+        (SET_BOT_PROMOTION_MODE, "botmsg_mode_handler_audited"),
+        (SET_BOT_CONVERSATION_SEQUENCE, "botmsg_generic_value_handler_audited"),
+        (SET_BOT_NO_RESPONSE_TIMEOUT, "botmsg_generic_value_handler_audited"),
+        (SET_BOT_CONV_DELAY_MIN, "botmsg_generic_value_handler_audited"),
+        (SET_BOT_CONV_DELAY_MAX, "botmsg_generic_value_handler_audited"),
+        (SET_BOT_PROMO_DELAY_MIN, "botmsg_generic_value_handler_audited"),
+        (SET_BOT_PROMO_DELAY_MAX, "botmsg_generic_value_handler_audited"),
+        (EDIT_GROUP_NAME, "group_edit_name_handler_audited"),
+        (EDIT_GROUP_DELAY, "group_edit_delay_handler_audited"),
+        (SET_GROUP_MESSAGE, "group_set_message_handler_audited"),
+        (EDIT_GROUP_TIME_START, "group_time_start_handler_audited"),
+        (EDIT_GROUP_TIME_END, "group_time_end_handler_audited"),
+        (SET_PROMOTION_ASSET_CHANNEL, "promotion_asset_channel_handler_audited"),
+        (SET_PROMOTION_STICKER, "promotion_sticker_message_id_handler_audited"),
+    ]
+
+
+def _log_conversation_audit() -> None:
+    state_map = _conversation_state_map()
+    declared_state_ids = {
+        ADD_GROUP_CHAT_ID,
+        ADD_CATEGORY_MESSAGE_CONTENT,
+        ADD_CATEGORY_MESSAGE_DELAY,
+        EDIT_CATEGORY_MESSAGE_CONTENT,
+        EDIT_CATEGORY_MESSAGE_DELAY,
+        ADD_BOT_USERNAME,
+        ADD_BOT_START_CMD,
+        ADD_BOT_STOP_CMD,
+        ADD_BOT_MATCH_TRIGGERS,
+        ADD_BOT_SECURITY_TRIGGERS,
+        ADD_BOT_AFTER_MATCH_DELAY,
+        ADD_BOT_AFTER_CHAT_DELAY,
+        EDIT_BOT_START_CMD,
+        EDIT_BOT_STOP_CMD,
+        EDIT_BOT_MATCH_TRIGGERS,
+        EDIT_BOT_SECURITY_TRIGGERS,
+        EDIT_BOT_AFTER_MATCH_DELAY,
+        EDIT_BOT_AFTER_CHAT_DELAY,
+        SET_PROMOTION_STICKER,
+        SET_PROMOTION_ASSET_CHANNEL,
+        TEST_PROMOTION_STICKER,
+        SET_BOT_PROMOTION_MODE,
+        SET_BOT_CONVERSATION_SEQUENCE,
+        SET_BOT_NO_RESPONSE_TIMEOUT,
+        SET_BOT_CONV_DELAY_MIN,
+        SET_BOT_CONV_DELAY_MAX,
+        SET_BOT_PROMO_DELAY_MIN,
+        SET_BOT_PROMO_DELAY_MAX,
+        EDIT_GROUP_NAME,
+        EDIT_GROUP_DELAY,
+        SET_GROUP_MESSAGE,
+        EDIT_GROUP_TIME_START,
+        EDIT_GROUP_TIME_END,
+    }
+    logger.info("CONVERSATION STATE MAP START")
+    for state_id, handler_name in state_map:
+        logger.info("STATE_ID=%s -> HANDLER_NAME=%s", state_id, handler_name)
+    logger.info("CONVERSATION STATE MAP END count=%s", len(state_map))
+    mapped_ids = {state for state, _ in state_map}
+    orphaned_declared = sorted(declared_state_ids - mapped_ids)
+    logger.info("DECLARED STATE CONSTANTS=%s", sorted(declared_state_ids))
+    logger.info("ORPHANED STATE CONSTANTS=%s", orphaned_declared)
+
+
 async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _safe_callback_answer(update.callback_query)
 
@@ -1793,6 +2069,7 @@ async def start_controller() -> None:
     print("[STARTUP] Building Telegram control application...")
     logger.info("[STARTUP] Building Telegram control application...")
     _application = Application.builder().token(TOKEN).build()
+    _log_conversation_audit()
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -1819,51 +2096,107 @@ async def start_controller() -> None:
             CallbackQueryHandler(promotion_sticker_message_id_entry, pattern="^promotion:set_message_id$"),
         ],
         states={
-            ADD_GROUP_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_chat_id)],
+            ADD_GROUP_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_chat_id_audited)],
             ADD_CATEGORY_MESSAGE_CONTENT: [
                 MessageHandler(
                     (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL)
                     & ~filters.COMMAND,
-                    add_message_content,
+                    add_message_content_audited,
                 )
             ],
-            ADD_CATEGORY_MESSAGE_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_message_delay)],
-            ADD_BOT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_username_handler)],
-            ADD_BOT_START_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_start_cmd_handler)],
-            ADD_BOT_STOP_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_stop_cmd_handler)],
-            ADD_BOT_MATCH_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_match_triggers_handler)],
-            ADD_BOT_SECURITY_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_security_triggers_handler)],
-            ADD_BOT_AFTER_MATCH_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_after_match_delay_handler)],
-            ADD_BOT_AFTER_CHAT_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_after_chat_delay_handler)],
-            EDIT_BOT_START_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_start_cmd_handler)],
-            EDIT_BOT_STOP_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_stop_cmd_handler)],
-            EDIT_BOT_MATCH_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_match_handler)],
-            EDIT_BOT_SECURITY_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_security_handler)],
-            EDIT_BOT_AFTER_MATCH_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_after_match_handler)],
-            EDIT_BOT_AFTER_CHAT_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_after_chat_handler)],
-            SET_BOT_PROMOTION_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_mode_handler)],
-            SET_BOT_CONVERSATION_SEQUENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
-            SET_BOT_NO_RESPONSE_TIMEOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
-            SET_BOT_CONV_DELAY_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
-            SET_BOT_CONV_DELAY_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
-            SET_BOT_PROMO_DELAY_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
-            SET_BOT_PROMO_DELAY_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
-            EDIT_GROUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_name_handler)],
-            EDIT_GROUP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_delay_handler)],
-            SET_GROUP_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_set_message_handler)],
-            EDIT_GROUP_TIME_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_start_handler)],
-            EDIT_GROUP_TIME_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_end_handler)],
-            SET_PROMOTION_ASSET_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, promotion_asset_channel_handler)],
-            SET_PROMOTION_STICKER: [MessageHandler(filters.TEXT & ~filters.COMMAND, promotion_sticker_message_id_handler)],
+            ADD_CATEGORY_MESSAGE_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_message_delay_audited)],
+            ADD_BOT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_username_handler_audited)],
+            ADD_BOT_START_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_start_cmd_handler_audited)],
+            ADD_BOT_STOP_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_stop_cmd_handler_audited)],
+            ADD_BOT_MATCH_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_match_triggers_handler_audited)],
+            ADD_BOT_SECURITY_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_security_triggers_handler_audited)],
+            ADD_BOT_AFTER_MATCH_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_after_match_delay_handler_audited)],
+            ADD_BOT_AFTER_CHAT_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_after_chat_delay_handler_audited)],
+            EDIT_BOT_START_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_start_cmd_handler_audited)],
+            EDIT_BOT_STOP_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_stop_cmd_handler_audited)],
+            EDIT_BOT_MATCH_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_match_handler_audited)],
+            EDIT_BOT_SECURITY_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_security_handler_audited)],
+            EDIT_BOT_AFTER_MATCH_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_after_match_handler_audited)],
+            EDIT_BOT_AFTER_CHAT_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_after_chat_handler_audited)],
+            SET_BOT_PROMOTION_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_mode_handler_audited)],
+            SET_BOT_CONVERSATION_SEQUENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
+            SET_BOT_NO_RESPONSE_TIMEOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
+            SET_BOT_CONV_DELAY_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
+            SET_BOT_CONV_DELAY_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
+            SET_BOT_PROMO_DELAY_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
+            SET_BOT_PROMO_DELAY_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
+            EDIT_GROUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_name_handler_audited)],
+            EDIT_GROUP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_delay_handler_audited)],
+            SET_GROUP_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_set_message_handler_audited)],
+            EDIT_GROUP_TIME_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_start_handler_audited)],
+            EDIT_GROUP_TIME_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_end_handler_audited)],
+            SET_PROMOTION_ASSET_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, promotion_asset_channel_handler_audited)],
+            SET_PROMOTION_STICKER: [MessageHandler(filters.TEXT & ~filters.COMMAND, promotion_sticker_message_id_handler_audited)],
         },
         fallbacks=[
             CallbackQueryHandler(cancel_callback, pattern="^nav:cancel$"),
             CommandHandler("cancel", cancel_callback),
+            CommandHandler("back", cancel_callback),
         ],
         per_chat=True,
         per_user=True,
         per_message=False,
+        allow_reentry=False,
     )
+    logger.info(
+        "CONVERSATION HANDLER CONFIG per_chat=%s per_user=%s per_message=%s allow_reentry=%s fallbacks=%s",
+        True,
+        True,
+        False,
+        False,
+        ["nav:cancel", "/cancel", "/back"],
+    )
+    logger.info(
+        "HANDLER ORDER=%s",
+        [
+            "CommandHandler(start)",
+            "ConversationHandler",
+            "CallbackQueryHandler(menu:)",
+            "CallbackQueryHandler(bot:list)",
+            "CallbackQueryHandler(bot:view:)",
+            "CallbackQueryHandler(bot:refresh:)",
+            "CallbackQueryHandler(bot:toggle:)",
+            "CallbackQueryHandler(bot:edit:)",
+            "CallbackQueryHandler(bot:bypass:)",
+            "CallbackQueryHandler(bot:delete:)",
+            "CallbackQueryHandler(botmsg:view:)",
+            "CallbackQueryHandler(botmsg:mode:)",
+            "CallbackQueryHandler(botmsg:sequence:)",
+            "CallbackQueryHandler(botmsg:timeout:)",
+            "CallbackQueryHandler(botmsg:conv_min:)",
+            "CallbackQueryHandler(botmsg:conv_max:)",
+            "CallbackQueryHandler(botmsg:promo_min:)",
+            "CallbackQueryHandler(botmsg:promo_max:)",
+            "CallbackQueryHandler(group:list)",
+            "CallbackQueryHandler(group:view:)",
+            "CallbackQueryHandler(group:toggle:)",
+            "CallbackQueryHandler(group:time_window:)",
+            "CallbackQueryHandler(group:time_clear:)",
+            "CallbackQueryHandler(group:clear_message:)",
+            "CallbackQueryHandler(group:delete:)",
+            "CallbackQueryHandler(message:list)",
+            "CallbackQueryHandler(msg:view:)",
+            "CallbackQueryHandler(msg:enable/disable)",
+            "CallbackQueryHandler(message:delete)",
+            "CallbackQueryHandler(msg:delete:)",
+            "CallbackQueryHandler(automation:start/stop/pause/resume)",
+            "CallbackQueryHandler(msg:category)",
+            "CallbackQueryHandler(noop)",
+        ],
+    )
+    registered_states = sorted(conv_handler.states.keys())
+    mapped_states = {state for state, _ in _conversation_state_map()}
+    missing_in_map = sorted(set(registered_states) - mapped_states)
+    orphaned_map = sorted(mapped_states - set(registered_states))
+    logger.info("REGISTERED CONVERSATION STATES=%s", registered_states)
+    logger.info("STATE MAP CHECK missing_in_map=%s orphaned_map=%s", missing_in_map, orphaned_map)
+    if missing_in_map or orphaned_map:
+        logger.warning("CONVERSATION HANDLER AUDIT MISMATCH missing_in_map=%s orphaned_map=%s", missing_in_map, orphaned_map)
 
     _application.add_handler(CommandHandler("start", start_command))
     _application.add_handler(conv_handler)
