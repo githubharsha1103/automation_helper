@@ -402,9 +402,9 @@ async def bot_setting_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not query:
         return
     await _safe_answer(query)
-    _, _, scope, bot_name, setting = query.data.split(":", 4)
+    _, _, bot_name, setting = query.data.split(":", 3)
     context.user_data.clear()
-    context.user_data.update({"action": "update_setting", "scope": scope, "target": bot_name, "setting": setting})
+    context.user_data.update({"action": "update_setting", "scope": "bot", "target": bot_name, "setting": setting})
     prompts = {
         "no_response_timeout": "Send the no response timeout.",
         "conversation_sequence": "Send comma-separated message IDs, for example 1,2,3.",
