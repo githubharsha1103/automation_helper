@@ -239,6 +239,67 @@ def _ensure_message_perf_defaults(category: str, message_id: int) -> dict[str, i
     return perf
 
 
+def migrate_message_ids() -> dict[str, Any]:
+    migrated_total = 0
+    skipped_total = 0
+    details: dict[str, dict[str, int]] = {}
+    for collection_name in ("bot_messages", "conversational_messages", "group_messages"):
+        collection = _collection(collection_name)
+        docs = list(collection.find({"$or": [{"id": {"$exists": False}}, {"id": None}]}))
+        if not docs:
+            details[collection_name] = {"migrated": 0, "skipped": 0}
+            continue
+        existing_ids = {
+            int(doc["id"])
+            for doc in collection.find({"id": {"$type": "int"}} , {"id": 1})
+            if doc.get("id") is not None
+        }
+        next_id = max(existing_ids) + 1 if existing_ids else 1
+        migrated = 0
+        skipped = 0
+        for doc in docs:
+            legacy_id = doc.get("id")
+            if isinstance(legacy_id, int) and legacy_id > 0:
+                skipped += 1
+                continue
+            while next_id in existing_ids:
+                next_id += 1
+            collection.update_one({"_id": doc["_id"]}, {"$set": {"id": next_id, "updated_at": datetime.utcnow()}})
+            cached = _category_cache(collection_name)
+            cache_key = int(doc.get("id") or 0)
+            if cache_key in cached:
+                cached.pop(cache_key, None)
+            normalized = {k: v for k, v in doc.items() if k != "_id"}
+            normalized["id"] = next_id
+            normalized.setdefault("enabled", True)
+            cached[next_id] = normalized
+            if collection_name in _MESSAGE_PERF_CACHE:
+                _MESSAGE_PERF_CACHE[collection_name][next_id] = _MESSAGE_PERF_CACHE[collection_name].pop(cache_key, {"times_sent": 0, "replies_received": 0})
+            existing_ids.add(next_id)
+            next_id += 1
+            migrated += 1
+        details[collection_name] = {"migrated": migrated, "skipped": skipped}
+        migrated_total += migrated
+        skipped_total += skipped
+        logger.info(
+            "MESSAGE ID MIGRATION collection=%s migrated=%s skipped=%s",
+            collection_name,
+            migrated,
+            skipped,
+        )
+    logger.info(
+        "MESSAGE ID MIGRATION SUMMARY migrated_total=%s skipped_total=%s details=%s",
+        migrated_total,
+        skipped_total,
+        details,
+    )
+    return {
+        "migrated_total": migrated_total,
+        "skipped_total": skipped_total,
+        "details": details,
+    }
+
+
 def get_message_performance(category: str, message_id: int) -> dict[str, int]:
     category = _normalize_category(category)
     perf = dict(_ensure_message_perf_defaults(category, int(message_id)))
@@ -571,6 +632,8 @@ def init_db() -> None:
     db["groups"].create_index([("status", 1), ("cooldown_until", 1)])
     for collection_name in ("conversational_messages", "bot_messages", "group_messages"):
         db[collection_name].create_index([("is_active", 1), ("id", 1)])
+    migrate_message_ids()
+    for collection_name in ("conversational_messages", "bot_messages", "group_messages"):
         db[collection_name].create_index([("id", 1)], unique=True)
     db["promotion_stickers"].create_index([("id", 1)], unique=True)
     db["bot_settings"].create_index([("bot_name", 1)], unique=True)
