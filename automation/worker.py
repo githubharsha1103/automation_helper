@@ -953,12 +953,21 @@ class AutomationService:
                 db_bots_start = time.monotonic()
                 bots = list_enabled_bots()
                 self._log_timing("DB READ list_enabled_bots", db_bots_start, timings)
+                if not bots:
+                    self.last_active_messages_count = 0
+                    self.last_eligible_groups_count = 0
+                    self.last_promotion_summary = {"enabled_bots": 0, "enabled_groups": 0, "active_messages": 0}
+                    self._record_skip("no_enabled_bots")
+                    logger.warning("WORKER LOOP SKIP: enabled_bots=0, skipping group/message reads")
+                    continue
                 db_groups_start = time.monotonic()
                 groups = list_enabled_groups()
                 self._log_timing("DB READ list_enabled_groups", db_groups_start, timings)
                 db_messages_start = time.monotonic()
                 messages = await alist_messages(active_only=True)
                 self._log_timing("DB READ list_messages", db_messages_start, timings)
+                mongo_total_ms = sum(elapsed for label, elapsed in timings if label.startswith("DB READ"))
+                logger.info("WORKER MONGO TOTAL elapsed_ms=%.2f enabled_bots=%s enabled_groups=%s active_messages=%s", mongo_total_ms, len(bots), len(groups), len(messages))
                 self.last_promotion_summary = {
                     "enabled_bots": len(bots),
                     "enabled_groups": len(groups),

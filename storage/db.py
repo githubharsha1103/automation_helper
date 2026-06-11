@@ -39,6 +39,7 @@ _DB_METRICS: dict[str, dict[str, int]] = {
 _DB_LAST_TIMINGS: dict[str, float] = {}
 _OP_HISTORY: list[dict[str, Any]] = []
 _OP_STATS: dict[str, dict[str, Any]] = {}
+_MESSAGE_LIST_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 45.0, "active_only": None, "messages": []}
 
 
 def record_operation(
@@ -114,6 +115,21 @@ def _record_db_metric(name: str, cache_hit: bool, elapsed_ms: float) -> None:
         metric["misses"],
     )
     _DB_LAST_TIMINGS[name] = elapsed_ms
+
+
+def _set_message_list_cache(messages: list[dict[str, Any]], active_only: bool) -> None:
+    _MESSAGE_LIST_CACHE["ts"] = time.monotonic()
+    _MESSAGE_LIST_CACHE["active_only"] = active_only
+    _MESSAGE_LIST_CACHE["messages"] = [dict(message) for message in messages]
+
+
+def _get_message_list_cache(active_only: bool) -> list[dict[str, Any]] | None:
+    if _MESSAGE_LIST_CACHE.get("active_only") != active_only:
+        return None
+    ttl = float(_MESSAGE_LIST_CACHE.get("ttl", 45.0) or 45.0)
+    if time.monotonic() - float(_MESSAGE_LIST_CACHE.get("ts", 0.0) or 0.0) > ttl:
+        return None
+    return [dict(message) for message in _MESSAGE_LIST_CACHE.get("messages", [])]
 
 
 async def aget_setting(key: str, default: Any = None) -> Any:
@@ -217,6 +233,7 @@ def add_category_message(
     _category_cache(collection)[message_id] = dict(doc)
     if collection in _MESSAGE_PERF_CACHE:
         _MESSAGE_PERF_CACHE[collection][message_id] = {"times_sent": 0, "replies_received": 0}
+    _MESSAGE_LIST_CACHE["ts"] = 0.0
     return message_id
 
 
@@ -356,6 +373,7 @@ def update_category_message(category: str, message_id: int, **changes: Any) -> b
     cache = _category_cache(collection)
     if message_id in cache:
         cache[message_id].update(changes)
+    _MESSAGE_LIST_CACHE["ts"] = 0.0
     return True
 
 
@@ -364,6 +382,7 @@ def delete_category_message(category: str, message_id: int) -> bool:
     _collection(collection).delete_one({"id": int(message_id)})
     _category_cache(collection).pop(int(message_id), None)
     _MESSAGE_PERF_CACHE.setdefault(collection, {}).pop(int(message_id), None)
+    _MESSAGE_LIST_CACHE["ts"] = 0.0
     return True
 
 
@@ -476,12 +495,23 @@ def db_status() -> dict[str, Any]:
 
 
 def list_enabled_bots() -> list[dict[str, Any]]:
+    start = time.monotonic()
     bots = list(get_bots().values())
-    return sorted([bot for bot in bots if bool(bot.get("enabled", False))], key=lambda item: str(item.get("username") or ""))
+    enabled = sorted([bot for bot in bots if bool(bot.get("enabled", False))], key=lambda item: str(item.get("username") or ""))
+    elapsed_ms = (time.monotonic() - start) * 1000
+    logger.info("DB READ list_enabled_bots elapsed_ms=%.2f total=%s enabled=%s", elapsed_ms, len(bots), len(enabled))
+    record_operation("list_enabled_bots", elapsed_ms, True, "mongo", {"total": len(bots), "enabled": len(enabled)})
+    return enabled
 
 
 def list_enabled_groups() -> list[dict[str, Any]]:
-    return sorted([group for group in list_groups(enabled_only=False) if group.get("status") == "enabled"], key=lambda item: str(item.get("group_id") or ""))
+    start = time.monotonic()
+    groups = list_groups(enabled_only=False)
+    enabled = sorted([group for group in groups if group.get("status") == "enabled"], key=lambda item: str(item.get("group_id") or ""))
+    elapsed_ms = (time.monotonic() - start) * 1000
+    logger.info("DB READ list_enabled_groups elapsed_ms=%.2f total=%s enabled=%s", elapsed_ms, len(groups), len(enabled))
+    record_operation("list_enabled_groups", elapsed_ms, True, "mongo", {"total": len(groups), "enabled": len(enabled)})
+    return enabled
 
 
 def repair_promotion_data() -> dict[str, Any]:
@@ -630,8 +660,11 @@ def init_db() -> None:
     db["groups"].create_index([("status", 1), ("updated_at", 1)])
     db["groups"].create_index([("status", 1), ("next_run_at", 1)])
     db["groups"].create_index([("status", 1), ("cooldown_until", 1)])
+    db["groups"].create_index([("status", 1), ("group_id", 1)])
+    db["bots"].create_index([("enabled", 1), ("_id", 1)])
     for collection_name in ("conversational_messages", "bot_messages", "group_messages"):
         db[collection_name].create_index([("is_active", 1), ("id", 1)])
+        db[collection_name].create_index([("enabled", 1), ("is_active", 1), ("id", 1)])
     migrate_message_ids()
     for collection_name in ("conversational_messages", "bot_messages", "group_messages"):
         db[collection_name].create_index([("id", 1)], unique=True)
@@ -958,6 +991,13 @@ def get_message(message_id: int) -> dict[str, Any] | None:
 
 def list_messages(active_only: bool = True) -> list[dict[str, Any]]:
     start = time.monotonic()
+    cached = _get_message_list_cache(active_only) if active_only else None
+    if cached is not None:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info("DB READ list_messages cache_hit elapsed_ms=%.2f count=%s active_only=%s", elapsed_ms, len(cached), active_only)
+        _record_db_metric("list_messages", True, elapsed_ms)
+        record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": True, "active_only": active_only})
+        return cached
     if active_only:
         query = {"is_active": True}
         messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _collection("bot_messages").find(query).sort("id", 1)]
@@ -965,7 +1005,9 @@ def list_messages(active_only: bool = True) -> list[dict[str, Any]]:
             message_id = int(message.get("id"))
             message.setdefault("enabled", True)
             _message_cache_for("bot_messages")[message_id] = dict(message)
+        _set_message_list_cache(messages, active_only)
         elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info("DB READ list_messages mongo elapsed_ms=%.2f count=%s active_only=%s", elapsed_ms, len(messages), active_only)
         _record_db_metric("list_messages", False, elapsed_ms)
         record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": False, "active_only": active_only})
         return messages
@@ -983,6 +1025,7 @@ def list_messages(active_only: bool = True) -> list[dict[str, Any]]:
         message.setdefault("enabled", True)
         _message_cache_for("bot_messages")[message_id] = dict(message)
     elapsed_ms = (time.monotonic() - start) * 1000
+    logger.info("DB READ list_messages mongo elapsed_ms=%.2f count=%s active_only=%s", elapsed_ms, len(messages), active_only)
     _record_db_metric("list_messages", False, elapsed_ms)
     record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": False, "active_only": active_only})
     return messages
@@ -1002,8 +1045,9 @@ def set_category_message_enabled(category: str, message_id: int, enabled: bool) 
         cached["enabled"] = bool(enabled)
     if collection == "bot_messages":
         cached_bot = _message_cache_for("bot_messages").get(int(message_id))
-        if cached_bot is not None:
-            cached_bot["enabled"] = bool(enabled)
+    if cached_bot is not None:
+        cached_bot["enabled"] = bool(enabled)
+    _MESSAGE_LIST_CACHE["ts"] = 0.0
     return True
 
 
