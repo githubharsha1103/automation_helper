@@ -22,14 +22,20 @@ from automation.worker import automation_service, telegram_service
 from storage.db import (
     add_bot,
     add_group,
+    add_category_message,
+    add_promotion_sticker,
     add_message,
     clear_group_special_message,
+    delete_category_message,
     delete_bot,
     delete_group,
     delete_message,
     get_bot,
     get_bots,
     get_group,
+    get_category_message,
+    get_bot_settings,
+    get_bot_runtime,
     get_message,
     get_setting,
     get_promotion_asset_channel,
@@ -37,13 +43,22 @@ from storage.db import (
     is_bot_enabled,
     is_bot_paused,
     list_groups,
+    list_category_messages,
     list_messages,
+    list_bot_settings,
+    get_message_performance,
+    set_category_message_enabled,
+    is_category_message_enabled,
     set_group_special_message,
     set_promotion_asset_channel,
     set_promotion_sticker_message_id,
+    update_category_message,
     set_bot_enabled,
     set_bot_paused,
     set_group_status,
+    set_bot_settings,
+    update_bot_runtime,
+    increment_bot_runtime,
     set_setting,
     update_group_delay,
     update_group_name,
@@ -56,8 +71,10 @@ logger = logging.getLogger(__name__)
 STICKER_DIR = Path("stickers")
 
 ADD_GROUP_CHAT_ID = 100
-ADD_MESSAGE_CONTENT = 200
-ADD_MESSAGE_DELAY = 201
+ADD_CATEGORY_MESSAGE_CONTENT = 200
+ADD_CATEGORY_MESSAGE_DELAY = 201
+EDIT_CATEGORY_MESSAGE_CONTENT = 202
+EDIT_CATEGORY_MESSAGE_DELAY = 203
 DELETE_MESSAGE_PICK = 300
 EDIT_GROUP_NAME = 400
 EDIT_GROUP_DELAY = 401
@@ -81,6 +98,13 @@ SET_PROMOTION_STICKER = 600
 SET_PROMOTION_ASSET_CHANNEL = 601
 TEST_PROMOTION_STICKER = 602
 SET_PROMOTION_ASSET_CHANNEL = 601
+SET_BOT_PROMOTION_MODE = 700
+SET_BOT_CONVERSATION_SEQUENCE = 701
+SET_BOT_NO_RESPONSE_TIMEOUT = 702
+SET_BOT_CONV_DELAY_MIN = 703
+SET_BOT_CONV_DELAY_MAX = 704
+SET_BOT_PROMO_DELAY_MIN = 705
+SET_BOT_PROMO_DELAY_MAX = 706
 
 
 def _env(name: str, default: str = "") -> str:
@@ -132,7 +156,7 @@ def _main_menu() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("Bots", callback_data="menu:bots")],
             [InlineKeyboardButton("Groups", callback_data="menu:groups")],
-            [InlineKeyboardButton("Messages", callback_data="menu:messages")],
+            [InlineKeyboardButton("Message Management", callback_data="menu:messages")],
             [InlineKeyboardButton("Automation", callback_data="menu:automation")],
         ]
     )
@@ -161,9 +185,10 @@ def _bots_menu() -> InlineKeyboardMarkup:
 def _messages_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Set Message", callback_data="message:add")],
-            [InlineKeyboardButton("List Messages", callback_data="message:list")],
-            [InlineKeyboardButton("Clear Message", callback_data="message:delete")],
+            [InlineKeyboardButton("Conversational Messages", callback_data="menu:messages:conversational")],
+            [InlineKeyboardButton("Bot Messages", callback_data="menu:messages:bot")],
+            [InlineKeyboardButton("Group Messages", callback_data="menu:messages:group")],
+            [InlineKeyboardButton("Stickers", callback_data="menu:messages:stickers")],
             [InlineKeyboardButton("Back", callback_data="menu:main")],
         ]
     )
@@ -297,17 +322,64 @@ async def _render_group_time_window(update: Update, group_id: str) -> None:
     await _send_or_edit(update, _group_time_window_text(group), _group_time_window_keyboard(group_id))
 
 
-def _message_rows() -> list[list[InlineKeyboardButton]]:
+def _category_label(category: str) -> str:
+    return {
+        "conversational_messages": "Conversational Messages",
+        "bot_messages": "Bot Messages",
+        "group_messages": "Group Messages",
+        "promotion_stickers": "Promotion Stickers",
+    }[category]
+
+
+def _category_back_target(category: str) -> str:
+    return "menu:messages"
+
+
+def _category_rows(category: str) -> list[list[InlineKeyboardButton]]:
     rows: list[list[InlineKeyboardButton]] = []
-    for message in list_messages(active_only=False):
-        snippet = message["content"].replace("\n", " ")[:28]
-        rows.append(
-            [InlineKeyboardButton(f"#{message['id']} [{message['delay_minutes']}m] {snippet}", callback_data=f"message:view:{message['id']}")]
-        )
+    messages = list_category_messages(category, active_only=False)
+    top_message = None
+    top_reply_rate = -1.0
+    if category == "conversational_messages":
+        for message in messages:
+            perf = get_message_performance(category, int(message["id"]))
+            sent = int(perf.get("times_sent", 0) or 0)
+            replies = int(perf.get("replies_received", 0) or 0)
+            reply_rate = (replies / sent) if sent else 0.0
+            if reply_rate > top_reply_rate:
+                top_reply_rate = reply_rate
+                top_message = message
+    for message in messages:
+        enabled = bool(message.get("enabled", True))
+        status = "Enabled" if enabled else "Disabled"
+        if category == "promotion_stickers":
+            label = f"#{message['id']} Sticker"
+        else:
+            snippet = str(message.get("content", "")).replace("\n", " ")[:28]
+            label = f"#{message['id']} {snippet}\nStatus: {status}"
+            if category == "conversational_messages":
+                perf = get_message_performance(category, int(message["id"]))
+                sent = int(perf.get("times_sent", 0) or 0)
+                replies = int(perf.get("replies_received", 0) or 0)
+                reply_rate = f"{(replies / sent * 100):.1f}%" if sent else "0.0%"
+                label = f"{label}\nSent: {sent}\nReplies: {replies}\nReply Rate: {reply_rate}"
+            elif category == "bot_messages":
+                perf = get_message_performance(category, int(message["id"]))
+                sent = int(perf.get("times_sent", 0) or 0)
+                label = f"{label}\nSent: {sent}"
+        action_buttons = [InlineKeyboardButton(label, callback_data=f"msg:{category}:view:{message['id']}")]
+        if category in {"conversational_messages", "bot_messages"}:
+            if enabled:
+                action_buttons.append(InlineKeyboardButton("Disable", callback_data=f"msg:{category}:disable:{message['id']}"))
+            else:
+                action_buttons.append(InlineKeyboardButton("Enable", callback_data=f"msg:{category}:enable:{message['id']}"))
+        rows.append(action_buttons)
     if not rows:
         rows.append([InlineKeyboardButton("No messages saved", callback_data="noop")])
-    rows.append([InlineKeyboardButton("Set Message", callback_data="message:add")])
-    rows.append([InlineKeyboardButton("Back", callback_data="menu:messages")])
+    if category == "conversational_messages" and top_message:
+        rows.insert(0, [InlineKeyboardButton(f"Top Performer: #{top_message['id']}", callback_data=f"msg:{category}:view:{top_message['id']}")])
+    rows.append([InlineKeyboardButton("Add", callback_data=f"msg:{category}:add")])
+    rows.append([InlineKeyboardButton("Back", callback_data=_category_back_target(category))])
     return rows
 
 
@@ -334,6 +406,13 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
     promotion_mode = get_setting("promotion_mode", "message") or "message"
     promotion_asset_channel = get_promotion_asset_channel()
     promotion_sticker_message_id = get_promotion_sticker_message_id()
+    runtime = get_bot_runtime(bot_name)
+    conversations_started = int(runtime.get("conversations_started", 0) or 0)
+    partner_replies = int(runtime.get("partner_replies", 0) or 0)
+    promotions_sent = int(runtime.get("promotions_sent", 0) or 0)
+    error_count = int(runtime.get("error_count", 0) or 0)
+    reply_rate = round(partner_replies / conversations_started, 4) if conversations_started else 0.0
+    promotion_coverage = round(promotions_sent / conversations_started, 4) if conversations_started else 0.0
     sticker_configured = "Yes" if promotion_sticker_message_id else "No"
     mode_label = {
         "message": "Message",
@@ -344,6 +423,16 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
         f"Bot: {bot_name}\n"
         f"Status: {'ON' if enabled else 'OFF'}\n"
         f"Runtime state: {runtime_state}\n"
+        f"Current Stage: {runtime.get('current_stage', 'IDLE')}\n"
+        f"Last Activity Timestamp: {runtime.get('last_activity_ts') or 'N/A'}\n"
+        f"Last Failure Reason: {runtime.get('last_failure_reason') or 'None'}\n"
+        f"Last Failure Time: {runtime.get('last_failure_ts') or 'N/A'}\n"
+        f"Conversations Started: {conversations_started}\n"
+        f"Partner Replies: {partner_replies}\n"
+        f"Promotions Sent: {promotions_sent}\n"
+        f"Error Count: {error_count}\n"
+        f"Reply Rate: {reply_rate}\n"
+        f"Promotion Coverage: {promotion_coverage}\n"
         f"Promotion Mode: {mode_label}\n"
         f"Asset Channel Configured: {'Yes' if promotion_asset_channel else 'No'}\n"
         f"Sticker Message ID: {promotion_sticker_message_id or 'N/A'}\n"
@@ -365,6 +454,8 @@ def _bot_details_keyboard(bot_name: str, enabled: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Disable" if enabled else "Enable", callback_data=f"bot:toggle:{bot_name}"),
                 InlineKeyboardButton("Edit Settings", callback_data=f"bot:edit:{bot_name}"),
             ],
+            [InlineKeyboardButton("Refresh Status", callback_data=f"bot:refresh:{bot_name}")],
+            [InlineKeyboardButton("Message Management", callback_data=f"botmsg:view:{bot_name}")],
             [InlineKeyboardButton("Delete Bot", callback_data=f"bot:delete:{bot_name}")],
             [InlineKeyboardButton("Back", callback_data="bot:list")],
         ]
@@ -382,6 +473,33 @@ def _bot_settings_text(bot_name: str, bot: dict) -> str:
         f"Security triggers: {', '.join(security_triggers) if security_triggers else 'None'}\n"
         f"After match delay: {bot.get('after_match_delay', 1)} sec\n"
         f"After chat delay: {bot.get('after_chat_delay', 10)} sec"
+    )
+
+
+def _bot_message_settings_text(bot_name: str) -> str:
+    settings = get_bot_settings(bot_name)
+    return (
+        f"Automation Settings: {bot_name}\n\n"
+        f"Promotion Mode: {settings.get('promotion_mode', 'MESSAGE')}\n"
+        f"Conversation Sequence: {','.join(map(str, settings.get('conversation_sequence', []))) or 'None'}\n"
+        f"No Response Timeout: {settings.get('no_response_timeout', 0)} sec\n"
+        f"Conversation Delay: {settings.get('conversation_delay_min', 0)}-{settings.get('conversation_delay_max', 0)} sec\n"
+        f"Promotion Delay: {settings.get('promotion_delay_min', 0)}-{settings.get('promotion_delay_max', 0)} sec"
+    )
+
+
+def _bot_message_settings_keyboard(bot_name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Promotion Mode", callback_data=f"botmsg:mode:{bot_name}")],
+            [InlineKeyboardButton("Conversation Sequence", callback_data=f"botmsg:sequence:{bot_name}")],
+            [InlineKeyboardButton("No Response Timeout", callback_data=f"botmsg:timeout:{bot_name}")],
+            [InlineKeyboardButton("Conversation Delay Min", callback_data=f"botmsg:conv_min:{bot_name}")],
+            [InlineKeyboardButton("Conversation Delay Max", callback_data=f"botmsg:conv_max:{bot_name}")],
+            [InlineKeyboardButton("Promotion Delay Min", callback_data=f"botmsg:promo_min:{bot_name}")],
+            [InlineKeyboardButton("Promotion Delay Max", callback_data=f"botmsg:promo_max:{bot_name}")],
+            [InlineKeyboardButton("Back", callback_data=f"bot:view:{bot_name}")],
+        ]
     )
 
 
@@ -421,6 +539,15 @@ def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
         "after_chat_delay": float(bot.get("after_chat_delay", 10) or 10),
         "enabled": existing_enabled,
     }
+
+
+def _group_assigned_bot(group: dict | None) -> str | None:
+    if not group:
+        return None
+    assigned_bot = group.get("assigned_bot") or group.get("bot_username")
+    if assigned_bot:
+        return str(assigned_bot).strip().lstrip("@") or None
+    return None
 
 
 def _save_bot_config(bot_name: str, bot: dict) -> dict:
@@ -558,6 +685,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _send_or_edit(update, "Message management", _messages_menu())
     elif action == "menu:automation":
         await _send_or_edit(update, _automation_status_text(), _automation_menu())
+    elif action == "menu:messages:conversational":
+        await _send_or_edit(update, "Conversational Messages", InlineKeyboardMarkup(_category_rows("conversational_messages")))
+    elif action == "menu:messages:bot":
+        await _send_or_edit(update, "Bot Messages", InlineKeyboardMarkup(_category_rows("bot_messages")))
+    elif action == "menu:messages:group":
+        await _send_or_edit(update, "Group Messages", InlineKeyboardMarkup(_category_rows("group_messages")))
+    elif action == "menu:messages:stickers":
+        await _send_or_edit(update, "Promotion Stickers", InlineKeyboardMarkup(_category_rows("promotion_stickers")))
 
 
 async def promotion_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -693,6 +828,13 @@ async def view_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _render_bot_details(update, bot_name)
 
 
+async def refresh_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    bot_name = query.data.split(":", 2)[2]
+    await _render_bot_details(update, bot_name)
+
+
 async def toggle_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_callback_answer(query)
@@ -739,6 +881,115 @@ async def edit_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     context.user_data.clear()
     await _render_bot_settings(update, bot_name)
+
+
+async def bot_message_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    bot_name = query.data.split(":", 2)[2]
+    await _send_or_edit(update, _bot_message_settings_text(bot_name), _bot_message_settings_keyboard(bot_name))
+
+
+async def botmsg_mode_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await _safe_callback_answer(update.callback_query)
+    bot_name = update.callback_query.data.split(":", 2)[2]
+    context.user_data.clear()
+    context.user_data["edit_bot_name"] = bot_name
+    context.user_data["state"] = SET_BOT_PROMOTION_MODE
+    await _send_or_edit(update, "Send promotion mode: MESSAGE, STICKER, BOTH, RANDOM, or DISABLED.", _cancel_menu())
+    return SET_BOT_PROMOTION_MODE
+
+
+async def botmsg_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    bot_name = context.user_data.get("edit_bot_name")
+    mode = update.message.text.strip().upper()
+    if mode not in {"MESSAGE", "STICKER", "BOTH", "RANDOM", "DISABLED"}:
+        await update.message.reply_text("Choose MESSAGE, STICKER, BOTH, RANDOM, or DISABLED.")
+        return SET_BOT_PROMOTION_MODE
+    settings = get_bot_settings(bot_name)
+    settings["promotion_mode"] = mode
+    set_bot_settings(bot_name, **settings)
+    context.user_data.clear()
+    await update.message.reply_text(_bot_message_settings_text(bot_name), reply_markup=_bot_message_settings_keyboard(bot_name))
+    return ConversationHandler.END
+
+
+async def botmsg_value_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, prompt: str, state: int) -> int:
+    await _safe_callback_answer(update.callback_query)
+    bot_name = update.callback_query.data.split(":", 2)[2]
+    context.user_data.clear()
+    context.user_data["edit_bot_name"] = bot_name
+    context.user_data["botmsg_field"] = field
+    context.user_data["state"] = state
+    await _send_or_edit(update, prompt, _cancel_menu())
+    return state
+
+
+async def botmsg_sequence_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_value_entry(update, context, "conversation_sequence", "Send comma-separated conversational message IDs, e.g. 1,2,3", SET_BOT_CONVERSATION_SEQUENCE)
+
+
+async def botmsg_timeout_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_value_entry(update, context, "no_response_timeout", "Send no-response timeout in seconds.", SET_BOT_NO_RESPONSE_TIMEOUT)
+
+
+async def botmsg_conv_min_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_value_entry(update, context, "conversation_delay_min", "Send conversation delay minimum in seconds.", SET_BOT_CONV_DELAY_MIN)
+
+
+async def botmsg_conv_max_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_value_entry(update, context, "conversation_delay_max", "Send conversation delay maximum in seconds.", SET_BOT_CONV_DELAY_MAX)
+
+
+async def botmsg_promo_min_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_value_entry(update, context, "promotion_delay_min", "Send promotion delay minimum in seconds.", SET_BOT_PROMO_DELAY_MIN)
+
+
+async def botmsg_promo_max_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await botmsg_value_entry(update, context, "promotion_delay_max", "Send promotion delay maximum in seconds.", SET_BOT_PROMO_DELAY_MAX)
+
+
+async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    bot_name = context.user_data.get("edit_bot_name")
+    field = context.user_data.get("botmsg_field")
+    if not bot_name or not field:
+        return ConversationHandler.END
+    raw = update.message.text.strip()
+    if field == "conversation_sequence":
+        try:
+            value = [int(item.strip()) for item in raw.split(",") if item.strip()]
+        except ValueError:
+            await update.message.reply_text("Use comma-separated numeric IDs.")
+            return context.user_data.get("state", ConversationHandler.END)
+    else:
+        try:
+            value = int(raw)
+        except ValueError:
+            await update.message.reply_text("Send a whole number.")
+            return context.user_data.get("state", ConversationHandler.END)
+    settings = get_bot_settings(bot_name)
+    settings[field] = value
+    set_bot_settings(bot_name, **settings)
+    context.user_data.clear()
+    await update.message.reply_text(_bot_message_settings_text(bot_name), reply_markup=_bot_message_settings_keyboard(bot_name))
+    return ConversationHandler.END
+
+
+async def _set_bot_setting_value(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, field: str, cast=str) -> int:
+    bot_name = context.user_data.get("edit_bot_name")
+    if not bot_name:
+        return ConversationHandler.END
+    try:
+        value = cast(update.message.text.strip())
+    except Exception:
+        await update.message.reply_text("Invalid value.")
+        return context.user_data.get("state", ConversationHandler.END)
+    settings = get_bot_settings(bot_name)
+    settings[field] = value
+    set_bot_settings(bot_name, **settings)
+    context.user_data.clear()
+    await update.message.reply_text(_bot_message_settings_text(bot_name), reply_markup=_bot_message_settings_keyboard(bot_name))
+    return ConversationHandler.END
 
 
 async def add_bot_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1263,47 +1514,47 @@ async def add_group_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
-async def messages_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _safe_callback_answer(update.callback_query)
-    await _send_or_edit(update, "Saved messages", InlineKeyboardMarkup(_message_rows()))
-
-
-async def message_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await _safe_callback_answer(query)
-    message_id = int(query.data.split(":", 2)[2])
-    message = get_message(message_id)
-    if not message:
-        await messages_list_callback(update, context)
-        return
-    media = message["media_type"] or "none"
-    text = (
-        f"Message #{message['id']}\n"
-        f"Delay: {message['delay_minutes']} minute(s)\n"
-        f"Media: {media}\n\n"
-        f"{message['content']}"
+def set_group_assigned_bot(group_id: str, bot_name: str | None) -> bool:
+    group = get_group(group_id) or {}
+    group["assigned_bot"] = bot_name
+    group["bot_username"] = bot_name
+    return bool(
+        __import__("storage.db", fromlist=["update_group_runtime"])._groups_collection().update_one(  # type: ignore[attr-defined]
+            {"_id": str(group_id)},
+            {"$set": {"assigned_bot": bot_name, "bot_username": bot_name, "updated_at": __import__("datetime").datetime.utcnow()}},
+        )
     )
+
+
+async def _message_list_callback(update: Update, category: str) -> None:
+    await _send_or_edit(update, _category_label(category), InlineKeyboardMarkup(_category_rows(category)))
+
+
+async def _message_view_callback(update: Update, category: str, message_id: int) -> None:
+    message = get_category_message(category, message_id)
+    if not message:
+        await _message_list_callback(update, category)
+        return
+    text = f"Message #{message['id']}\n\n{message.get('content', '') or message.get('media_file_id', '')}"
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Delete", callback_data=f"message:delete_one:{message_id}")],
-            [InlineKeyboardButton("Back", callback_data="message:list")],
+            [InlineKeyboardButton("Edit", callback_data=f"msg:{category}:edit:{message_id}")],
+            [InlineKeyboardButton("Delete", callback_data=f"msg:{category}:delete:{message_id}")],
+            [InlineKeyboardButton("Back", callback_data=f"menu:messages:{'stickers' if category == 'promotion_stickers' else category.split('_')[0]}")],
         ]
     )
     await _send_or_edit(update, text, keyboard)
 
 
-async def add_message_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def _message_add_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str) -> int:
     await _safe_callback_answer(update.callback_query)
     context.user_data.clear()
-    await _send_or_edit(
-        update,
-        "Send the message text. You can attach one photo, video, or document with the same message if needed.",
-        _cancel_menu(),
-    )
-    return ADD_MESSAGE_CONTENT
+    context.user_data["message_category"] = category
+    await _send_or_edit(update, f"Send the new {_category_label(category).lower()} content.", _cancel_menu())
+    return ADD_CATEGORY_MESSAGE_CONTENT
 
 
-async def add_message_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def _message_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not _is_allowed(update):
         return ConversationHandler.END
     message = update.message
@@ -1323,56 +1574,104 @@ async def add_message_content(update: Update, context: ContextTypes.DEFAULT_TYPE
     content = (message.caption or message.text or "").strip()
     if not content:
         await message.reply_text("Message content cannot be empty.")
-        return ADD_MESSAGE_CONTENT
+        return ADD_CATEGORY_MESSAGE_CONTENT
 
     context.user_data["message_content"] = content
     context.user_data["media_type"] = media_type
     context.user_data["media_file_id"] = media_file_id
+    if context.user_data.get("message_edit_id") is not None:
+        category = context.user_data["message_category"]
+        message_id = int(context.user_data["message_edit_id"])
+        if category == "promotion_stickers":
+            delete_category_message(category, message_id)
+            add_promotion_sticker(media_file_id or "")
+        else:
+            update_category_message(category, message_id, content=content, media_type=media_type, media_file_id=media_file_id)
+        context.user_data.clear()
+        await message.reply_text("Updated.")
+        return ConversationHandler.END
+    category = context.user_data.get("message_category")
+    if category == "promotion_stickers":
+        add_promotion_sticker(media_file_id or "")
+        context.user_data.clear()
+        await message.reply_text("Sticker saved.")
+        return ConversationHandler.END
     await message.reply_text("Enter delay in minutes for this message.", reply_markup=_cancel_menu())
-    return ADD_MESSAGE_DELAY
+    return ADD_CATEGORY_MESSAGE_DELAY
 
 
-async def add_message_delay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def _message_delay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         delay_minutes = int(update.message.text.strip())
         if delay_minutes < 1:
             raise ValueError
     except ValueError:
         await update.message.reply_text("Delay must be a whole number of minutes greater than 0.")
-        return ADD_MESSAGE_DELAY
+        return ADD_CATEGORY_MESSAGE_DELAY
 
-    add_message(
+    add_category_message(
+        context.user_data["message_category"],
         content=context.user_data["message_content"],
-        delay_minutes=delay_minutes,
         media_type=context.user_data.get("media_type"),
         media_file_id=context.user_data.get("media_file_id"),
     )
     context.user_data.clear()
-    await update.message.reply_text(
-        "Message saved.",
-        reply_markup=InlineKeyboardMarkup(_message_rows()),
-    )
+    await update.message.reply_text("Message saved.")
     return ConversationHandler.END
+
+
+async def messages_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _safe_callback_answer(update.callback_query)
+    await _message_list_callback(update, "bot_messages")
+
+
+async def message_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    parts = query.data.split(":")
+    category = parts[1]
+    message_id = int(parts[3]) if len(parts) > 3 else int(parts[-1])
+    await _message_view_callback(update, category, message_id)
+
+
+async def message_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    parts = query.data.split(":")
+    category = parts[1]
+    action = parts[2]
+    message_id = int(parts[3])
+    enabled = action == "enable"
+    set_category_message_enabled(category, message_id, enabled)
+    await _send_or_edit(update, "Updated.", InlineKeyboardMarkup(_category_rows(category)))
+
+
+async def add_message_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _message_add_entry(update, context, "bot_messages")
+
+
+async def add_message_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _message_content_handler(update, context)
+
+
+async def add_message_delay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _message_delay_handler(update, context)
 
 
 async def delete_message_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await _safe_callback_answer(update.callback_query)
-    rows = []
-    for message in list_messages(active_only=False):
-        rows.append(
-            [InlineKeyboardButton(f"Delete #{message['id']}", callback_data=f"message:delete_one:{message['id']}")]
-        )
-    rows.append([InlineKeyboardButton("Back", callback_data="menu:messages")])
-    await _send_or_edit(update, "Choose a message to delete", InlineKeyboardMarkup(rows))
+    await _send_or_edit(update, "Choose a message to delete", InlineKeyboardMarkup(_category_rows("bot_messages")))
     return ConversationHandler.END
 
 
 async def delete_one_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_callback_answer(query)
-    message_id = int(query.data.split(":", 3)[3])
-    delete_message(message_id)
-    await _send_or_edit(update, "Message deleted", InlineKeyboardMarkup(_message_rows()))
+    parts = query.data.split(":")
+    category = parts[1]
+    message_id = int(parts[3])
+    delete_category_message(category, message_id)
+    await _send_or_edit(update, "Message deleted", InlineKeyboardMarkup(_category_rows(category)))
 
 
 async def automation_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1466,6 +1765,27 @@ async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _safe_callback_answer(update.callback_query)
 
 
+async def message_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    parts = query.data.split(":")
+    category = parts[1]
+    action = parts[2]
+    if action == "add":
+        await _message_add_entry(update, context, category)
+    elif action == "view":
+        await _message_view_callback(update, category, int(parts[3]))
+    elif action == "edit":
+        await _safe_callback_answer(query)
+        context.user_data.clear()
+        context.user_data["message_category"] = category
+        context.user_data["message_edit_id"] = int(parts[3])
+        await _send_or_edit(update, f"Send the new {_category_label(category).lower()} content.", _cancel_menu())
+    elif action == "delete":
+        delete_category_message(category, int(parts[3]))
+        await _send_or_edit(update, "Deleted.", InlineKeyboardMarkup(_category_rows(category)))
+
+
 async def start_controller() -> None:
     global _application
     if not TOKEN:
@@ -1501,14 +1821,14 @@ async def start_controller() -> None:
         ],
         states={
             ADD_GROUP_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_chat_id)],
-            ADD_MESSAGE_CONTENT: [
+            ADD_CATEGORY_MESSAGE_CONTENT: [
                 MessageHandler(
                     (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL)
                     & ~filters.COMMAND,
                     add_message_content,
                 )
             ],
-            ADD_MESSAGE_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_message_delay)],
+            ADD_CATEGORY_MESSAGE_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_message_delay)],
             ADD_BOT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_username_handler)],
             ADD_BOT_START_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_start_cmd_handler)],
             ADD_BOT_STOP_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_stop_cmd_handler)],
@@ -1522,6 +1842,13 @@ async def start_controller() -> None:
             EDIT_BOT_SECURITY_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_security_handler)],
             EDIT_BOT_AFTER_MATCH_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_after_match_handler)],
             EDIT_BOT_AFTER_CHAT_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_after_chat_handler)],
+            SET_BOT_PROMOTION_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_mode_handler)],
+            SET_BOT_CONVERSATION_SEQUENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
+            SET_BOT_NO_RESPONSE_TIMEOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
+            SET_BOT_CONV_DELAY_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
+            SET_BOT_CONV_DELAY_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
+            SET_BOT_PROMO_DELAY_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
+            SET_BOT_PROMO_DELAY_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler)],
             EDIT_GROUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_name_handler)],
             EDIT_GROUP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_delay_handler)],
             SET_GROUP_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_set_message_handler)],
@@ -1544,10 +1871,19 @@ async def start_controller() -> None:
     _application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
     _application.add_handler(CallbackQueryHandler(list_bots_callback, pattern="^bot:list$"))
     _application.add_handler(CallbackQueryHandler(view_bot_callback, pattern="^bot:view:"))
+    _application.add_handler(CallbackQueryHandler(refresh_bot_callback, pattern="^bot:refresh:"))
     _application.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^bot:toggle:"))
     _application.add_handler(CallbackQueryHandler(edit_bot_callback, pattern="^bot:edit:"))
     _application.add_handler(CallbackQueryHandler(bypass_bot_callback, pattern="^bot:bypass:"))
     _application.add_handler(CallbackQueryHandler(delete_bot_callback, pattern="^bot:delete:"))
+    _application.add_handler(CallbackQueryHandler(bot_message_settings_callback, pattern="^botmsg:view:"))
+    _application.add_handler(CallbackQueryHandler(botmsg_mode_entry, pattern="^botmsg:mode:"))
+    _application.add_handler(CallbackQueryHandler(botmsg_sequence_entry, pattern="^botmsg:sequence:"))
+    _application.add_handler(CallbackQueryHandler(botmsg_timeout_entry, pattern="^botmsg:timeout:"))
+    _application.add_handler(CallbackQueryHandler(botmsg_conv_min_entry, pattern="^botmsg:conv_min:"))
+    _application.add_handler(CallbackQueryHandler(botmsg_conv_max_entry, pattern="^botmsg:conv_max:"))
+    _application.add_handler(CallbackQueryHandler(botmsg_promo_min_entry, pattern="^botmsg:promo_min:"))
+    _application.add_handler(CallbackQueryHandler(botmsg_promo_max_entry, pattern="^botmsg:promo_max:"))
     _application.add_handler(CallbackQueryHandler(list_groups_callback, pattern="^group:list$"))
     _application.add_handler(CallbackQueryHandler(view_group_callback, pattern="^group:view:"))
     _application.add_handler(CallbackQueryHandler(toggle_group_callback, pattern="^group:toggle:"))
@@ -1556,13 +1892,15 @@ async def start_controller() -> None:
     _application.add_handler(CallbackQueryHandler(clear_group_message_callback, pattern="^group:clear_message:"))
     _application.add_handler(CallbackQueryHandler(delete_group_callback, pattern="^group:delete:"))
     _application.add_handler(CallbackQueryHandler(messages_list_callback, pattern="^message:list$"))
-    _application.add_handler(CallbackQueryHandler(message_view_callback, pattern="^message:view:"))
+    _application.add_handler(CallbackQueryHandler(message_view_callback, pattern="^msg:[a-z_]+:view:"))
+    _application.add_handler(CallbackQueryHandler(message_toggle_callback, pattern="^msg:[a-z_]+:(enable|disable):"))
     _application.add_handler(CallbackQueryHandler(delete_message_menu, pattern="^message:delete$"))
-    _application.add_handler(CallbackQueryHandler(delete_one_message, pattern="^message:delete_one:"))
+    _application.add_handler(CallbackQueryHandler(delete_one_message, pattern="^msg:[a-z_]+:delete:"))
     _application.add_handler(CallbackQueryHandler(automation_start, pattern="^automation:start$"))
     _application.add_handler(CallbackQueryHandler(automation_stop, pattern="^automation:stop$"))
     _application.add_handler(CallbackQueryHandler(automation_pause, pattern="^automation:pause$"))
     _application.add_handler(CallbackQueryHandler(automation_resume, pattern="^automation:resume$"))
+    _application.add_handler(CallbackQueryHandler(message_category_callback, pattern="^msg:[a-z_]+:"))
     _application.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
 
     try:

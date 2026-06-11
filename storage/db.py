@@ -18,7 +18,18 @@ _MONGO_DB = None
 _SETTING_CACHE: dict[str, Any] = {}
 _BOT_CACHE: dict[str, dict[str, Any]] = {}
 _GROUP_CACHE: dict[str, dict[str, Any]] = {}
-_MESSAGE_CACHE: dict[int, dict[str, Any]] = {}
+_MESSAGE_CACHE: dict[str, dict[int, dict[str, Any]]] = {
+    "conversational_messages": {},
+    "bot_messages": {},
+    "group_messages": {},
+    "promotion_stickers": {},
+}
+_MESSAGE_PERF_CACHE: dict[str, dict[int, dict[str, int]]] = {
+    "conversational_messages": {},
+    "bot_messages": {},
+}
+_BOT_SETTINGS_CACHE: dict[str, dict[str, Any]] = {}
+_BOT_RUNTIME_CACHE: dict[str, dict[str, Any]] = {}
 _DB_METRICS: dict[str, dict[str, int]] = {
     "get_setting": {"hits": 0, "misses": 0, "count": 0},
     "get_bot": {"hits": 0, "misses": 0, "count": 0},
@@ -137,6 +148,10 @@ async def aupdate_group_runtime(*args: Any, **kwargs: Any) -> bool:
     return await asyncio.to_thread(update_group_runtime, *args, **kwargs)
 
 
+async def alist_category_messages(category: str, active_only: bool = True) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(list_category_messages, category, active_only)
+
+
 def get_promotion_asset_channel() -> Any:
     return get_setting("promotion_asset_channel", None)
 
@@ -153,14 +168,371 @@ def set_promotion_sticker_message_id(value: Any) -> bool:
     return set_setting("promotion_sticker_message_id", value)
 
 
+def _normalize_category(category: str) -> str:
+    category = str(category).strip().lower()
+    aliases = {
+        "conversational": "conversational_messages",
+        "messages": "bot_messages",
+        "bot": "bot_messages",
+        "group": "group_messages",
+        "stickers": "promotion_stickers",
+        "sticker": "promotion_stickers",
+    }
+    return aliases.get(category, category)
+
+
+def _collection(category: str):
+    category = _normalize_category(category)
+    return _mongo_db()[category]
+
+
+def _category_cache(category: str) -> dict[int, dict[str, Any]]:
+    return _MESSAGE_CACHE.setdefault(_normalize_category(category), {})
+
+
+def add_category_message(
+    category: str,
+    content: str,
+    media_type: str | None = None,
+    media_file_id: str | None = None,
+    is_active: bool = True,
+) -> int:
+    collection = _normalize_category(category)
+    message_id = _next_message_id(collection)
+    doc: dict[str, Any] = {
+        "id": message_id,
+        "content": content,
+        "media_type": media_type,
+        "media_file_id": media_file_id,
+        "is_active": is_active,
+        "enabled": True,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    if collection == "promotion_stickers":
+        doc["content"] = ""
+        doc["media_type"] = "sticker"
+        doc["is_active"] = True
+    _collection(collection).insert_one(doc)
+    _category_cache(collection)[message_id] = dict(doc)
+    if collection in _MESSAGE_PERF_CACHE:
+        _MESSAGE_PERF_CACHE[collection][message_id] = {"times_sent": 0, "replies_received": 0}
+    return message_id
+
+
+def get_category_message(category: str, message_id: int) -> dict[str, Any] | None:
+    collection = _normalize_category(category)
+    cache = _category_cache(collection)
+    if message_id in cache:
+        return dict(cache[message_id])
+    doc = _collection(collection).find_one({"id": int(message_id)})
+    if not doc:
+        return None
+    message = {k: v for k, v in doc.items() if k != "_id"}
+    cache[message_id] = dict(message)
+    return message
+
+
+def _ensure_message_perf_defaults(category: str, message_id: int) -> dict[str, int]:
+    perf_cache = _MESSAGE_PERF_CACHE.setdefault(_normalize_category(category), {})
+    perf = perf_cache.setdefault(message_id, {"times_sent": 0, "replies_received": 0})
+    return perf
+
+
+def get_message_performance(category: str, message_id: int) -> dict[str, int]:
+    category = _normalize_category(category)
+    perf = dict(_ensure_message_perf_defaults(category, int(message_id)))
+    doc = _collection(category).find_one({"id": int(message_id)}, {"performance": 1})
+    if doc and isinstance(doc.get("performance"), dict):
+        perf.update(
+            {
+                "times_sent": int(doc["performance"].get("times_sent", perf["times_sent"]) or 0),
+                "replies_received": int(doc["performance"].get("replies_received", perf["replies_received"]) or 0),
+            }
+        )
+    _MESSAGE_PERF_CACHE.setdefault(category, {})[int(message_id)] = dict(perf)
+    return perf
+
+
+def increment_message_performance(category: str, message_id: int, **increments: int) -> dict[str, int]:
+    category = _normalize_category(category)
+    update: dict[str, Any] = {}
+    for key, value in increments.items():
+        try:
+            update[f"performance.{key}"] = int(value)
+        except (TypeError, ValueError):
+            continue
+    if update:
+        _collection(category).update_one(
+            {"id": int(message_id)},
+            {"$inc": update, "$set": {"updated_at": datetime.utcnow()}},
+        )
+    perf = _ensure_message_perf_defaults(category, int(message_id))
+    for key, value in increments.items():
+        try:
+            perf[key] = int(perf.get(key, 0) or 0) + int(value)
+        except (TypeError, ValueError):
+            continue
+    _MESSAGE_PERF_CACHE.setdefault(category, {})[int(message_id)] = dict(perf)
+    return dict(perf)
+
+
+def list_category_messages(category: str, active_only: bool = True) -> list[dict[str, Any]]:
+    collection = _normalize_category(category)
+    query = {"is_active": True} if active_only and collection != "promotion_stickers" else {}
+    messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _collection(collection).find(query).sort("id", 1)]
+    cache = _category_cache(collection)
+    for message in messages:
+        message.setdefault("enabled", True)
+        cache[int(message["id"])] = dict(message)
+    return messages
+
+
+def update_category_message(category: str, message_id: int, **changes: Any) -> bool:
+    collection = _normalize_category(category)
+    changes["updated_at"] = datetime.utcnow()
+    _collection(collection).update_one({"id": int(message_id)}, {"$set": changes})
+    cache = _category_cache(collection)
+    if message_id in cache:
+        cache[message_id].update(changes)
+    return True
+
+
+def delete_category_message(category: str, message_id: int) -> bool:
+    collection = _normalize_category(category)
+    _collection(collection).delete_one({"id": int(message_id)})
+    _category_cache(collection).pop(int(message_id), None)
+    _MESSAGE_PERF_CACHE.setdefault(collection, {}).pop(int(message_id), None)
+    return True
+
+
+def add_promotion_sticker(file_id: str) -> int:
+    return add_category_message("promotion_stickers", "", media_type="sticker", media_file_id=file_id)
+
+
+def delete_promotion_sticker(sticker_id: int) -> bool:
+    return delete_category_message("promotion_stickers", sticker_id)
+
+
+def get_bot_settings(bot_name: str) -> dict[str, Any]:
+    if bot_name in _BOT_SETTINGS_CACHE:
+        return dict(_BOT_SETTINGS_CACHE[bot_name])
+    doc = _mongo_db()["bot_settings"].find_one({"bot_name": bot_name})
+    if not doc:
+        settings = {
+            "bot_name": bot_name,
+            "promotion_mode": "MESSAGE",
+            "conversation_sequence": [],
+            "no_response_timeout": 0,
+            "conversation_delay_min": 0,
+            "conversation_delay_max": 0,
+            "promotion_delay_min": 0,
+            "promotion_delay_max": 0,
+            "runtime": {
+                "current_stage": "IDLE",
+                "last_activity_ts": None,
+                "last_failure_reason": None,
+                "last_failure_ts": None,
+                "conversations_started": 0,
+                "partner_replies": 0,
+                "promotions_sent": 0,
+                "error_count": 0,
+            },
+        }
+        _BOT_SETTINGS_CACHE[bot_name] = dict(settings)
+        return settings
+    settings = {k: v for k, v in doc.items() if k != "_id"}
+    settings.setdefault(
+        "runtime",
+        {
+            "current_stage": "IDLE",
+            "last_activity_ts": None,
+            "last_failure_reason": None,
+            "last_failure_ts": None,
+            "conversations_started": 0,
+            "partner_replies": 0,
+            "promotions_sent": 0,
+            "error_count": 0,
+        },
+    )
+    _BOT_SETTINGS_CACHE[bot_name] = dict(settings)
+    return settings
+
+
+def set_bot_settings(bot_name: str, **changes: Any) -> bool:
+    current = get_bot_settings(bot_name)
+    current.update(changes)
+    current["bot_name"] = bot_name
+    _mongo_db()["bot_settings"].update_one({"bot_name": bot_name}, {"$set": {**current, "updated_at": datetime.utcnow()}}, upsert=True)
+    _BOT_SETTINGS_CACHE[bot_name] = dict(current)
+    return True
+
+
+def update_bot_runtime(bot_name: str, **changes: Any) -> bool:
+    runtime = dict(get_bot_settings(bot_name).get("runtime", {}))
+    runtime.update(changes)
+    _BOT_RUNTIME_CACHE[bot_name] = dict(runtime)
+    return set_bot_settings(bot_name, runtime=runtime)
+
+
+def increment_bot_runtime(bot_name: str, **increments: int) -> dict[str, Any]:
+    update: dict[str, Any] = {}
+    for key, value in increments.items():
+        try:
+            update[f"runtime.{key}"] = int(value)
+        except (TypeError, ValueError):
+            continue
+    if update:
+        _mongo_db()["bot_settings"].update_one({"bot_name": bot_name}, {"$inc": update, "$set": {"updated_at": datetime.utcnow()}}, upsert=True)
+    runtime = dict(get_bot_runtime(bot_name))
+    for key, value in increments.items():
+        try:
+            runtime[key] = int(runtime.get(key, 0) or 0) + int(value)
+        except (TypeError, ValueError):
+            continue
+    _BOT_RUNTIME_CACHE[bot_name] = dict(runtime)
+    return runtime
+
+
+def get_bot_runtime(bot_name: str) -> dict[str, Any]:
+    if bot_name in _BOT_RUNTIME_CACHE:
+        return dict(_BOT_RUNTIME_CACHE[bot_name])
+    runtime = dict(get_bot_settings(bot_name).get("runtime", {}))
+    _BOT_RUNTIME_CACHE[bot_name] = dict(runtime)
+    return runtime
+
+
 def db_status() -> dict[str, Any]:
     return {
         "settings_cache": len(_SETTING_CACHE),
         "bots_cache": len(_BOT_CACHE),
         "groups_cache": len(_GROUP_CACHE),
-        "messages_cache": len(_MESSAGE_CACHE),
+        "messages_cache": sum(len(cache) for cache in _MESSAGE_CACHE.values()),
+        "bot_settings_cache": len(_BOT_SETTINGS_CACHE),
         "metrics": {key: dict(value) for key, value in _DB_METRICS.items()},
         "last_timings_ms": dict(_DB_LAST_TIMINGS),
+    }
+
+
+def list_enabled_bots() -> list[dict[str, Any]]:
+    bots = list(get_bots().values())
+    return sorted([bot for bot in bots if bool(bot.get("enabled", False))], key=lambda item: str(item.get("username") or ""))
+
+
+def list_enabled_groups() -> list[dict[str, Any]]:
+    return sorted([group for group in list_groups(enabled_only=False) if group.get("status") == "enabled"], key=lambda item: str(item.get("group_id") or ""))
+
+
+def repair_promotion_data() -> dict[str, Any]:
+    bots = get_bots()
+    groups = list_groups(enabled_only=False)
+    messages = list_messages(active_only=False)
+    bot_names = set(bots.keys())
+    repaired_groups = 0
+    missing_assignments = 0
+    invalid_assignments = 0
+    for group in groups:
+        group_id = str(group.get("group_id") or "")
+        assigned_bot = str(group.get("assigned_bot") or group.get("bot_username") or "").strip().lstrip("@") or None
+        if not assigned_bot:
+            missing_assignments += 1
+            assigned_bot = next(iter(bot_names), None)
+        elif assigned_bot not in bot_names:
+            invalid_assignments += 1
+            assigned_bot = next(iter(bot_names), None)
+        update: dict[str, Any] = {}
+        if group.get("assigned_bot") != assigned_bot or group.get("bot_username") != assigned_bot:
+            update["assigned_bot"] = assigned_bot
+            update["bot_username"] = assigned_bot
+        if group.get("status") != "enabled":
+            update["status"] = "enabled"
+        if group.get("enabled") is not True:
+            update["enabled"] = True
+        if group.get("cooldown_until") is None:
+            update["cooldown_until"] = datetime.utcnow().isoformat()
+        if group.get("next_run_at") is None:
+            update["next_run_at"] = datetime.utcnow().isoformat()
+        if update:
+            update["updated_at"] = datetime.utcnow()
+            _groups_collection().update_one({"_id": group_id}, {"$set": update})
+            cached = _GROUP_CACHE.get(group_id)
+            if cached is not None:
+                cached.update(update)
+            repaired_groups += 1
+    return {
+        "total_bots": len(bots),
+        "total_groups": len(groups),
+        "total_active_messages": len([message for message in messages if message.get("is_active", message.get("active", False)) and message.get("content")]),
+        "groups_missing_assignments": missing_assignments,
+        "groups_invalid_assignments": invalid_assignments,
+        "groups_repaired": repaired_groups,
+        "expected_promotions_per_cycle": len([g for g in groups if str(g.get("assigned_bot") or g.get("bot_username") or "").strip()]),
+    }
+
+
+def migrate_legacy_promotion_messages() -> dict[str, Any]:
+    legacy_collections = ["bot_messages", "group_messages", "messages_collection"]
+    seen: set[str] = set()
+    imported = 0
+    skipped_duplicates = 0
+    legacy_found = 0
+    imported_ids: list[int] = []
+
+    def _normalize_text(value: Any) -> str:
+        return str(value or "").strip()
+
+    def _extract_content(doc: dict[str, Any]) -> str:
+        for key in ("content", "text", "message", "body"):
+            if doc.get(key):
+                return _normalize_text(doc.get(key))
+        return ""
+
+    def _extract_created_at(doc: dict[str, Any]) -> datetime:
+        created_at = doc.get("created_at") or doc.get("updated_at")
+        return created_at if isinstance(created_at, datetime) else datetime.utcnow()
+
+    def _extract_delay_minutes(doc: dict[str, Any]) -> int:
+        for key in ("delay_minutes", "delay", "delay_min", "minutes"):
+            value = doc.get(key)
+            if value is not None:
+                try:
+                    return max(int(value), 1)
+                except (TypeError, ValueError):
+                    continue
+        return 1
+
+    for collection_name in legacy_collections:
+        for doc in _mongo_db()[collection_name].find():
+            legacy_found += 1
+            content = _extract_content(doc)
+            if not content:
+                skipped_duplicates += 1
+                continue
+            signature = content.lower()
+            if signature in seen:
+                skipped_duplicates += 1
+                continue
+            seen.add(signature)
+            next_id = _next_message_id()
+            new_doc = {
+                "id": next_id,
+                "content": content,
+                "media_type": doc.get("media_type"),
+                "media_file_id": doc.get("media_file_id"),
+                "delay_minutes": _extract_delay_minutes(doc),
+                "is_active": True,
+                "created_at": _extract_created_at(doc),
+            }
+            _collection("bot_messages").insert_one(new_doc)
+            _MESSAGE_CACHE["bot_messages"][next_id] = dict(new_doc)
+            imported_ids.append(next_id)
+            imported += 1
+
+    return {
+        "legacy_messages_found": legacy_found,
+        "imported_messages": imported,
+        "skipped_duplicates": skipped_duplicates,
+        "imported_message_ids": imported_ids,
     }
 
 
@@ -187,10 +559,21 @@ def init_db() -> None:
     db["settings"].update_one({"_id": "promotion_mode"}, {"$setOnInsert": {"value": "message"}}, upsert=True)
     db["settings"].update_one({"_id": "promotion_asset_channel"}, {"$setOnInsert": {"value": None}}, upsert=True)
     db["settings"].update_one({"_id": "promotion_sticker_message_id"}, {"$setOnInsert": {"value": None}}, upsert=True)
+    db["settings"].update_one({"_id": "default_promotion_mode"}, {"$setOnInsert": {"value": "MESSAGE"}}, upsert=True)
+    db["settings"].update_one({"_id": "default_conversation_sequence"}, {"$setOnInsert": {"value": []}}, upsert=True)
+    db["settings"].update_one({"_id": "default_no_response_timeout"}, {"$setOnInsert": {"value": 0}}, upsert=True)
+    db["settings"].update_one({"_id": "default_conversation_delay_min"}, {"$setOnInsert": {"value": 0}}, upsert=True)
+    db["settings"].update_one({"_id": "default_conversation_delay_max"}, {"$setOnInsert": {"value": 0}}, upsert=True)
+    db["settings"].update_one({"_id": "default_promotion_delay_min"}, {"$setOnInsert": {"value": 0}}, upsert=True)
+    db["settings"].update_one({"_id": "default_promotion_delay_max"}, {"$setOnInsert": {"value": 0}}, upsert=True)
     db["groups"].create_index([("status", 1), ("updated_at", 1)])
     db["groups"].create_index([("status", 1), ("next_run_at", 1)])
     db["groups"].create_index([("status", 1), ("cooldown_until", 1)])
-    db["messages"].create_index([("is_active", 1), ("id", 1)])
+    for collection_name in ("conversational_messages", "bot_messages", "group_messages"):
+        db[collection_name].create_index([("is_active", 1), ("id", 1)])
+        db[collection_name].create_index([("id", 1)], unique=True)
+    db["promotion_stickers"].create_index([("id", 1)], unique=True)
+    db["bot_settings"].create_index([("bot_name", 1)], unique=True)
 
 
 def _settings_value(doc: dict[str, Any] | None, default: Any) -> Any:
@@ -322,6 +705,8 @@ def add_group(group_id: str, group_name: str, status: str = "enabled") -> bool:
         "_id": str(group_id),
         "group_id": str(group_id),
         "group_name": group_name,
+        "assigned_bot": None,
+        "bot_username": None,
         "status": status,
         "delay_min": 4,
         "delay_max": 7,
@@ -454,31 +839,57 @@ def clear_group_special_message(group_id: str) -> bool:
     return bool(_groups_collection().update_one({"_id": str(group_id)}, {"$set": {"special_message": None, "updated_at": datetime.utcnow()}}))
 
 
-def _messages_collection():
-    return _mongo_db()["messages"]
+def set_group_assigned_bot(group_id: str, bot_name: str | None) -> bool:
+    cached = _GROUP_CACHE.get(str(group_id))
+    if cached is not None:
+        cached["assigned_bot"] = bot_name
+        cached["bot_username"] = bot_name
+    return bool(
+        _groups_collection().update_one(
+            {"_id": str(group_id)},
+            {"$set": {"assigned_bot": bot_name, "bot_username": bot_name, "updated_at": datetime.utcnow()}},
+        )
+    )
 
 
-def _next_message_id() -> int:
-    doc = _messages_collection().find_one(sort=[("id", -1)])
+def _collection(name: str):
+    return _mongo_db()[name]
+
+
+def _message_cache_for(category: str) -> dict[int, dict[str, Any]]:
+    return _MESSAGE_CACHE.setdefault(category, {})
+
+
+def _next_message_id(category: str) -> int:
+    doc = _collection(category).find_one(sort=[("id", -1)])
     return int(doc["id"]) + 1 if doc and "id" in doc else 1
 
 
 def add_message(content: str, delay_minutes: int, media_type: str | None = None, media_file_id: str | None = None) -> int:
-    message_id = _next_message_id()
-    doc = {"id": message_id, "content": content, "media_type": media_type, "media_file_id": media_file_id, "delay_minutes": delay_minutes, "is_active": True, "created_at": datetime.utcnow()}
-    _messages_collection().insert_one(doc)
-    _MESSAGE_CACHE[message_id] = dict(doc)
+    message_id = _next_message_id("bot_messages")
+    doc = {
+        "id": message_id,
+        "content": content,
+        "media_type": media_type,
+        "media_file_id": media_file_id,
+        "delay_minutes": delay_minutes,
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+    }
+    _collection("bot_messages").insert_one(doc)
+    _message_cache_for("bot_messages")[message_id] = dict(doc)
     return message_id
 
 
 def get_message(message_id: int) -> dict[str, Any] | None:
-    if message_id in _MESSAGE_CACHE:
-        return dict(_MESSAGE_CACHE[message_id])
-    doc = _messages_collection().find_one({"id": int(message_id)})
+    if message_id in _message_cache_for("bot_messages"):
+        return dict(_message_cache_for("bot_messages")[message_id])
+    doc = _collection("bot_messages").find_one({"id": int(message_id)})
     if not doc:
         return None
     message = {k: v for k, v in doc.items() if k != "_id"}
-    _MESSAGE_CACHE[message_id] = dict(message)
+    message.setdefault("enabled", True)
+    _message_cache_for("bot_messages")[message_id] = dict(message)
     return message
 
 
@@ -486,26 +897,28 @@ def list_messages(active_only: bool = True) -> list[dict[str, Any]]:
     start = time.monotonic()
     if active_only:
         query = {"is_active": True}
-        messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _messages_collection().find(query).sort("id", 1)]
+        messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _collection("bot_messages").find(query).sort("id", 1)]
         for message in messages:
             message_id = int(message.get("id"))
-            _MESSAGE_CACHE[message_id] = dict(message)
+            message.setdefault("enabled", True)
+            _message_cache_for("bot_messages")[message_id] = dict(message)
         elapsed_ms = (time.monotonic() - start) * 1000
         _record_db_metric("list_messages", False, elapsed_ms)
         record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": False, "active_only": active_only})
         return messages
-    if _MESSAGE_CACHE:
-        messages = [dict(message) for message in _MESSAGE_CACHE.values()]
+    if _message_cache_for("bot_messages"):
+        messages = [dict(message) for message in _message_cache_for("bot_messages").values()]
         result = sorted(messages, key=lambda item: item.get("id", 0))
         elapsed_ms = (time.monotonic() - start) * 1000
         _record_db_metric("list_messages", True, elapsed_ms)
         record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": True, "active_only": active_only})
         return result
     query = {}
-    messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _messages_collection().find(query).sort("id", 1)]
+    messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _collection("bot_messages").find(query).sort("id", 1)]
     for message in messages:
         message_id = int(message.get("id"))
-        _MESSAGE_CACHE[message_id] = dict(message)
+        message.setdefault("enabled", True)
+        _message_cache_for("bot_messages")[message_id] = dict(message)
     elapsed_ms = (time.monotonic() - start) * 1000
     _record_db_metric("list_messages", False, elapsed_ms)
     record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": False, "active_only": active_only})
@@ -513,6 +926,26 @@ def list_messages(active_only: bool = True) -> list[dict[str, Any]]:
 
 
 def delete_message(message_id: int) -> bool:
-    _messages_collection().delete_one({"id": int(message_id)})
-    _MESSAGE_CACHE.pop(int(message_id), None)
+    _collection("bot_messages").delete_one({"id": int(message_id)})
+    _message_cache_for("bot_messages").pop(int(message_id), None)
     return True
+
+
+def set_category_message_enabled(category: str, message_id: int, enabled: bool) -> bool:
+    collection = _normalize_category(category)
+    _collection(collection).update_one({"id": int(message_id)}, {"$set": {"enabled": bool(enabled), "updated_at": datetime.utcnow()}})
+    cached = _category_cache(collection).get(int(message_id))
+    if cached is not None:
+        cached["enabled"] = bool(enabled)
+    if collection == "bot_messages":
+        cached_bot = _message_cache_for("bot_messages").get(int(message_id))
+        if cached_bot is not None:
+            cached_bot["enabled"] = bool(enabled)
+    return True
+
+
+def is_category_message_enabled(category: str, message_id: int, default: bool = True) -> bool:
+    message = get_category_message(category, message_id)
+    if message is None:
+        return default
+    return bool(message.get("enabled", default))

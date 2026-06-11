@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import time
+from collections.abc import Iterable
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -18,24 +19,37 @@ from storage.db import (
     aget_bots,
     aget_setting,
     alist_groups,
+    alist_category_messages,
     alist_messages,
     aset_bot_paused,
     aset_setting,
     aupdate_group_runtime,
     db_status,
+    list_enabled_bots,
+    list_enabled_groups,
+    repair_promotion_data,
     get_promotion_asset_channel,
     get_promotion_sticker_message_id,
     record_operation,
     telemetry_snapshot,
     get_bot,
     get_bots,
+    get_bot_settings,
+    get_bot_settings,
+    update_bot_runtime,
+    increment_bot_runtime,
+    get_bot_runtime,
     get_setting,
+    increment_message_performance,
+    is_category_message_enabled,
     is_bot_enabled,
     is_bot_paused,
     list_groups,
+    list_category_messages,
     list_messages,
     set_bot_paused,
     set_setting,
+    get_group,
     update_group_runtime,
 )
 
@@ -300,6 +314,11 @@ class AutomationService:
         self.last_active_messages_count = 0
         self.last_promotion_attempt: dict[str, object] | None = None
         self.last_successful_promotion: dict[str, object] | None = None
+        self.last_promotion_summary: dict[str, object] | None = None
+        self.last_failure_summary: dict[str, object] | None = None
+        self._bot_sessions: dict[str, dict[str, object]] = {}
+        self._bot_reply_events: dict[str, asyncio.Event] = {}
+        self._bot_task_locks: dict[str, asyncio.Lock] = {}
 
     def _record_skip(self, reason: str, group: dict | None = None, message: dict | None = None, **extra: object) -> None:
         self.last_skip_reason = reason
@@ -363,6 +382,343 @@ class AutomationService:
     def _save_snapshot(self, snapshot: AutomationSnapshot) -> None:
         set_setting("automation_group_index", snapshot.group_index)
         set_setting("automation_message_index", snapshot.message_index)
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _parse_sequence(raw_sequence: object) -> list[int]:
+        if isinstance(raw_sequence, str):
+            items: Iterable[object] = [item.strip() for item in raw_sequence.split(",")]
+        elif isinstance(raw_sequence, Iterable):
+            items = raw_sequence
+        else:
+            items = []
+        result: list[int] = []
+        for item in items:
+            try:
+                value = int(str(item).strip())
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                result.append(value)
+        return result
+
+    @staticmethod
+    def _delay_bounds(settings: dict[str, object], prefix: str, default_min: float = 0.0, default_max: float = 0.0) -> tuple[float, float]:
+        try:
+            min_value = float(settings.get(f"{prefix}_min", default_min) or default_min)
+        except (TypeError, ValueError):
+            min_value = default_min
+        try:
+            max_value = float(settings.get(f"{prefix}_max", default_max) or default_max)
+        except (TypeError, ValueError):
+            max_value = default_max
+        if max_value < min_value:
+            max_value = min_value
+        return min_value, max_value
+
+    @staticmethod
+    def _promotion_mode_for(settings: dict[str, object]) -> str:
+        mode = str(settings.get("promotion_mode", "MESSAGE") or "MESSAGE").strip().upper()
+        return mode if mode in {"MESSAGE", "STICKER", "BOTH", "RANDOM", "DISABLED"} else "MESSAGE"
+
+    def _bot_session(self, bot_name: str) -> dict[str, object]:
+        session = self._bot_sessions.setdefault(
+            bot_name,
+            {
+                "engaged": False,
+                "active": False,
+                "completed": False,
+                "last_partner_reply_at": None,
+                "last_conversation_message_id": None,
+            },
+        )
+        self._bot_reply_events.setdefault(bot_name, asyncio.Event())
+        return session
+
+    def _set_bot_runtime(self, bot_name: str, stage: str, **changes: object) -> None:
+        payload = {"current_stage": stage, "last_activity_ts": self._utc_now().isoformat()}
+        payload.update(changes)
+        update_bot_runtime(bot_name, **payload)
+        logger.info("BOT RUNTIME UPDATE bot=%s stage=%s changes=%s", bot_name, stage, changes)
+
+    def _increment_bot_runtime(self, bot_name: str, **changes: int) -> None:
+        runtime = increment_bot_runtime(bot_name, **changes)
+        logger.info("BOT RUNTIME COUNTERS bot=%s values=%s", bot_name, runtime)
+
+    def _bot_lock(self, bot_name: str) -> asyncio.Lock:
+        return self._bot_task_locks.setdefault(bot_name, asyncio.Lock())
+
+    def _clear_bot_session(self, bot_name: str) -> None:
+        self._bot_sessions.pop(bot_name, None)
+        event = self._bot_reply_events.pop(bot_name, None)
+        if event is not None:
+            event.set()
+
+    def _choose_message(self, category: str) -> dict[str, object] | None:
+        messages = list_category_messages(category, active_only=True)
+        if not messages:
+            return None
+        enabled_messages = [message for message in messages if bool(message.get("enabled", True))]
+        if not enabled_messages:
+            logger.warning("MESSAGE CHOICE SKIP category=%s reason=no_enabled_messages", category)
+            return None
+        return random.choice(enabled_messages)
+
+    def _choose_conversation_message(self, message_ids: list[int]) -> dict[str, object] | None:
+        if not message_ids:
+            return None
+        indexed = {int(message["id"]): message for message in list_category_messages("conversational_messages", active_only=True)}
+        candidates = []
+        for message_id in message_ids:
+            message = indexed.get(message_id)
+            if not message:
+                continue
+            if not bool(message.get("enabled", True)):
+                logger.info("CONVERSATION MESSAGE SKIP reason=disabled message_id=%s", message_id)
+                continue
+            candidates.append(message)
+        if not candidates:
+            return None
+        return random.choice(candidates)
+
+    async def _sleep_with_wakeup(self, seconds: float) -> bool:
+        if seconds <= 0:
+            return False
+        try:
+            await asyncio.wait_for(self._wake_event.wait(), timeout=seconds)
+            self._wake_event.clear()
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    @staticmethod
+    def _safe_positive_float(value: object, default: float = 0.0) -> float:
+        try:
+            parsed = float(value if value is not None else default)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    def _validate_bot_settings(self, bot_name: str, settings: dict[str, object]) -> tuple[list[int], float, tuple[float, float], tuple[float, float]]:
+        sequence = self._parse_sequence(settings.get("conversation_sequence", []))
+        no_response_timeout = self._safe_positive_float(settings.get("no_response_timeout", 0), 0.0)
+        conv_delay = self._delay_bounds(settings, "conversation_delay", 0.0, 0.0)
+        promo_delay = self._delay_bounds(settings, "promotion_delay", 0.0, 0.0)
+        if not sequence:
+            logger.warning("BOT CONFIG INVALID bot=%s reason=empty_conversation_sequence settings=%s", bot_name, settings)
+        if no_response_timeout <= 0:
+            logger.warning("BOT CONFIG INVALID bot=%s reason=no_response_timeout_not_positive value=%s", bot_name, settings.get("no_response_timeout"))
+        if conv_delay[0] < 0 or conv_delay[1] < 0:
+            logger.warning("BOT CONFIG INVALID bot=%s reason=negative_conversation_delay min=%s max=%s", bot_name, conv_delay[0], conv_delay[1])
+        if promo_delay[0] < 0 or promo_delay[1] < 0:
+            logger.warning("BOT CONFIG INVALID bot=%s reason=negative_promotion_delay min=%s max=%s", bot_name, promo_delay[0], promo_delay[1])
+        return sequence, no_response_timeout, conv_delay, promo_delay
+
+    async def _send_saved_payload_guarded(self, bot_name: str, message: dict, stage: str) -> bool:
+        if not message or not message.get("id"):
+            logger.warning("BOT SEND SKIP bot=%s stage=%s reason=missing_message_payload message=%s", bot_name, stage, message)
+            return False
+        try:
+            await asyncio.wait_for(self.telegram.send_saved_payload(bot_name, message), timeout=60)
+            logger.info("BOT SEND OK bot=%s stage=%s message_id=%s", bot_name, stage, message.get("id"))
+            return True
+        except asyncio.TimeoutError:
+            logger.exception("BOT SEND TIMEOUT bot=%s stage=%s message_id=%s", bot_name, stage, message.get("id"))
+            return False
+        except Exception as exc:
+            logger.exception("BOT SEND FAILED bot=%s stage=%s message_id=%s error=%s", bot_name, stage, message.get("id"), exc)
+            return False
+
+    def _record_message_send(self, bot_name: str, category: str, message_id: int) -> None:
+        try:
+            perf = increment_message_performance(category, message_id, times_sent=1)
+            logger.info(
+                "MESSAGE PERF SEND bot=%s category=%s message_id=%s times_sent=%s replies_received=%s",
+                bot_name,
+                category,
+                message_id,
+                perf.get("times_sent"),
+                perf.get("replies_received"),
+            )
+        except Exception:
+            logger.exception("Failed to update message send performance bot=%s category=%s message_id=%s", bot_name, category, message_id)
+
+    def _record_message_reply(self, bot_name: str, message_id: int | None) -> None:
+        if not message_id:
+            logger.info("MESSAGE PERF REPLY SKIP bot=%s reason=no_last_message", bot_name)
+            return
+        try:
+            perf = increment_message_performance("conversational_messages", int(message_id), replies_received=1)
+            logger.info(
+                "MESSAGE PERF REPLY bot=%s message_id=%s times_sent=%s replies_received=%s",
+                bot_name,
+                message_id,
+                perf.get("times_sent"),
+                perf.get("replies_received"),
+            )
+        except Exception:
+            logger.exception("Failed to update message reply performance bot=%s message_id=%s", bot_name, message_id)
+
+    async def _wait_for_partner_reply(self, bot_name: str, timeout_seconds: float) -> bool:
+        event = self._bot_reply_events.setdefault(bot_name, asyncio.Event())
+        if timeout_seconds <= 0:
+            logger.warning("BOT WAIT SKIP bot=%s reason=non_positive_timeout value=%s", bot_name, timeout_seconds)
+            return False
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout_seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _send_bot_promotion(self, bot_name: str, settings: dict[str, object]) -> None:
+        mode = self._promotion_mode_for(settings)
+        self._set_bot_runtime(bot_name, "PROMOTING")
+        if mode == "DISABLED":
+            logger.info("PROMOTION DISABLED bot=%s", bot_name)
+            self._set_bot_runtime(bot_name, "IDLE")
+            return
+        promotion_messages = list_category_messages("bot_messages", active_only=True)
+        promotion_messages = [message for message in promotion_messages if bool(message.get("enabled", True))]
+        if not promotion_messages:
+            logger.warning("PROMOTION SKIP bot=%s reason=no_enabled_bot_messages", bot_name)
+            self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="no_bot_messages", last_failure_ts=self._utc_now().isoformat())
+            self._increment_bot_runtime(bot_name, error_count=1)
+            return
+        selected_message = random.choice(promotion_messages)
+        promotion_delay_min, promotion_delay_max = self._delay_bounds(settings, "promotion_delay", 0.0, 0.0)
+        chosen_mode = mode
+        if mode == "RANDOM":
+            chosen_mode = random.choice(["MESSAGE", "STICKER", "BOTH"])
+        logger.info("PROMOTION STAGE bot=%s mode=%s selected_mode=%s message_id=%s", bot_name, mode, chosen_mode, selected_message.get("id"))
+        if chosen_mode == "MESSAGE":
+            await self._send_saved_payload_guarded(bot_name, selected_message, "promotion_message")
+            self._record_message_send(bot_name, "bot_messages", int(selected_message.get("id")))
+            self._increment_bot_runtime(bot_name, promotions_sent=1)
+            self._set_bot_runtime(bot_name, "IDLE")
+            return
+        if chosen_mode == "STICKER":
+            sticker_sent = await self._send_promotion_sticker(bot_name)
+            if not sticker_sent:
+                logger.warning("PROMOTION STICKER FAILED bot=%s message_id=%s", bot_name, selected_message.get("id"))
+                self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="promotion_sticker_failed", last_failure_ts=self._utc_now().isoformat())
+                self._increment_bot_runtime(bot_name, error_count=1)
+            else:
+                self._increment_bot_runtime(bot_name, promotions_sent=1)
+                self._set_bot_runtime(bot_name, "IDLE")
+            return
+        if chosen_mode == "BOTH":
+            message_sent = await self._send_saved_payload_guarded(bot_name, selected_message, "promotion_both_message")
+            if not message_sent:
+                logger.warning("PROMOTION BOTH ABORTED bot=%s reason=message_failed message_id=%s", bot_name, selected_message.get("id"))
+                self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="promotion_message_failed", last_failure_ts=self._utc_now().isoformat())
+                self._increment_bot_runtime(bot_name, error_count=1)
+                return
+            self._record_message_send(bot_name, "bot_messages", int(selected_message.get("id")))
+            if promotion_delay_max > 0:
+                delay = random.uniform(promotion_delay_min, promotion_delay_max)
+                logger.info("PROMOTION DELAY bot=%s seconds=%.2f", bot_name, delay)
+                await self._sleep_with_wakeup(delay)
+            sticker_sent = await self._send_promotion_sticker(bot_name)
+            if not sticker_sent:
+                logger.warning("PROMOTION BOTH STICKER FAILED bot=%s message_id=%s", bot_name, selected_message.get("id"))
+                self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="promotion_sticker_failed", last_failure_ts=self._utc_now().isoformat())
+                self._increment_bot_runtime(bot_name, error_count=1)
+            else:
+                self._increment_bot_runtime(bot_name, promotions_sent=1)
+                self._set_bot_runtime(bot_name, "IDLE")
+            return
+        logger.warning("PROMOTION SKIP bot=%s reason=invalid_mode resolved_mode=%s", bot_name, chosen_mode)
+        self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="invalid_promotion_mode", last_failure_ts=self._utc_now().isoformat())
+        self._increment_bot_runtime(bot_name, error_count=1)
+
+    async def _run_bot_conversation(self, bot_name: str, settings: dict[str, object]) -> None:
+        sequence, no_response_timeout, (conversation_delay_min, conversation_delay_max), _ = self._validate_bot_settings(bot_name, settings)
+        if not sequence:
+            logger.warning("BOT CONVERSATION ABORTED bot=%s reason=no_valid_sequence", bot_name)
+            self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="no_valid_sequence", last_failure_ts=self._utc_now().isoformat())
+            self._increment_bot_runtime(bot_name, error_count=1)
+            return
+        session = self._bot_session(bot_name)
+        session["active"] = True
+        session["engaged"] = False
+        session["completed"] = False
+        reply_event = self._bot_reply_events[bot_name]
+        reply_event.clear()
+        self._set_bot_runtime(bot_name, "STARTING")
+        self._increment_bot_runtime(bot_name, conversations_started=1)
+        logger.info(
+            "BOT CONVERSATION START bot=%s sequence=%s conv_delay=%s-%s timeout=%s",
+            bot_name,
+            sequence,
+            conversation_delay_min,
+            conversation_delay_max,
+            no_response_timeout,
+        )
+        try:
+            for message_id in sequence:
+                if not is_bot_enabled(bot_name, False):
+                    logger.warning("BOT CONVERSATION ABORTED bot=%s reason=disabled mid_sequence", bot_name)
+                    self._set_bot_runtime(bot_name, "CLEANUP")
+                    break
+                if session.get("engaged"):
+                    logger.info("BOT CONVERSATION STOPPED bot=%s reason=engaged message_id=%s", bot_name, message_id)
+                    break
+                message = get_category_message("conversational_messages", message_id)
+                if not message or not message.get("is_active", True):
+                    logger.warning("BOT CONVERSATION SKIP bot=%s reason=missing_message message_id=%s", bot_name, message_id)
+                    self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="missing_conversational_message", last_failure_ts=self._utc_now().isoformat())
+                    self._increment_bot_runtime(bot_name, error_count=1)
+                    continue
+                if not bool(message.get("enabled", True)):
+                    logger.info("BOT CONVERSATION SKIP bot=%s reason=disabled_message message_id=%s", bot_name, message_id)
+                    continue
+                self._set_bot_runtime(bot_name, "SENDING_CONVERSATION")
+                sent = await self._send_saved_payload_guarded(bot_name, message, "conversation")
+                if not sent:
+                    logger.warning("BOT CONVERSATION CONTINUE bot=%s reason=send_failed message_id=%s", bot_name, message_id)
+                    self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="conversation_send_failed", last_failure_ts=self._utc_now().isoformat())
+                    self._increment_bot_runtime(bot_name, error_count=1)
+                    continue
+                session["last_conversation_message_id"] = int(message_id)
+                self._record_message_send(bot_name, "conversational_messages", int(message_id))
+                if conversation_delay_max > 0:
+                    delay = random.uniform(conversation_delay_min, conversation_delay_max)
+                    logger.info("BOT CONVERSATION DELAY bot=%s seconds=%.2f after_message_id=%s", bot_name, delay, message_id)
+                    self._set_bot_runtime(bot_name, "WAITING_REPLY")
+                    interrupted = await self._sleep_with_wakeup(delay)
+                    if interrupted:
+                        logger.info("BOT CONVERSATION WAKEUP bot=%s reason=external_event", bot_name)
+                if reply_event.is_set():
+                    session["engaged"] = True
+                    session["last_partner_reply_at"] = self._utc_now().isoformat()
+                    self._increment_bot_runtime(bot_name, partner_replies=1)
+                    break
+            if not session.get("engaged"):
+                self._set_bot_runtime(bot_name, "WAITING_TIMEOUT")
+                replied = await self._wait_for_partner_reply(bot_name, no_response_timeout)
+                session["engaged"] = bool(replied)
+                if replied:
+                    session["last_partner_reply_at"] = self._utc_now().isoformat()
+                    self._increment_bot_runtime(bot_name, partner_replies=1)
+                else:
+                    logger.info("BOT NO REPLY bot=%s timeout_seconds=%s", bot_name, no_response_timeout)
+            logger.info("BOT CONVERSATION COMPLETE bot=%s engaged=%s", bot_name, session.get("engaged"))
+            await self._send_bot_promotion(bot_name, settings)
+            post_promo_delay = random.uniform(2, 5)
+            logger.info("BOT POST PROMOTION DELAY bot=%s seconds=%.2f", bot_name, post_promo_delay)
+            self._set_bot_runtime(bot_name, "DISCONNECTING")
+            await self._sleep_with_wakeup(post_promo_delay)
+        finally:
+            session["active"] = False
+            session["completed"] = True
+            reply_event.clear()
+            self._clear_bot_session(bot_name)
+            self._set_bot_runtime(bot_name, "CLEANUP")
+            self._set_bot_runtime(bot_name, "IDLE")
+            logger.info("BOT SESSION CLEANED bot=%s", bot_name)
 
     @staticmethod
     def _promotion_mode() -> str:
@@ -584,34 +940,36 @@ class AutomationService:
     async def run_forever(self) -> None:
         loop_start_overall = time.monotonic()
         while True:
-            self._running = bool(await aget_setting("automation_running", False))
-            self._paused = bool(await aget_setting("automation_paused", False))
             delay_seconds = GROUP_LOOP_POLL_SECONDS
             cycle_start = time.monotonic()
             timings: list[tuple[str, float]] = []
             metrics = CycleMetrics(timings=timings)
             token = CURRENT_CYCLE.set(metrics)
             try:
+                self._running = True
+                self._paused = False
                 logger.info("[LOOP START] running=%s paused=%s", self._running, self._paused)
 
-                if not self._running:
-                    logger.warning("WORKER LOOP EARLY RETURN: running=False")
-                    self._wake_event.clear()
-                    await self._wake_event.wait()
-                    continue
-
-                if self._paused:
-                    logger.warning("WORKER LOOP EARLY RETURN: paused=True")
-                    self._wake_event.clear()
-                    await self._wake_event.wait()
-                    continue
-
+                db_bots_start = time.monotonic()
+                bots = list_enabled_bots()
+                self._log_timing("DB READ list_enabled_bots", db_bots_start, timings)
                 db_groups_start = time.monotonic()
-                groups = await alist_groups(enabled_only=True)
-                self._log_timing("DB READ list_groups", db_groups_start, timings)
+                groups = list_enabled_groups()
+                self._log_timing("DB READ list_enabled_groups", db_groups_start, timings)
                 db_messages_start = time.monotonic()
                 messages = await alist_messages(active_only=True)
                 self._log_timing("DB READ list_messages", db_messages_start, timings)
+                self.last_promotion_summary = {
+                    "enabled_bots": len(bots),
+                    "enabled_groups": len(groups),
+                    "active_messages": len(messages),
+                }
+                logger.warning(
+                    "PROMOTION SCHEDULER LOAD: enabled_bots=%s enabled_groups=%s active_messages=%s",
+                    len(bots),
+                    len(groups),
+                    len(messages),
+                )
                 self.last_active_messages_count = len(messages)
                 logger.warning("ACTIVE PROMOTION MESSAGES LOADED: count=%s", len(messages))
                 for item in messages:
@@ -631,28 +989,46 @@ class AutomationService:
                     group_ids,
                 )
 
-                if not groups or not messages:
-                    self._record_skip("missing_groups_or_messages", groups=len(groups), messages=len(messages))
+                if not groups or not messages or not bots:
+                    self._record_skip("missing_groups_or_messages", groups=len(groups), messages=len(messages), bots=len(bots))
                     logger.warning(
-                        "WORKER LOOP SKIP: groups_or_messages_missing groups=%s messages=%s",
+                        "WORKER LOOP SKIP: groups_or_messages_missing groups=%s messages=%s bots=%s",
                         len(groups),
                         len(messages),
+                        len(bots),
                     )
-                    logger.info("Automation paused because groups or messages are missing")
-                    self._wake_event.clear()
-                    try:
-                        await asyncio.wait_for(self._wake_event.wait(), timeout=10)
-                    except asyncio.TimeoutError:
-                        pass
                     continue
 
                 snapshot = self._load_snapshot()
                 now = self._utc_now()
-                due_processed = False
-
                 for offset in range(len(groups)):
                     group = groups[(snapshot.group_index + offset) % len(groups)]
-                    message = messages[snapshot.message_index % len(messages)]
+                    assigned_bot_name = str(group.get("assigned_bot") or group.get("bot_username") or "").strip().lstrip("@")
+                    logger.warning(
+                        "GROUP BOT ASSIGNMENT: group_id=%s group_username=%s assigned_bot=%s",
+                        group.get("group_id"),
+                        group.get("group_name"),
+                        assigned_bot_name,
+                    )
+                    if not assigned_bot_name:
+                        self._record_skip("missing_assigned_bot", group=group)
+                        self.last_failure_summary = {"group_id": group.get("group_id"), "reason": "missing_assigned_bot"}
+                        continue
+                    bot = await aget_bot(assigned_bot_name)
+                    logger.warning(
+                        "BOT RECORD LOADED: username=%s exists=%s enabled=%s",
+                        assigned_bot_name,
+                        bool(bot),
+                        bot.get("enabled") if bot else None,
+                    )
+                    if not bot or not is_bot_enabled(assigned_bot_name, False):
+                        self._record_skip("assigned_bot_missing_or_disabled", group=group)
+                        self.last_failure_summary = {"group_id": group.get("group_id"), "reason": "assigned_bot_missing_or_disabled"}
+                        continue
+                    if group.get("status") != "enabled":
+                        self._record_skip("group_disabled", group=group)
+                        self.last_failure_summary = {"group_id": group.get("group_id"), "reason": "group_disabled"}
+                        continue
                     cooldown_until = self._parse_timestamp(group.get("cooldown_until"))
                     next_run_at = self._parse_timestamp(group.get("next_run_at"))
                     logger.warning(
@@ -660,7 +1036,7 @@ class AutomationService:
                         group.get("group_id"),
                         offset,
                         snapshot.group_index,
-                        message.get("id"),
+                        None if not messages else messages[snapshot.message_index % len(messages)].get("id"),
                         group.get("next_run_at"),
                         group.get("cooldown_until"),
                     )
@@ -677,24 +1053,26 @@ class AutomationService:
 
                     if next_run_at is None:
                         next_run_at = now
-                        logger.warning(
-                            "WORKER LOOP SKIP CONDITION: next_run_at_missing group_id=%s setting_now=%s",
-                            group.get("group_id"),
-                            next_run_at.isoformat(),
-                        )
                         await aupdate_group_runtime(group["group_id"], next_run_at=next_run_at.isoformat())
-
+                    if cooldown_until is None:
+                        cooldown_until = now
+                        await aupdate_group_runtime(group["group_id"], cooldown_until=cooldown_until.isoformat())
                     logger.warning(
-                        "NEXT_RUN_AT BYPASS ACTIVE: group_id=%s now=%s next_run_at=%s",
+                        "PROMOTION ELIGIBILITY: group_id=%s status=%s next_run_at=%s cooldown_until=%s eligible=%s",
                         group.get("group_id"),
-                        now.isoformat(),
-                        next_run_at.isoformat(),
+                        group.get("status"),
+                        group.get("next_run_at"),
+                        group.get("cooldown_until"),
+                        now >= next_run_at and (cooldown_until is None or now >= cooldown_until),
                     )
-
-                    due_processed = True
+                    if now < next_run_at:
+                        self._record_skip("not_due", group=group)
+                        self.last_failure_summary = {"group_id": group.get("group_id"), "reason": "not_due"}
+                        continue
 
                     if cooldown_until and now < cooldown_until:
                         self._record_skip("cooldown", group=group, message=message)
+                        self.last_failure_summary = {"group_id": group.get("group_id"), "reason": "cooldown"}
                         logger.warning(
                             "WORKER LOOP SKIP CONDITION: cooldown group_id=%s now=%s cooldown_until=%s",
                             group.get("group_id"),
@@ -715,12 +1093,11 @@ class AutomationService:
                             group.get("group_id"),
                             cooldown_until.isoformat(),
                         )
-                        self._advance_snapshot(snapshot, len(groups), len(messages))
-                        logger.info("[CYCLE COMPLETE] result=skipped_cooldown group_id=%s", group.get("group_id"))
                         continue
 
                     if not self._is_within_active_window(group, now):
                         self._record_skip("inactive_window", group=group, message=message)
+                        self.last_failure_summary = {"group_id": group.get("group_id"), "reason": "inactive_window"}
                         logger.warning(
                             "WORKER LOOP SKIP CONDITION: inactive_window group_id=%s now_hour=%s active_start=%s active_end=%s",
                             group.get("group_id"),
@@ -739,23 +1116,21 @@ class AutomationService:
                             last_error="None",
                             next_run_at=next_run_at_value,
                         )
-                        self._advance_snapshot(snapshot, len(groups), len(messages))
-                        logger.info("[CYCLE COMPLETE] result=inactive_time group_id=%s", group.get("group_id"))
                         continue
 
                     try:
+                        message = messages[snapshot.message_index % len(messages)]
                         logger.warning(
-                            "BEFORE _send_group_promotion(): group_id=%s message_id=%s",
+                            "BEFORE _send_group_promotion(): group_id=%s bot=%s message_id=%s",
                             group.get("group_id"),
+                            assigned_bot_name,
                             message.get("id"),
                         )
-                        bots_start = time.monotonic()
-                        metrics.bots = len(await aget_bots())
-                        self._log_timing("DB READ get_bots", bots_start, timings)
                         await self._send_group_promotion(group, message)
                         logger.warning(
-                            "AFTER _send_group_promotion(): group_id=%s message_id=%s",
+                            "AFTER _send_group_promotion(): group_id=%s bot=%s message_id=%s",
                             group.get("group_id"),
+                            assigned_bot_name,
                             message.get("id"),
                         )
                         next_run_at_value = self._compute_next_run_at(group, message, now)
@@ -773,6 +1148,13 @@ class AutomationService:
                             "[SUCCESS] Group %s reset fail_count",
                             group.get("group_id"),
                         )
+                        self.last_successful_promotion = {
+                            "group_id": group.get("group_id"),
+                            "bot": assigned_bot_name,
+                            "message_id": message.get("id"),
+                            "next_run_at": next_run_at_value,
+                        }
+                        self.last_failure_summary = None
                     except FloodWaitError as exc:
                         wait_seconds = max(int(getattr(exc, "seconds", 0) or 0), 1)
                         fail_count = min(int(group.get("fail_count", 0) or 0) + 1, GROUP_FAILURE_THRESHOLD)
@@ -802,7 +1184,6 @@ class AutomationService:
                             group.get("group_id"),
                             wait_seconds,
                         )
-                        self._advance_snapshot(snapshot, len(groups), len(messages))
                         logger.info("[CYCLE COMPLETE] result=flood_wait group_id=%s", group.get("group_id"))
                         continue
                     except Exception as exc:
@@ -835,19 +1216,11 @@ class AutomationService:
                             message.get("id"),
                             exc,
                         )
-                        self._advance_snapshot(snapshot, len(groups), len(messages))
                         logger.info("[CYCLE COMPLETE] result=failed group_id=%s", group.get("group_id"))
                         continue
-
-                    self._advance_snapshot(snapshot, len(groups), len(messages))
-                    logger.info("[CYCLE COMPLETE] result=success group_id=%s", group.get("group_id"))
-
-                if not due_processed:
-                    self._record_skip("no_due_groups")
-                    logger.warning("WORKER LOOP EARLY RETURN: no_due_groups")
-                    logger.info("[CYCLE COMPLETE] result=no_due_groups")
             except Exception as exc:
                 logger.exception("[LOOP ERROR] %s", exc)
+                self.last_failure_summary = {"reason": "loop_error", "error": str(exc)}
                 delay_seconds = max(delay_seconds, 1)
             finally:
                 CURRENT_CYCLE.reset(token)
@@ -864,6 +1237,17 @@ class AutomationService:
                     True,
                     "worker",
                     {"groups": metrics.groups, "bots": metrics.bots, "messages_sent": metrics.messages_sent},
+                )
+                promotions_sent = metrics.messages_sent
+                failures = 0 if self.last_failure_summary is None else 1
+                logger.warning(
+                    "SCHEDULER SUMMARY: enabled_bots=%s enabled_groups=%s eligible_groups=%s active_messages=%s promotions_sent=%s failures=%s",
+                    len(bots),
+                    len(groups),
+                    len(groups),
+                    len(messages),
+                    promotions_sent,
+                    failures,
                 )
                 logger.info(
                     "WORKER CYCLE: groups=%s bots=%s dialogs=%s messages_sent=%s duration=%.2f ms",
@@ -882,168 +1266,82 @@ automation_service = AutomationService(telegram_service)
 
 
 async def handle_bot_automation(event) -> None:
-    token = None
     cycle_start = time.monotonic()
+    bot_name = None
     try:
-        timings: list[tuple[str, float]] = []
-        metrics = CycleMetrics(timings=timings)
-        token = CURRENT_CYCLE.set(metrics)
+        if event is None:
+            logger.warning("BOT EVENT SKIP reason=missing_event")
+            return
         chat = await event.get_chat()
         sender = await event.get_sender()
-        chat_username = getattr(chat, "username", None)
-        sender_username = getattr(sender, "username", None)
-        sender_is_bot = bool(getattr(sender, "bot", False))
-        if not sender_is_bot:
-            logger.warning("BOT PROMOTION SKIP: sender_not_bot")
-            return
-        bot_username = sender_username
-        logger.warning(
-            "BOT LOOKUP SOURCE: chat_username=%s sender_username=%s sender_is_bot=%s lookup_username=%s",
-            chat_username,
-            sender_username,
-            sender_is_bot,
-            bot_username,
-        )
-        if not bot_username:
-            logger.warning("BOT PROMOTION SKIP: missing_username")
+        chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
+        sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
+        bot_name = sender_username if getattr(sender, "bot", False) else chat_username
+        text = (event.raw_text or "").strip().lower()
+        if not bot_name:
+            logger.debug("BOT EVENT SKIP reason=no_bot_name chat=%s sender=%s", chat_username, sender_username)
             return
 
-        bots = await aget_bots()
-        bot = bots.get(bot_username) or await aget_bot(bot_username)
-        enabled = is_bot_enabled(bot_username, False) if bot else None
-        logger.warning(
-            "BOT LOOKUP RESULT: username=%s exists=%s enabled=%s",
-            bot_username,
-            bool(bot),
-            enabled,
-        )
-        if not bot or not is_bot_enabled(bot_username, False):
-            logger.warning(
-                "BOT PROMOTION SKIP: bot_missing_or_disabled bot=%s exists=%s enabled=%s",
-                bot_username,
-                bool(bot),
-                is_bot_enabled(bot_username, False) if bot else None,
-            )
+        bot = get_bot(bot_name) or await aget_bot(bot_name)
+        if not bot or not is_bot_enabled(bot_name, False):
+            logger.debug("BOT EVENT SKIP bot=%s exists=%s enabled=%s", bot_name, bool(bot), is_bot_enabled(bot_name, False) if bot else None)
             return
 
-        text = (event.raw_text or "").lower()
-        security_triggers = [item.lower() for item in bot.get("security_triggers", [])]
-        if any(trigger in text for trigger in security_triggers):
-            set_bot_paused(bot_username, True)
-            logger.warning("Security trigger hit for %s", bot_username)
+        if any(trigger in text for trigger in [item.lower() for item in bot.get("security_triggers", [])]):
+            set_bot_paused(bot_name, True)
+            logger.warning("Security trigger hit for %s", bot_name)
             try:
                 from controller.controller import notify_security
 
-                await notify_security(bot_username)
+                await notify_security(bot_name)
             except Exception:
-                logger.exception("Failed to notify security state for %s", bot_username)
+                logger.exception("Failed to notify security state for %s", bot_name)
             return
 
-        if is_bot_paused(bot_username, False):
-            logger.warning("BOT PROMOTION SKIP: paused bot=%s", bot_username)
+        session = automation_service._bot_sessions.get(bot_name)
+        if session and session.get("active") and not getattr(sender, "bot", False):
+            session["engaged"] = True
+            session["last_partner_reply_at"] = automation_service._utc_now().isoformat()
+            reply_event = automation_service._bot_reply_events.setdefault(bot_name, asyncio.Event())
+            reply_event.set()
+            automation_service._set_bot_runtime(bot_name, "WAITING_REPLY", last_activity_ts=automation_service._utc_now().isoformat())
+            automation_service._increment_bot_runtime(bot_name, partner_replies=1)
+            automation_service._record_message_reply(bot_name, session.get("last_conversation_message_id"))
+            logger.info("BOT PARTNER REPLY DETECTED bot=%s chat=%s text=%s", bot_name, chat_username, text[:120])
             return
 
-        match_triggers = [item.lower() for item in (bot.get("match_triggers") or bot.get("triggers") or [])]
-        if not any(trigger in text for trigger in match_triggers):
-            logger.warning(
-                "BOT PROMOTION SKIP: no_match bot=%s triggers=%s text=%s",
-                bot_username,
-                match_triggers,
-                text,
-            )
-            return
-
-        after_match_delay = float(bot.get("after_match_delay", 1) or 0)
-        after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
-        messages = await alist_messages(active_only=True)
-        promotion_mode = str(await aget_setting("promotion_mode", "message") or "message").strip().lower()
-        logger.warning(
-            "PROMOTION MODE: bot=%s mode=%s active_messages=%s",
-            bot_username,
-            promotion_mode,
-            len(messages),
-        )
-        for item in messages:
-            logger.warning(
-                "ACTIVE PROMOTION MESSAGE DETAIL: message_id=%s is_active=%s content_length=%s",
-                item.get("id"),
-                item.get("is_active"),
-                len(str(item.get("content", ""))),
-            )
-        logger.info(
-            "PROMOTION STICKER CHECK: asset_channel=%s sticker_message_id=%s",
-            get_promotion_asset_channel(),
-            get_promotion_sticker_message_id(),
-        )
-        if promotion_mode not in {"message", "sticker", "both"}:
-            logger.warning("BOT PROMOTION SKIP: invalid_mode bot=%s mode=%s forcing_message", bot_username, promotion_mode)
-            promotion_mode = "message"
-
-        if after_match_delay:
-            await asyncio.sleep(after_match_delay)
-        if messages:
-            selected_message = random.choice(messages)
-            logger.warning("SELECTED PROMOTION MESSAGE ID: bot=%s message_id=%s", bot_username, selected_message.get("id"))
-            try:
-                if promotion_mode == "sticker":
-                    logger.warning("BEFORE STICKER SEND: bot=%s mode=sticker", bot_username)
-                    sticker_sent = await automation_service._send_promotion_sticker(bot_username)
-                    logger.warning("AFTER STICKER SEND: bot=%s mode=sticker sent=%s", bot_username, sticker_sent)
-                    if sticker_sent:
-                        pass
-                elif promotion_mode == "both":
-                    logger.warning("BEFORE STICKER SEND: bot=%s mode=both", bot_username)
-                    sticker_sent = await automation_service._send_promotion_sticker(bot_username)
-                    logger.warning("AFTER STICKER SEND: bot=%s mode=both sent=%s", bot_username, sticker_sent)
-                    if sticker_sent:
-                        await asyncio.sleep(1)
-                        logger.warning("BEFORE send_saved_payload(): bot=%s message_id=%s", bot_username, selected_message.get("id"))
-                        await telegram_service.send_saved_payload(bot_username, selected_message)
-                        logger.warning("AFTER send_saved_payload(): bot=%s message_id=%s", bot_username, selected_message.get("id"))
-                        metrics.messages_sent += 1
-                else:
-                    logger.warning("BEFORE send_saved_payload(): bot=%s message_id=%s", bot_username, selected_message.get("id"))
-                    await telegram_service.send_saved_payload(bot_username, selected_message)
-                    logger.warning("AFTER send_saved_payload(): bot=%s message_id=%s", bot_username, selected_message.get("id"))
-                    metrics.messages_sent += 1
-                logger.warning("AFTER MESSAGE SEND: bot=%s mode=%s", bot_username, promotion_mode)
-            except Exception:
-                logger.exception("Failed to send promotion payload to %s", bot_username)
-        else:
-            logger.warning("BOT PROMOTION SKIP: no_active_messages bot=%s", bot_username)
-            return
-        stop_cmd = _normalize_command(bot.get("stop_cmd"))
-        if stop_cmd:
-            logger.warning("BEFORE STOP COMMAND: bot=%s stop_cmd=%s", bot_username, stop_cmd)
-            await telegram_service.client.send_message(bot_username, stop_cmd)
-
-        if after_chat_delay:
-            await asyncio.sleep(after_chat_delay)
-        start_cmd = _normalize_command(bot.get("start_cmd"))
-        if start_cmd and is_bot_enabled(bot_username, False):
-            logger.warning("BEFORE START COMMAND: bot=%s start_cmd=%s", bot_username, start_cmd)
-            await telegram_service.client.send_message(bot_username, start_cmd)
-            logger.info("Automation cycled for %s", bot_username)
-        logger.info(
-            "BOT AUTOMATION CYCLE: bot=%s dialogs=%s messages_sent=%s duration=%.2f ms",
-            bot_username,
-            metrics.dialogs,
-            metrics.messages_sent,
-            (time.monotonic() - cycle_start) * 1000,
-        )
-        record_operation(
-            "bot_automation_cycle",
-            (time.monotonic() - cycle_start) * 1000,
-            True,
-            "worker",
-            {"bot": bot_username, "messages_sent": metrics.messages_sent},
-        )
+        if not getattr(sender, "bot", False):
+            match_triggers = [item.lower() for item in (bot.get("match_triggers") or bot.get("triggers") or [])]
+            if match_triggers and not any(trigger in text for trigger in match_triggers):
+                logger.debug("BOT EVENT SKIP bot=%s reason=no_match", bot_name)
+                return
+            if is_bot_paused(bot_name, False):
+                logger.warning("BOT CONVERSATION SKIP bot=%s reason=paused", bot_name)
+                return
+            settings = get_bot_settings(bot_name)
+            lock = automation_service._bot_lock(bot_name)
+            if lock.locked():
+                logger.warning("BOT CONVERSATION SKIP bot=%s reason=already_running", bot_name)
+                return
+            async with lock:
+                logger.info("BOT CONVERSATION LOCK ACQUIRED bot=%s", bot_name)
+                await automation_service._run_bot_conversation(bot_name, settings)
+                record_operation(
+                    "bot_automation_cycle",
+                    (time.monotonic() - cycle_start) * 1000,
+                    True,
+                    "worker",
+                    {"bot": bot_name, "flow": "conversation"},
+                )
     except Exception:
-        record_operation("bot_automation_cycle", (time.monotonic() - cycle_start) * 1000, False, "worker", {"bot": bot_username if 'bot_username' in locals() else None})
-        logger.exception("Bot automation event handling failed")
-    finally:
-        if token is not None:
-            CURRENT_CYCLE.reset(token)
+        try:
+            automation_service._set_bot_runtime(bot_name or "unknown", "ERROR", last_failure_reason="runtime_exception", last_failure_ts=automation_service._utc_now().isoformat())
+            if bot_name:
+                automation_service._increment_bot_runtime(bot_name, error_count=1)
+        except Exception:
+            logger.exception("Failed to persist bot error runtime bot=%s", bot_name)
+        record_operation("bot_automation_cycle", (time.monotonic() - cycle_start) * 1000, False, "worker", {"bot": bot_name if 'bot_name' in locals() else None})
+        logger.exception("Bot automation event handling failed bot=%s", bot_name)
 
 
 async def start_worker() -> None:
@@ -1057,6 +1355,15 @@ async def start_worker() -> None:
             client = telegram_service._ensure_client()
             client.add_event_handler(handle_bot_automation, events.NewMessage(incoming=True))
             logger.info("Telegram user session connected")
+            validation = repair_promotion_data()
+            logger.warning(
+                "PROMOTION SYSTEM VALIDATION enabled_bots=%s enabled_groups=%s groups_missing_assigned_bot=%s groups_with_invalid_assigned_bot=%s active_messages=%s",
+                validation["total_bots"],
+                validation["total_groups"],
+                validation["groups_missing_assignments"],
+                validation["groups_invalid_assignments"],
+                validation["total_active_messages"],
+            )
             db_start = time.monotonic()
             bots = await aget_bots()
             logger.debug("DB READ get_bots elapsed_ms=%.2f", (time.monotonic() - db_start) * 1000)
@@ -1120,9 +1427,22 @@ def get_client() -> TelegramClient:
 
 
 def get_worker_status() -> dict[str, object]:
+    enabled_bots = list_enabled_bots()
+    enabled_groups = list_enabled_groups()
+    active_messages = list_messages(active_only=True)
     return {
         "worker_running": automation_service.is_running,
         "worker_paused": automation_service.is_paused,
+        "enabled_bots": enabled_bots,
+        "enabled_groups": enabled_groups,
+        "active_messages": active_messages,
+        "enabled_bots_count": len(enabled_bots),
+        "enabled_groups_count": len(enabled_groups),
+        "active_messages_count": len(active_messages),
+        "last_promotion": automation_service.last_successful_promotion,
+        "last_failure": automation_service.last_failure_summary,
+        "next_scheduled_promotion": automation_service.last_successful_promotion.get("next_run_at") if automation_service.last_successful_promotion else None,
+        "promotion_system_validation": automation_service.last_promotion_summary,
         "telegram": telegram_service.status(),
         "db": db_status(),
     }
