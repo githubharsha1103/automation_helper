@@ -45,7 +45,6 @@ from storage.db import (
     list_groups,
     list_category_messages,
     list_messages,
-    list_bot_settings,
     get_message_performance,
     set_category_message_enabled,
     is_category_message_enabled,
