@@ -112,6 +112,7 @@ def _env(name: str, default: str = "") -> str:
 TOKEN = _env("CONTROL_BOT_TOKEN")
 ALLOWED_USER_ID = int(_env("ALLOWED_USER_ID", "0") or "0")
 _application: Application | None = None
+_controller_started = False
 _VIEW_CACHE: dict[str, tuple[float, object]] = {}
 _VIEW_CACHE_TTL_SECONDS = 2.0
 
@@ -1015,21 +1016,24 @@ async def botmsg_mode_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data["edit_bot_name"] = bot_name
     context.user_data["state"] = SET_BOT_PROMOTION_MODE
     await _send_or_edit(update, "Send promotion mode: MESSAGE, STICKER, BOTH, RANDOM, or DISABLED.", _cancel_menu())
-    logger.info("ENTERING CONVERSATION STATE %s FROM %s", SET_BOT_PROMOTION_MODE, "botmsg_mode_entry")
+    logger.info("CALLBACK EXECUTED botmsg_mode_entry bot=%s returned_state=%s conversation_active=%s", bot_name, SET_BOT_PROMOTION_MODE, True)
     return SET_BOT_PROMOTION_MODE
 
 
 async def botmsg_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     bot_name = context.user_data.get("edit_bot_name")
+    logger.info("TEXT RECEIVED botmsg_mode_handler bot=%s text=%s", bot_name, getattr(getattr(update, "message", None), "text", None))
     mode = update.message.text.strip().upper()
     if mode not in {"MESSAGE", "STICKER", "BOTH", "RANDOM", "DISABLED"}:
         await update.message.reply_text("Choose MESSAGE, STICKER, BOTH, RANDOM, or DISABLED.")
         return SET_BOT_PROMOTION_MODE
     settings = get_bot_settings(bot_name)
     settings["promotion_mode"] = mode
+    settings.pop("bot_name", None)
     set_bot_settings(bot_name, **settings)
     context.user_data.clear()
     await update.message.reply_text(_bot_message_settings_text(bot_name), reply_markup=_bot_message_settings_keyboard(bot_name))
+    logger.info("SAVE SUCCESS botmsg_mode_handler bot=%s field=promotion_mode state=%s", bot_name, ConversationHandler.END)
     return ConversationHandler.END
 
 
@@ -1041,7 +1045,7 @@ async def botmsg_value_entry(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.user_data["botmsg_field"] = field
     context.user_data["state"] = state
     await _send_or_edit(update, prompt, _cancel_menu())
-    logger.info("ENTERING CONVERSATION STATE %s FROM %s", state, "botmsg_value_entry")
+    logger.info("CALLBACK EXECUTED botmsg_value_entry bot=%s field=%s returned_state=%s conversation_active=%s", bot_name, field, state, True)
     return state
 
 
@@ -1074,6 +1078,7 @@ async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEF
     field = context.user_data.get("botmsg_field")
     if not bot_name or not field:
         return ConversationHandler.END
+    logger.info("TEXT RECEIVED botmsg_generic_value_handler bot=%s field=%s text=%s", bot_name, field, getattr(getattr(update, "message", None), "text", None))
     raw = update.message.text.strip()
     if field == "conversation_sequence":
         try:
@@ -1089,16 +1094,20 @@ async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEF
             return context.user_data.get("state", ConversationHandler.END)
     settings = get_bot_settings(bot_name)
     settings[field] = value
+    settings.pop("bot_name", None)
     set_bot_settings(bot_name, **settings)
     context.user_data.clear()
     await update.message.reply_text(_bot_message_settings_text(bot_name), reply_markup=_bot_message_settings_keyboard(bot_name))
+    logger.info("SAVE SUCCESS botmsg_generic_value_handler bot=%s field=%s state=%s", bot_name, field, ConversationHandler.END)
     return ConversationHandler.END
 
 
 async def botmsg_generic_value_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     state = int(context.user_data.get("state", ConversationHandler.END))
     logger.info("TEXT RECEIVED FOR STATE %s", state)
-    return await _audit_state_handler(update, context, state, botmsg_generic_value_handler)
+    result = await _audit_state_handler(update, context, state, botmsg_generic_value_handler)
+    logger.info("STATE EXIT state=%s next_state=%s", state, "END" if result == ConversationHandler.END else result)
+    return result
 
 
 async def _set_bot_setting_value(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, field: str, cast=str) -> int:
@@ -1112,6 +1121,7 @@ async def _set_bot_setting_value(update: Update, context: ContextTypes.DEFAULT_T
         return context.user_data.get("state", ConversationHandler.END)
     settings = get_bot_settings(bot_name)
     settings[field] = value
+    settings.pop("bot_name", None)
     set_bot_settings(bot_name, **settings)
     context.user_data.clear()
     await update.message.reply_text(_bot_message_settings_text(bot_name), reply_markup=_bot_message_settings_keyboard(bot_name))
@@ -2111,12 +2121,17 @@ async def message_category_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 async def start_controller() -> None:
-    global _application
+    global _application, _controller_started
     if not TOKEN:
         raise ValueError("CONTROL_BOT_TOKEN is required")
+    if _controller_started:
+        logger.warning("CONTROL BOT INSTANCE STARTED already true; skipping duplicate start")
+        return
+    _controller_started = True
 
     print("[STARTUP] Building Telegram control application...")
     logger.info("[STARTUP] Building Telegram control application...")
+    logger.info("CONTROL BOT INSTANCE STARTED")
     _application = Application.builder().token(TOKEN).build()
     _log_conversation_audit()
 

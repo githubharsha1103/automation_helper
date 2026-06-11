@@ -100,6 +100,7 @@ class TelegramService:
         self.client: TelegramClient | None = None
         self._connect_lock = asyncio.Lock()
         self._entity_cache: OrderedDict[str, tuple[float, object]] = OrderedDict()
+        self._dialog_cache_primed = False
         self._configured = bool(API_ID and API_ID.isdigit() and API_HASH)
         self._session_source = "env:SESSION_STRING" if SESSION_STRING else f"file:{SESSION_NAME}.session"
         self.last_ensure_connected_ms = 0.0
@@ -130,6 +131,8 @@ class TelegramService:
                 reconnected = True
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
+            if not self._dialog_cache_primed:
+                await self._prime_dialog_cache(client)
         elapsed_ms = (time.monotonic() - start) * 1000
         self.last_ensure_connected_ms = elapsed_ms
         if reconnected:
@@ -141,6 +144,34 @@ class TelegramService:
         metrics = CURRENT_CYCLE.get()
         if metrics is not None and metrics.timings is not None:
             metrics.timings.append(("ensure_connected", elapsed_ms))
+
+    async def _prime_dialog_cache(self, client: TelegramClient) -> None:
+        start = time.monotonic()
+        try:
+            dialogs = await client.get_dialogs(limit=200)
+            for dialog in dialogs:
+                entity = getattr(dialog, "entity", None)
+                if entity is None:
+                    continue
+                cache_keys = []
+                username = str(getattr(entity, "username", "") or "").lstrip("@")
+                if username:
+                    cache_keys.append(username)
+                entity_id = getattr(entity, "id", None)
+                if entity_id is not None:
+                    cache_keys.append(str(entity_id))
+                    if not str(entity_id).startswith("-"):
+                        cache_keys.append(f"-100{entity_id}")
+                for key in cache_keys:
+                    self._entity_cache[key] = (time.monotonic(), entity)
+            self._dialog_cache_primed = True
+            elapsed_ms = (time.monotonic() - start) * 1000
+            logger.info("TELETHON DIALOG CACHE PRIMED dialogs=%s elapsed_ms=%.2f", len(dialogs), elapsed_ms)
+            record_operation("prime_dialog_cache", elapsed_ms, True, "telegram", {"dialogs": len(dialogs)})
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - start) * 1000
+            logger.warning("TELETHON DIALOG CACHE PRIME FAILED elapsed_ms=%.2f error=%s", elapsed_ms, exc)
+            record_operation("prime_dialog_cache", elapsed_ms, False, "telegram", {"error": str(exc)})
 
     async def is_authorized(self) -> bool:
         client = self._ensure_client()

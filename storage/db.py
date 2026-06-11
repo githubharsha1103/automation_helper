@@ -30,6 +30,11 @@ _MESSAGE_PERF_CACHE: dict[str, dict[int, dict[str, int]]] = {
 }
 _BOT_SETTINGS_CACHE: dict[str, dict[str, Any]] = {}
 _BOT_RUNTIME_CACHE: dict[str, dict[str, Any]] = {}
+_BOT_CACHE_META: dict[str, float] = {}
+_GROUP_CACHE_META: dict[str, float] = {}
+_BOT_LIST_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 3.0, "bots": {}}
+_GROUP_LIST_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 3.0, "enabled_only": None, "groups": []}
+_ENABLED_BOTS_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 3.0, "bots": []}
 _DB_METRICS: dict[str, dict[str, int]] = {
     "get_setting": {"hits": 0, "misses": 0, "count": 0},
     "get_bot": {"hits": 0, "misses": 0, "count": 0},
@@ -40,6 +45,25 @@ _DB_LAST_TIMINGS: dict[str, float] = {}
 _OP_HISTORY: list[dict[str, Any]] = []
 _OP_STATS: dict[str, dict[str, Any]] = {}
 _MESSAGE_LIST_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 45.0, "active_only": None, "messages": []}
+
+
+def _cache_valid(meta: dict[str, float], key: str, ttl: float) -> bool:
+    cached_at = meta.get(key, 0.0)
+    return bool(cached_at and (time.monotonic() - cached_at) <= ttl)
+
+
+def _touch_cache(meta: dict[str, float], key: str) -> None:
+    meta[key] = time.monotonic()
+
+
+def _invalidate_runtime_caches(*names: str) -> None:
+    if not names or "bots" in names:
+        _BOT_LIST_CACHE["ts"] = 0.0
+        _ENABLED_BOTS_CACHE["ts"] = 0.0
+    if not names or "groups" in names:
+        _GROUP_LIST_CACHE["ts"] = 0.0
+    if not names or "messages" in names:
+        _MESSAGE_LIST_CACHE["ts"] = 0.0
 
 
 def record_operation(
@@ -460,6 +484,7 @@ def set_bot_settings(bot_name: str, **changes: Any) -> bool:
     current["bot_name"] = bot_name
     _mongo_db()["bot_settings"].update_one({"bot_name": bot_name}, {"$set": {**current, "updated_at": datetime.utcnow()}}, upsert=True)
     _BOT_SETTINGS_CACHE[bot_name] = dict(current)
+    _invalidate_runtime_caches("bots")
     return True
 
 
@@ -511,11 +536,20 @@ def db_status() -> dict[str, Any]:
 
 def list_enabled_bots() -> list[dict[str, Any]]:
     start = time.monotonic()
+    ttl = float(_ENABLED_BOTS_CACHE.get("ttl", 3.0) or 3.0)
+    if _ENABLED_BOTS_CACHE.get("ts", 0.0) and time.monotonic() - float(_ENABLED_BOTS_CACHE["ts"]) <= ttl:
+        bots = [dict(bot) for bot in _ENABLED_BOTS_CACHE.get("bots", [])]
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.info("DB READ list_enabled_bots cache_hit elapsed_ms=%.2f total=%s enabled=%s", elapsed_ms, len(bots), len(bots))
+        record_operation("list_enabled_bots", elapsed_ms, True, "mongo", {"cache_hit": True, "total": len(bots), "enabled": len(bots)})
+        return bots
     bots = list(get_bots().values())
     enabled = sorted([bot for bot in bots if bool(bot.get("enabled", False))], key=lambda item: str(item.get("username") or ""))
     elapsed_ms = (time.monotonic() - start) * 1000
     logger.info("DB READ list_enabled_bots elapsed_ms=%.2f total=%s enabled=%s", elapsed_ms, len(bots), len(enabled))
     record_operation("list_enabled_bots", elapsed_ms, True, "mongo", {"total": len(bots), "enabled": len(enabled)})
+    _ENABLED_BOTS_CACHE["bots"] = [dict(bot) for bot in enabled]
+    _ENABLED_BOTS_CACHE["ts"] = time.monotonic()
     return enabled
 
 
@@ -696,6 +730,8 @@ def _settings_value(doc: dict[str, Any] | None, default: Any) -> Any:
 def set_setting(key: str, value: Any) -> bool:
     _mongo_db()["settings"].update_one({"_id": key}, {"$set": {"value": value, "updated_at": datetime.utcnow()}}, upsert=True)
     _SETTING_CACHE[key] = value
+    if key.startswith("bot_enabled_") or key.startswith("bot_paused_") or key in {"promotion_mode", "automation_state", "automation_last_execution_time"}:
+        _invalidate_runtime_caches("bots")
     return True
 
 
@@ -729,13 +765,15 @@ def _bots_collection():
 def add_bot(bot_name: str, config: dict[str, Any]) -> bool:
     _bots_collection().replace_one({"_id": bot_name}, {"_id": bot_name, **config, "updated_at": datetime.utcnow()}, upsert=True)
     _BOT_CACHE[bot_name] = dict(config)
+    _touch_cache(_BOT_CACHE_META, bot_name)
+    _invalidate_runtime_caches("bots")
     logger.warning("BOT SAVED: name=%s enabled=%s", bot_name, config.get("enabled"))
     return True
 
 
 def get_bot(bot_name: str) -> dict[str, Any] | None:
     start = time.monotonic()
-    if bot_name in _BOT_CACHE:
+    if bot_name in _BOT_CACHE and _cache_valid(_BOT_CACHE_META, bot_name, 3.0):
         bot = dict(_BOT_CACHE[bot_name])
         elapsed_ms = (time.monotonic() - start) * 1000
         _record_db_metric("get_bot", True, elapsed_ms)
@@ -749,6 +787,7 @@ def get_bot(bot_name: str) -> dict[str, Any] | None:
         return None
     bot = {k: v for k, v in doc.items() if k != "_id"}
     _BOT_CACHE[bot_name] = dict(bot)
+    _touch_cache(_BOT_CACHE_META, bot_name)
     elapsed_ms = (time.monotonic() - start) * 1000
     _record_db_metric("get_bot", False, elapsed_ms)
     record_operation("get_bot", elapsed_ms, True, "mongo", {"cache_hit": False})
@@ -770,20 +809,26 @@ def update_bot(bot_name: str, **changes: Any) -> bool:
 def delete_bot(bot_name: str) -> bool:
     _bots_collection().delete_one({"_id": bot_name})
     _BOT_CACHE.pop(bot_name, None)
+    _BOT_CACHE_META.pop(bot_name, None)
+    _invalidate_runtime_caches("bots")
     delete_setting(f"bot_enabled_{bot_name}")
     delete_setting(f"bot_paused_{bot_name}")
     return True
 
 
 def get_bots() -> dict[str, dict[str, Any]]:
-    if _BOT_CACHE:
-        return {name: dict(config) for name, config in sorted(_BOT_CACHE.items(), key=lambda item: item[0])}
+    ttl = float(_BOT_LIST_CACHE.get("ttl", 3.0) or 3.0)
+    if _BOT_LIST_CACHE.get("ts", 0.0) and time.monotonic() - float(_BOT_LIST_CACHE["ts"]) <= ttl:
+        bots = _BOT_LIST_CACHE.get("bots", {})
+        return {name: dict(config) for name, config in sorted(bots.items(), key=lambda item: item[0])}
     docs = _timed_db_call("get_bots_find", lambda: list(_bots_collection().find().sort("_id", 1)))
     bots = {
         str(doc["_id"]): {k: v for k, v in doc.items() if k != "_id"}
         for doc in docs
     }
     _BOT_CACHE.update({name: dict(config) for name, config in bots.items()})
+    _BOT_LIST_CACHE["bots"] = {name: dict(config) for name, config in bots.items()}
+    _BOT_LIST_CACHE["ts"] = time.monotonic()
     return bots
 
 
@@ -856,10 +901,9 @@ def get_group(group_id: str) -> dict[str, Any] | None:
 
 def list_groups(enabled_only: bool = False) -> list[dict[str, Any]]:
     start = time.monotonic()
-    if _GROUP_CACHE:
-        groups = [dict(group) for group in _GROUP_CACHE.values()]
-        filtered = [group for group in groups if (group.get("status") == "enabled")] if enabled_only else groups
-        result = sorted(filtered, key=lambda item: item.get("updated_at") or datetime.min)
+    ttl = float(_GROUP_LIST_CACHE.get("ttl", 3.0) or 3.0)
+    if _GROUP_LIST_CACHE.get("ts", 0.0) and _GROUP_LIST_CACHE.get("enabled_only") == enabled_only and time.monotonic() - float(_GROUP_LIST_CACHE["ts"]) <= ttl:
+        result = [dict(group) for group in _GROUP_LIST_CACHE.get("groups", [])]
         elapsed_ms = (time.monotonic() - start) * 1000
         _record_db_metric("list_groups", True, elapsed_ms)
         record_operation("list_groups", elapsed_ms, True, "mongo", {"cache_hit": True, "enabled_only": enabled_only})
@@ -871,6 +915,10 @@ def list_groups(enabled_only: bool = False) -> list[dict[str, Any]]:
         group_id = str(group.get("group_id"))
         if group_id:
             _GROUP_CACHE[group_id] = dict(group)
+            _touch_cache(_GROUP_CACHE_META, group_id)
+    _GROUP_LIST_CACHE["groups"] = [dict(group) for group in groups]
+    _GROUP_LIST_CACHE["enabled_only"] = enabled_only
+    _GROUP_LIST_CACHE["ts"] = time.monotonic()
     elapsed_ms = (time.monotonic() - start) * 1000
     _record_db_metric("list_groups", False, elapsed_ms)
     record_operation("list_groups", elapsed_ms, True, "mongo", {"cache_hit": False, "enabled_only": enabled_only})
@@ -880,6 +928,8 @@ def list_groups(enabled_only: bool = False) -> list[dict[str, Any]]:
 def delete_group(group_id: str) -> bool:
     _groups_collection().delete_one({"_id": str(group_id)})
     _GROUP_CACHE.pop(str(group_id), None)
+    _GROUP_CACHE_META.pop(str(group_id), None)
+    _invalidate_runtime_caches("groups")
     return True
 
 
@@ -889,6 +939,7 @@ def set_group_status(group_id: str, status: str) -> bool:
     if cached is not None:
         cached["status"] = status
         cached["updated_at"] = datetime.utcnow()
+    _invalidate_runtime_caches("groups")
     return True
 
 
@@ -912,6 +963,8 @@ def update_group_runtime(group_id: str, last_status: str | None = None, last_err
     cached = _GROUP_CACHE.get(str(group_id))
     if cached is not None:
         cached.update(update)
+        _touch_cache(_GROUP_CACHE_META, str(group_id))
+    _invalidate_runtime_caches("groups")
     return True
 
 
