@@ -1002,7 +1002,9 @@ async def botmsg_sequence_entry(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def botmsg_timeout_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_value_entry(update, context, "no_response_timeout", "Send no-response timeout in seconds.", SET_BOT_NO_RESPONSE_TIMEOUT)
+    state = await botmsg_value_entry(update, context, "no_response_timeout", "Send no-response timeout in seconds.", SET_BOT_NO_RESPONSE_TIMEOUT)
+    logger.warning("TIMEOUT ENTRY RETURNING STATE=%s", state)
+    return state
 
 
 async def botmsg_conv_min_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1026,6 +1028,8 @@ async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEF
     field = context.user_data.get("botmsg_field")
     if not bot_name or not field:
         return ConversationHandler.END
+    if field == "no_response_timeout":
+        logger.warning("TIMEOUT HANDLER RECEIVED TEXT=%s", getattr(getattr(update, "message", None), "text", None))
     raw = update.message.text.strip()
     if field == "conversation_sequence":
         try:
