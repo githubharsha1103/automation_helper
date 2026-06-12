@@ -618,6 +618,35 @@ class AutomationService:
         except asyncio.TimeoutError:
             return False
 
+    async def _resolve_event_bot_name(self, event) -> str | None:
+        chat = await event.get_chat()
+        sender = await event.get_sender()
+        chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
+        sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
+        if getattr(sender, "bot", False) and sender_username:
+            return sender_username
+        if chat_username:
+            return chat_username
+        for ref in (
+            getattr(event, "chat_id", None),
+            getattr(event, "sender_id", None),
+            getattr(getattr(event, "peer_id", None), "chat_id", None),
+            getattr(getattr(event, "peer_id", None), "channel_id", None),
+            getattr(getattr(event, "peer_id", None), "user_id", None),
+        ):
+            if ref is None:
+                continue
+            try:
+                entity = await self.telegram.resolve_entity(str(ref))
+            except Exception:
+                continue
+            resolved_username = str(getattr(entity, "username", "") or "").lstrip("@")
+            if resolved_username:
+                return resolved_username
+        if sender_username:
+            return sender_username
+        return None
+
     async def _send_bot_promotion(self, bot_name: str, settings: dict[str, object]) -> None:
         mode = self._promotion_mode_for(settings)
         self._set_bot_runtime(bot_name, "PROMOTING")
@@ -1335,13 +1364,23 @@ async def handle_bot_automation(event) -> None:
         sender = await event.get_sender()
         chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
         sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
-        bot_name = sender_username if getattr(sender, "bot", False) else chat_username
+        bot_name = await automation_service._resolve_event_bot_name(event)
         text = (event.raw_text or "").strip().lower()
+        enabled_bots = {name: bot for name, bot in get_bots().items() if bool(bot.get("enabled", False))}
+        if not bot_name and len(enabled_bots) == 1:
+            bot_name = next(iter(enabled_bots))
+            logger.info("BOT EVENT FALLBACK reason=single_enabled_bot bot=%s", bot_name)
         if not bot_name:
             logger.debug("BOT EVENT SKIP reason=no_bot_name chat=%s sender=%s", chat_username, sender_username)
             return
 
         bot = get_bot(bot_name) or await aget_bot(bot_name)
+        if bot is None and len(enabled_bots) == 1:
+            fallback_bot_name, fallback_bot = next(iter(enabled_bots.items()))
+            if fallback_bot_name != bot_name:
+                logger.warning("BOT EVENT FALLBACK reason=resolved_bot_missing requested=%s fallback=%s", bot_name, fallback_bot_name)
+            bot_name = fallback_bot_name
+            bot = fallback_bot
         enabled = bool(bot and bot.get("enabled", False))
         if not bot or not enabled:
             logger.debug("BOT EVENT SKIP bot=%s exists=%s enabled=%s", bot_name, bool(bot), enabled if bot else None)
