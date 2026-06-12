@@ -1387,7 +1387,18 @@ async def handle_bot_automation(event) -> None:
             return
 
         security_triggers = [item.lower() for item in bot.get("security_triggers", [])]
-        if any(trigger in text for trigger in security_triggers):
+        matched_trigger = next((trigger for trigger in security_triggers if trigger in text), None)
+        logger.info(
+            "SECURITY_CHECK bot_name=%s incoming_text=%s loaded_security_triggers=%s",
+            bot_name,
+            text,
+            security_triggers,
+        )
+        if matched_trigger is not None:
+            logger.info("SECURITY_MATCH trigger=%s text=%s", matched_trigger, text)
+        else:
+            logger.info("SECURITY_NO_MATCH")
+        if matched_trigger is not None:
             set_bot_paused(bot_name, True)
             logger.warning("Security trigger hit for %s", bot_name)
             try:
