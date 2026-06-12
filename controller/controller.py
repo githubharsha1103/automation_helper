@@ -70,10 +70,7 @@ logger = logging.getLogger(__name__)
 STICKER_DIR = Path("stickers")
 
 ADD_GROUP_CHAT_ID = 100
-ADD_CATEGORY_MESSAGE_CONTENT = 200
-ADD_CATEGORY_MESSAGE_DELAY = 201
-EDIT_CATEGORY_MESSAGE_CONTENT = 202
-EDIT_CATEGORY_MESSAGE_DELAY = 203
+ADD_CONVERSATIONAL_MESSAGE = 800
 DELETE_MESSAGE_PICK = 300
 EDIT_GROUP_NAME = 400
 EDIT_GROUP_DELAY = 401
@@ -376,7 +373,10 @@ def _category_rows(category: str) -> list[list[InlineKeyboardButton]]:
         rows.append([InlineKeyboardButton("No messages saved", callback_data="noop")])
     if category == "conversational_messages" and top_message:
         rows.insert(0, [InlineKeyboardButton(f"Top Performer: #{top_message['id']}", callback_data=f"msg:{category}:view:{top_message['id']}")])
-    rows.append([InlineKeyboardButton("Add", callback_data=f"msg:{category}:add")])
+    if category == "conversational_messages":
+        rows.append([InlineKeyboardButton("Add", callback_data="msg:conversational:add")])
+    else:
+        rows.append([InlineKeyboardButton("Add", callback_data=f"msg:{category}:add")])
     rows.append([InlineKeyboardButton("Back", callback_data=_category_back_target(category))])
     return rows
 
@@ -522,10 +522,7 @@ def _normalize_command(value: str) -> str:
 
 def _state_name(state: int) -> str:
     state_names = {
-        ADD_CATEGORY_MESSAGE_CONTENT: "ADD_CATEGORY_MESSAGE_CONTENT",
-        ADD_CATEGORY_MESSAGE_DELAY: "ADD_CATEGORY_MESSAGE_DELAY",
-        EDIT_CATEGORY_MESSAGE_CONTENT: "EDIT_CATEGORY_MESSAGE_CONTENT",
-        EDIT_CATEGORY_MESSAGE_DELAY: "EDIT_CATEGORY_MESSAGE_DELAY",
+        ADD_CONVERSATIONAL_MESSAGE: "ADD_CONVERSATIONAL_MESSAGE",
         ADD_BOT_USERNAME: "ADD_BOT_USERNAME",
         ADD_BOT_START_CMD: "ADD_BOT_START_CMD",
         ADD_BOT_STOP_CMD: "ADD_BOT_STOP_CMD",
@@ -1727,9 +1724,12 @@ async def _message_view_callback(update: Update, category: str, message_id: int)
         await _message_list_callback(update, category)
         return
     text = f"Message #{message['id']}\n\n{message.get('content', '') or message.get('media_file_id', '')}"
+    edit_callback = f"msg:{category}:edit:{message_id}"
+    if category == "conversational_messages":
+        edit_callback = f"msg:conversational:edit:{message_id}"
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Edit", callback_data=f"msg:{category}:edit:{message_id}")],
+            [InlineKeyboardButton("Edit", callback_data=edit_callback)],
             [InlineKeyboardButton("Delete", callback_data=f"msg:{category}:delete:{message_id}")],
             [InlineKeyboardButton("Back", callback_data=f"menu:messages:{'stickers' if category == 'promotion_stickers' else category.split('_')[0]}")],
         ]
@@ -1743,183 +1743,134 @@ async def _message_add_entry(update: Update, context: ContextTypes.DEFAULT_TYPE,
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
     context.user_data.clear()
     context.user_data["message_category"] = category
-    context.user_data["message_flow_state"] = ADD_CATEGORY_MESSAGE_CONTENT
+    context.user_data["message_action"] = "add"
     logger.warning(
         "MESSAGE ADD ENTRY user_id=%s chat_id=%s category=%s current_state=%s",
         user_id,
         chat_id,
         category,
-        ADD_CATEGORY_MESSAGE_CONTENT,
+        ADD_CONVERSATIONAL_MESSAGE,
     )
-    await _send_or_edit(update, f"Send the new {_category_label(category).lower()} content.", _cancel_menu())
+    await _send_or_edit(
+        update,
+        "Send message in this format:\n\n<delay_minutes>|<message>\n\nExample:\n5|Hello everyone",
+        _cancel_menu(),
+    )
     logger.warning(
         "MESSAGE ADD ENTRY RETURN user_id=%s chat_id=%s category=%s returned_state=%s",
         user_id,
         chat_id,
         category,
-        ADD_CATEGORY_MESSAGE_CONTENT,
+        ADD_CONVERSATIONAL_MESSAGE,
     )
-    return ADD_CATEGORY_MESSAGE_CONTENT
+    return ADD_CONVERSATIONAL_MESSAGE
 
 
-async def _message_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+def _parse_conversational_message_payload(value: str) -> tuple[int, str]:
+    raw = value.strip()
+    if "|" not in raw:
+        raise ValueError("Use <delay_minutes>|<message>")
+    delay_text, content = raw.split("|", 1)
+    delay_text = delay_text.strip()
+    content = content.strip()
+    if not delay_text or not delay_text.isdigit():
+        raise ValueError("Delay minutes must be a whole number.")
+    delay_minutes = int(delay_text)
+    if delay_minutes < 1:
+        raise ValueError("Delay minutes must be greater than 0.")
+    if not content:
+        raise ValueError("Message content cannot be empty.")
+    return delay_minutes, content
+
+
+async def conversational_message_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    parts = query.data.split(":")
+    action = parts[2]
+    user_id = getattr(getattr(update, "effective_user", None), "id", None)
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    context.user_data.clear()
+    context.user_data["message_category"] = "conversational_messages"
+    context.user_data["message_action"] = action
+    if action == "edit":
+        message_id = int(parts[3])
+        message = get_category_message("conversational_messages", message_id)
+        if not message:
+            await _send_or_edit(update, "Message not found.", InlineKeyboardMarkup(_category_rows("conversational_messages")))
+            return ConversationHandler.END
+        context.user_data["message_id"] = message_id
+        current_value = f"{int(message.get('delay_minutes', 0) or 0)}|{message.get('content', '') or ''}"
+        await _send_or_edit(
+            update,
+            "Send replacement value in format:\n\n<delay_minutes>|<message>\n\nCurrent value:\n"
+            f"{current_value}",
+            _cancel_menu(),
+        )
+    else:
+        await _send_or_edit(
+            update,
+            "Send conversational message in this format:\n\n<delay_minutes>|<message>\n\nExample:\n5|Hello everyone",
+            _cancel_menu(),
+        )
+    logger.warning(
+        "CONVERSATIONAL MESSAGE ENTRY user_id=%s chat_id=%s action=%s returned_state=%s",
+        user_id,
+        chat_id,
+        action,
+        ADD_CONVERSATIONAL_MESSAGE,
+    )
+    return ADD_CONVERSATIONAL_MESSAGE
+
+
+async def add_conversational_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not _is_allowed(update):
         return ConversationHandler.END
-    logger.warning(
-        "CONV_CONTENT_HANDLER_ENTERED text=%s",
-        update.message.text if update.message else None,
-    )
-    user_id = getattr(getattr(update, "effective_user", None), "id", None)
-    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
-    logger.warning(
-        "ENTER MESSAGE CONTENT HANDLER user_id=%s chat_id=%s state=%s user_data=%s",
-        user_id,
-        chat_id,
-        ADD_CATEGORY_MESSAGE_CONTENT,
-        {k: context.user_data.get(k) for k in ("message_category", "message_edit_id", "message_flow_state")},
-    )
     message = update.message
-    media_type = None
-    media_file_id = None
-
-    if message.photo:
-        media_type = "photo"
-        media_file_id = message.photo[-1].file_id
-    elif message.video:
-        media_type = "video"
-        media_file_id = message.video.file_id
-    elif message.document:
-        media_type = "document"
-        media_file_id = message.document.file_id
-
-    content = (message.caption or message.text or "").strip()
-    logger.warning("TEXT RECEIVED user_id=%s chat_id=%s category=%s current_state=%s text=%s", user_id, chat_id, context.user_data.get("message_category"), ADD_CATEGORY_MESSAGE_CONTENT, content)
-    if not content:
-        await message.reply_text("Message content cannot be empty.")
-        return ADD_CATEGORY_MESSAGE_CONTENT
-
-    context.user_data["message_content"] = content
-    context.user_data["media_type"] = media_type
-    context.user_data["media_file_id"] = media_file_id
-    if context.user_data.get("message_edit_id") is not None:
-        category = context.user_data["message_category"]
-        message_id = int(context.user_data["message_edit_id"])
-        if category == "promotion_stickers":
-            logger.warning("SAVE START user_id=%s chat_id=%s category=%s current_state=%s", user_id, chat_id, category, ADD_CATEGORY_MESSAGE_CONTENT)
-            delete_category_message(category, message_id)
-            add_promotion_sticker(media_file_id or "")
-            logger.warning("SAVE SUCCESS user_id=%s chat_id=%s category=%s next_state=%s", user_id, chat_id, category, ConversationHandler.END)
-        else:
-            logger.warning("SAVE START user_id=%s chat_id=%s category=%s current_state=%s", user_id, chat_id, category, ADD_CATEGORY_MESSAGE_CONTENT)
-            update_category_message(category, message_id, content=content, media_type=media_type, media_file_id=media_file_id)
-            logger.warning("SAVE SUCCESS user_id=%s chat_id=%s category=%s next_state=%s", user_id, chat_id, category, ConversationHandler.END)
-        context.user_data.clear()
-        await message.reply_text("Updated.")
-        logger.warning("STATE RETURN user_id=%s chat_id=%s category=%s returned_state=%s", user_id, chat_id, category, ConversationHandler.END)
-        return ConversationHandler.END
-    category = context.user_data.get("message_category")
-    if category == "promotion_stickers":
-        logger.warning("SAVE START user_id=%s chat_id=%s category=%s current_state=%s", user_id, chat_id, category, ADD_CATEGORY_MESSAGE_CONTENT)
-        add_promotion_sticker(media_file_id or "")
-        logger.warning("SAVE SUCCESS user_id=%s chat_id=%s category=%s next_state=%s", user_id, chat_id, category, ConversationHandler.END)
-        context.user_data.clear()
-        await message.reply_text("Sticker saved.")
-        logger.warning("STATE RETURN user_id=%s chat_id=%s category=%s returned_state=%s", user_id, chat_id, category, ConversationHandler.END)
-        return ConversationHandler.END
-    logger.warning("SAVE START user_id=%s chat_id=%s category=%s current_state=%s", user_id, chat_id, category, ADD_CATEGORY_MESSAGE_CONTENT)
-    await message.reply_text("Enter delay in minutes for this message.", reply_markup=_cancel_menu())
-    logger.warning("SAVE SUCCESS user_id=%s chat_id=%s category=%s next_state=%s", user_id, chat_id, category, ADD_CATEGORY_MESSAGE_DELAY)
-    logger.warning("STATE RETURN user_id=%s chat_id=%s category=%s returned_state=%s", user_id, chat_id, category, ADD_CATEGORY_MESSAGE_DELAY)
-    return ADD_CATEGORY_MESSAGE_DELAY
-
-
-async def _message_content_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.warning(
-        "CONV_STATE_200_ENTERED user=%s chat=%s",
-        update.effective_user.id if update.effective_user else None,
-        update.effective_chat.id if update.effective_chat else None,
-    )
-    return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_CONTENT, _message_content_handler)
-
-
-async def _message_delay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.warning("CONV_DELAY_HANDLER_ENTERED text=%s", update.message.text if update.message else None)
     user_id = getattr(getattr(update, "effective_user", None), "id", None)
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    raw_text = (message.text or message.caption or "").strip()
     logger.warning(
-        "ENTER MESSAGE DELAY HANDLER user_id=%s chat_id=%s state=%s user_data=%s",
+        "CONVERSATIONAL MESSAGE INPUT user_id=%s chat_id=%s raw_text=%s user_data=%s",
         user_id,
         chat_id,
-        ADD_CATEGORY_MESSAGE_DELAY,
-        {k: context.user_data.get(k) for k in ("message_category", "message_content", "media_type", "media_file_id")},
+        raw_text,
+        dict(context.user_data),
     )
     try:
-        delay_minutes = int(update.message.text.strip())
-        if delay_minutes < 1:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Delay must be a whole number of minutes greater than 0.")
-        return ADD_CATEGORY_MESSAGE_DELAY
+        delay_minutes, content = _parse_conversational_message_payload(raw_text)
+    except ValueError as exc:
+        await message.reply_text(str(exc))
+        return ADD_CONVERSATIONAL_MESSAGE
 
-    category = context.user_data.get("message_category")
-    if not category or "message_content" not in context.user_data:
-        await update.message.reply_text("Conversation state was lost. Please start adding the message again.")
-        logger.warning(
-            "MESSAGE DELAY HANDLER STATE LOST user_id=%s chat_id=%s category=%s user_data=%s",
-            user_id,
-            chat_id,
-            category,
-            dict(context.user_data),
-        )
-        return ConversationHandler.END
+    action = context.user_data.get("message_action")
+    category = context.user_data.get("message_category", "conversational_messages")
     try:
-        logger.warning(
-            "SAVE START user_id=%s chat_id=%s category=%s current_state=%s delay_minutes=%s",
-            user_id,
-            chat_id,
-            category,
-            ADD_CATEGORY_MESSAGE_DELAY,
-            delay_minutes,
-        )
-        add_category_message(
-            category,
-            content=context.user_data["message_content"],
-            media_type=context.user_data.get("media_type"),
-            media_file_id=context.user_data.get("media_file_id"),
-            delay_minutes=delay_minutes,
-        )
+        if action == "edit":
+            message_id = int(context.user_data["message_id"])
+            update_category_message(
+                category,
+                message_id,
+                content=content,
+                delay_minutes=delay_minutes,
+                media_type=None,
+                media_file_id=None,
+            )
+        else:
+            add_category_message(category, content=content, delay_minutes=delay_minutes)
     except Exception:
         logger.exception(
-            "SAVE FAILED user_id=%s chat_id=%s category=%s current_state=%s",
+            "CONVERSATIONAL MESSAGE SAVE FAILED user_id=%s chat_id=%s action=%s",
             user_id,
             chat_id,
-            category,
-            ADD_CATEGORY_MESSAGE_DELAY,
+            action,
         )
-        await update.message.reply_text("Failed to save the message. Please try again.")
+        await message.reply_text("Failed to save the message. Please try again.")
         return ConversationHandler.END
+
     context.user_data.clear()
-    await update.message.reply_text("Message saved.")
-    logger.warning(
-        "SAVE SUCCESS user_id=%s chat_id=%s category=%s next_state=%s",
-        user_id,
-        chat_id,
-        category,
-        ConversationHandler.END,
-    )
-    logger.warning(
-        "STATE RETURN user_id=%s chat_id=%s category=%s returned_state=%s",
-        user_id,
-        chat_id,
-        category,
-        ConversationHandler.END,
-    )
+    await message.reply_text("Message saved successfully.")
     return ConversationHandler.END
-
-
-async def _message_delay_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.warning("CONV_STATE_201_ENTERED")
-    return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_DELAY, _message_delay_handler)
 
 
 async def messages_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1952,26 +1903,6 @@ async def add_message_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     state = await _message_add_entry(update, context, "bot_messages")
     logger.warning("ADD MESSAGE ENTRY RETURNED STATE=%s", state)
     return state
-
-
-async def add_message_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _message_content_handler(update, context)
-
-
-async def add_message_delay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _message_delay_handler(update, context)
-
-
-async def add_message_content_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.warning(
-        f"CONV_STATE_200_ENTERED user={update.effective_user.id if update.effective_user else None} chat={update.effective_chat.id if update.effective_chat else None}"
-    )
-    return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_CONTENT, _message_content_handler)
-
-
-async def add_message_delay_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.warning("CONV_STATE_201_ENTERED")
-    return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_DELAY, _message_delay_handler)
 
 
 async def delete_message_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2080,8 +2011,7 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def _conversation_state_map() -> list[tuple[int, str]]:
     return [
         (ADD_GROUP_CHAT_ID, "add_group_chat_id_audited"),
-        (ADD_CATEGORY_MESSAGE_CONTENT, "add_message_content_audited"),
-        (ADD_CATEGORY_MESSAGE_DELAY, "add_message_delay_audited"),
+        (ADD_CONVERSATIONAL_MESSAGE, "add_conversational_message_handler"),
         (ADD_BOT_USERNAME, "bot_username_handler_audited"),
         (ADD_BOT_START_CMD, "bot_start_cmd_handler_audited"),
         (ADD_BOT_STOP_CMD, "bot_stop_cmd_handler_audited"),
@@ -2116,10 +2046,7 @@ def _log_conversation_audit() -> None:
     state_map = _conversation_state_map()
     declared_state_ids = {
         ADD_GROUP_CHAT_ID,
-        ADD_CATEGORY_MESSAGE_CONTENT,
-        ADD_CATEGORY_MESSAGE_DELAY,
-        EDIT_CATEGORY_MESSAGE_CONTENT,
-        EDIT_CATEGORY_MESSAGE_DELAY,
+        ADD_CONVERSATIONAL_MESSAGE,
         ADD_BOT_USERNAME,
         ADD_BOT_START_CMD,
         ADD_BOT_STOP_CMD,
@@ -2163,38 +2090,6 @@ async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _safe_callback_answer(update.callback_query)
 
 
-async def message_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await _safe_callback_answer(query)
-    parts = query.data.split(":")
-    category = parts[1]
-    action = parts[2]
-    if action == "add":
-        state = await _message_add_entry(update, context, category)
-        logger.warning("CONV_ENTRY callback=%s returned_state=%s", query.data, state)
-        return state
-    elif action == "view":
-        await _message_view_callback(update, category, int(parts[3]))
-    elif action == "edit":
-        await _safe_callback_answer(query)
-        context.user_data.clear()
-        context.user_data["message_category"] = category
-        context.user_data["message_edit_id"] = int(parts[3])
-        await _send_or_edit(update, f"Send the new {_category_label(category).lower()} content.", _cancel_menu())
-        logger.warning(
-            "MESSAGE CATEGORY EDIT RETURN user_id=%s chat_id=%s category=%s returned_state=%s",
-            getattr(getattr(update, "effective_user", None), "id", None),
-            getattr(getattr(update, "effective_chat", None), "id", None),
-            category,
-            ADD_CATEGORY_MESSAGE_CONTENT,
-        )
-        return ADD_CATEGORY_MESSAGE_CONTENT
-    elif action == "delete":
-        delete_category_message(category, int(parts[3]))
-        await _send_or_edit(update, "Deleted.", InlineKeyboardMarkup(_category_rows(category)))
-    return None
-
-
 async def start_controller() -> None:
     global _application
     if not TOKEN:
@@ -2209,7 +2104,7 @@ async def start_controller() -> None:
             CallbackQueryHandler(add_group_entry, pattern="^group:add$"),
             CallbackQueryHandler(add_message_entry, pattern="^message:add$"),
             CallbackQueryHandler(add_bot_entry, pattern="^bot:add$"),
-            CallbackQueryHandler(message_category_callback, pattern="^msg:[a-z_]+:(add|edit):"),
+            CallbackQueryHandler(conversational_message_callback, pattern="^msg:conversational:add$|^msg:conversational:edit:"),
             CallbackQueryHandler(group_edit_name_entry, pattern="^group:edit_name:"),
             CallbackQueryHandler(group_edit_delay_entry, pattern="^group:edit_delay:"),
             CallbackQueryHandler(group_set_message_entry, pattern="^group:set_message:"),
@@ -2238,14 +2133,9 @@ async def start_controller() -> None:
         ],
         states={
             ADD_GROUP_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_chat_id_audited)],
-            ADD_CATEGORY_MESSAGE_CONTENT: [
-                MessageHandler(
-                    (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL)
-                    & ~filters.COMMAND,
-                    add_message_content_audited,
-                )
+            ADD_CONVERSATIONAL_MESSAGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_conversational_message_handler)
             ],
-            ADD_CATEGORY_MESSAGE_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_message_delay_audited)],
             ADD_BOT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_username_handler_audited)],
             ADD_BOT_START_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_start_cmd_handler_audited)],
             ADD_BOT_STOP_CMD: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_stop_cmd_handler_audited)],
@@ -2292,11 +2182,6 @@ async def start_controller() -> None:
         False,
         ["nav:cancel", "/cancel", "/back"],
     )
-    logger.warning("STATE REGISTERED ADD_CATEGORY_MESSAGE_CONTENT=%s", ADD_CATEGORY_MESSAGE_CONTENT)
-    logger.warning(
-        "STATE HANDLER ADD_CATEGORY_MESSAGE_CONTENT=%s",
-        "add_message_content_audited",
-    )
     logger.info(
         "HANDLER ORDER=%s",
         [
@@ -2331,7 +2216,7 @@ async def start_controller() -> None:
             "CallbackQueryHandler(message:delete)",
             "CallbackQueryHandler(msg:delete:)",
             "CallbackQueryHandler(automation:start/stop/pause/resume)",
-            "CallbackQueryHandler(msg:category)",
+            "CallbackQueryHandler(msg:conversational:add/edit)",
             "CallbackQueryHandler(noop)",
         ],
     )
