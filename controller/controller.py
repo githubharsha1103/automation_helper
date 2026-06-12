@@ -2161,7 +2161,7 @@ async def start_controller() -> None:
             EDIT_GROUP_TIME_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_end_handler_audited)],
             ADD_BOT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_bot_message_handler_audited)],
             ADD_GROUP_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_message_handler_audited)],
-            ADD_STICKER: [MessageHandler(filters.STICKER | (filters.TEXT & ~filters.COMMAND), add_sticker_handler_audited)],
+            ADD_STICKER: [MessageHandler(filters.Sticker.ALL | (filters.TEXT & ~filters.COMMAND), add_sticker_handler_audited)],
         },
         fallbacks=[
             CallbackQueryHandler(cancel_callback, pattern="^nav:cancel$"),
