@@ -571,7 +571,11 @@ async def _audit_state_handler(
         user_message = getattr(getattr(update, "message", None), "text", None) or getattr(getattr(update, "message", None), "caption", None) or ""
         logger.info("RECEIVED USER MESSAGE %s text=%s", state_label, user_message)
         logger.info("HANDLER EXECUTED %s handler=%s", state_label, getattr(handler, "__name__", str(handler)))
-        result = await handler(update, context)
+        try:
+            result = await handler(update, context)
+        except Exception:
+            logger.exception("MESSAGE_CONTENT_HANDLER_CRASH")
+            raise
         logger.info("SAVE SUCCESS %s result=%s", state_label, result)
         logger.info("STATE TRANSITION state=%s next_state=%s", state_label, "END" if result == ConversationHandler.END else _state_name(result) if isinstance(result, int) else result)
         return result
@@ -1761,6 +1765,10 @@ async def _message_add_entry(update: Update, context: ContextTypes.DEFAULT_TYPE,
 async def _message_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not _is_allowed(update):
         return ConversationHandler.END
+    logger.warning(
+        "CONV_CONTENT_HANDLER_ENTERED text=%s",
+        update.message.text if update.message else None,
+    )
     user_id = getattr(getattr(update, "effective_user", None), "id", None)
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
     logger.warning(
@@ -1826,11 +1834,16 @@ async def _message_content_handler(update: Update, context: ContextTypes.DEFAULT
 
 
 async def _message_content_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.warning("ENTER MESSAGE CONTENT HANDLER AUDITED")
+    logger.warning(
+        "CONV_STATE_200_ENTERED user=%s chat=%s",
+        update.effective_user.id if update.effective_user else None,
+        update.effective_chat.id if update.effective_chat else None,
+    )
     return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_CONTENT, _message_content_handler)
 
 
 async def _message_delay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.warning("CONV_DELAY_HANDLER_ENTERED text=%s", update.message.text if update.message else None)
     user_id = getattr(getattr(update, "effective_user", None), "id", None)
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
     logger.warning(
@@ -1905,6 +1918,7 @@ async def _message_delay_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _message_delay_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.warning("CONV_STATE_201_ENTERED")
     return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_DELAY, _message_delay_handler)
 
 
@@ -1949,11 +1963,14 @@ async def add_message_delay(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def add_message_content_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    logger.warning("ADD MESSAGE CONTENT AUDITED ENTERED")
+    logger.warning(
+        f"CONV_STATE_200_ENTERED user={update.effective_user.id if update.effective_user else None} chat={update.effective_chat.id if update.effective_chat else None}"
+    )
     return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_CONTENT, _message_content_handler)
 
 
 async def add_message_delay_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.warning("CONV_STATE_201_ENTERED")
     return await _audit_state_handler(update, context, ADD_CATEGORY_MESSAGE_DELAY, _message_delay_handler)
 
 
@@ -2154,13 +2171,7 @@ async def message_category_callback(update: Update, context: ContextTypes.DEFAUL
     action = parts[2]
     if action == "add":
         state = await _message_add_entry(update, context, category)
-        logger.warning(
-            "MESSAGE CATEGORY ADD RETURN user_id=%s chat_id=%s category=%s returned_state=%s",
-            getattr(getattr(update, "effective_user", None), "id", None),
-            getattr(getattr(update, "effective_chat", None), "id", None),
-            category,
-            state,
-        )
+        logger.warning("CONV_ENTRY callback=%s returned_state=%s", query.data, state)
         return state
     elif action == "view":
         await _message_view_callback(update, category, int(parts[3]))
