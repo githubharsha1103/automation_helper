@@ -538,6 +538,20 @@ class AutomationService:
         no_response_timeout = self._safe_positive_float(settings.get("no_response_timeout", 0), 0.0)
         conv_delay = self._delay_bounds(settings, "conversation_delay", 0.0, 0.0)
         promo_delay = self._delay_bounds(settings, "promotion_delay", 0.0, 0.0)
+        cleaned_sequence: list[int] = []
+        if sequence:
+            indexed = {int(message["id"]): message for message in list_category_messages("conversational_messages", active_only=True)}
+            for message_id in sequence:
+                message = indexed.get(message_id) or get_category_message("conversational_messages", message_id)
+                if not message:
+                    logger.warning("BOT CONFIG CLEANUP bot=%s reason=missing_conversational_message message_id=%s", bot_name, message_id)
+                    continue
+                if not bool(message.get("enabled", True)) or not bool(message.get("is_active", True)):
+                    logger.warning("BOT CONFIG CLEANUP bot=%s reason=disabled_conversational_message message_id=%s", bot_name, message_id)
+                    continue
+                cleaned_sequence.append(int(message_id))
+        sequence = cleaned_sequence
+        logger.warning("BOT CONFIG CLEANED bot=%s sequence=%s", bot_name, sequence)
         if not sequence:
             logger.warning("BOT CONFIG INVALID bot=%s reason=empty_conversation_sequence settings=%s", bot_name, settings)
         if no_response_timeout <= 0:
@@ -615,8 +629,7 @@ class AutomationService:
         promotion_messages = [message for message in promotion_messages if bool(message.get("enabled", True))]
         if not promotion_messages:
             logger.warning("PROMOTION SKIP bot=%s reason=no_enabled_bot_messages", bot_name)
-            self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="no_bot_messages", last_failure_ts=self._utc_now().isoformat())
-            self._increment_bot_runtime(bot_name, error_count=1)
+            self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="no_bot_messages", last_failure_ts=self._utc_now().isoformat())
             return
         selected_message = random.choice(promotion_messages)
         promotion_delay_min, promotion_delay_max = self._delay_bounds(settings, "promotion_delay", 0.0, 0.0)
@@ -662,15 +675,14 @@ class AutomationService:
                 self._set_bot_runtime(bot_name, "IDLE")
             return
         logger.warning("PROMOTION SKIP bot=%s reason=invalid_mode resolved_mode=%s", bot_name, chosen_mode)
-        self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="invalid_promotion_mode", last_failure_ts=self._utc_now().isoformat())
-        self._increment_bot_runtime(bot_name, error_count=1)
+        self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="invalid_promotion_mode", last_failure_ts=self._utc_now().isoformat())
 
     async def _run_bot_conversation(self, bot_name: str, settings: dict[str, object]) -> None:
         sequence, no_response_timeout, (conversation_delay_min, conversation_delay_max), _ = self._validate_bot_settings(bot_name, settings)
         if not sequence:
-            logger.warning("BOT CONVERSATION ABORTED bot=%s reason=no_valid_sequence", bot_name)
-            self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="no_valid_sequence", last_failure_ts=self._utc_now().isoformat())
-            self._increment_bot_runtime(bot_name, error_count=1)
+            logger.warning("BOT CONVERSATION SKIP bot=%s reason=no_valid_sequence", bot_name)
+            await self._send_bot_promotion(bot_name, settings)
+            self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="no_valid_sequence", last_failure_ts=self._utc_now().isoformat())
             return
         session = self._bot_session(bot_name)
         session["active"] = True
@@ -700,8 +712,6 @@ class AutomationService:
                 message = get_category_message("conversational_messages", message_id)
                 if not message or not message.get("is_active", True):
                     logger.warning("BOT CONVERSATION SKIP bot=%s reason=missing_message message_id=%s", bot_name, message_id)
-                    self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="missing_conversational_message", last_failure_ts=self._utc_now().isoformat())
-                    self._increment_bot_runtime(bot_name, error_count=1)
                     continue
                 if not bool(message.get("enabled", True)):
                     logger.info("BOT CONVERSATION SKIP bot=%s reason=disabled_message message_id=%s", bot_name, message_id)
@@ -710,8 +720,6 @@ class AutomationService:
                 sent = await self._send_saved_payload_guarded(bot_name, message, "conversation")
                 if not sent:
                     logger.warning("BOT CONVERSATION CONTINUE bot=%s reason=send_failed message_id=%s", bot_name, message_id)
-                    self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="conversation_send_failed", last_failure_ts=self._utc_now().isoformat())
-                    self._increment_bot_runtime(bot_name, error_count=1)
                     continue
                 session["last_conversation_message_id"] = int(message_id)
                 self._record_message_send(bot_name, "conversational_messages", int(message_id))

@@ -251,9 +251,18 @@ def add_category_message(
     media_type: str | None = None,
     media_file_id: str | None = None,
     is_active: bool = True,
+    delay_minutes: int | None = None,
 ) -> int:
     collection = _normalize_category(category)
     message_id = _next_message_id(collection)
+    logger.warning(
+        "ADD CATEGORY MESSAGE START category=%s message_id=%s delay_minutes=%s media_type=%s has_media=%s",
+        collection,
+        message_id,
+        delay_minutes,
+        media_type,
+        bool(media_file_id),
+    )
     doc: dict[str, Any] = {
         "id": message_id,
         "content": content,
@@ -264,15 +273,22 @@ def add_category_message(
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
     }
+    if delay_minutes is not None:
+        doc["delay_minutes"] = int(delay_minutes)
     if collection == "promotion_stickers":
         doc["content"] = ""
         doc["media_type"] = "sticker"
         doc["is_active"] = True
-    _collection(collection).insert_one(doc)
+    try:
+        _collection(collection).insert_one(doc)
+    except Exception:
+        logger.exception("ADD CATEGORY MESSAGE FAILED category=%s message_id=%s", collection, message_id)
+        raise
     _category_cache(collection)[message_id] = dict(doc)
     if collection in _MESSAGE_PERF_CACHE:
         _MESSAGE_PERF_CACHE[collection][message_id] = {"times_sent": 0, "replies_received": 0}
     _MESSAGE_LIST_CACHE["ts"] = 0.0
+    logger.warning("ADD CATEGORY MESSAGE SUCCESS category=%s message_id=%s", collection, message_id)
     return message_id
 
 
