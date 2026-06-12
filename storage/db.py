@@ -207,20 +207,262 @@ async def alist_category_messages(category: str, active_only: bool = True) -> li
     return await asyncio.to_thread(list_category_messages, category, active_only)
 
 
-def get_promotion_asset_channel() -> Any:
-    return get_setting("promotion_asset_channel", None)
+async def alist_bot_messages(enabled: bool = True) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(list_bot_messages, enabled)
 
 
-def get_promotion_sticker_message_id() -> Any:
-    return get_setting("promotion_sticker_message_id", None)
+async def alist_group_messages(enabled: bool = True) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(list_group_messages, enabled)
 
 
-def set_promotion_asset_channel(value: Any) -> bool:
-    return set_setting("promotion_asset_channel", value)
+async def alist_stickers(enabled: bool = True) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(list_stickers, enabled)
 
 
-def set_promotion_sticker_message_id(value: Any) -> bool:
-    return set_setting("promotion_sticker_message_id", value)
+# ===================================================
+# NEW BOT MESSAGES SYSTEM (First-class native)
+# ===================================================
+
+def add_bot_message(content: str) -> str:
+    """Add new bot message, return ObjectId as string"""
+    doc = {
+        "content": content,
+        "enabled": True,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        "sent_count": 0,
+    }
+    result = _mongo_db()["bot_messages"].insert_one(doc)
+    _MESSAGE_CACHE["bot_messages"].pop(result.inserted_id, None)
+    _invalidate_runtime_caches("messages")
+    logger.warning("BOT MESSAGE ADDED message_id=%s content_len=%s", result.inserted_id, len(content))
+    return str(result.inserted_id)
+
+
+def update_bot_message(message_id: str, **changes: Any) -> bool:
+    """Update bot message fields"""
+    changes["updated_at"] = datetime.utcnow()
+    result = _mongo_db()["bot_messages"].update_one(
+        {"_id": ObjectId(message_id)},
+        {"$set": changes}
+    )
+    _MESSAGE_CACHE["bot_messages"].pop(message_id, None)
+    _invalidate_runtime_caches("messages")
+    logger.warning("BOT MESSAGE UPDATED message_id=%s changes=%s", message_id, list(changes.keys()))
+    return bool(result.modified_count)
+
+
+def delete_bot_message(message_id: str) -> bool:
+    """Delete bot message"""
+    result = _mongo_db()["bot_messages"].delete_one({"_id": ObjectId(message_id)})
+    _MESSAGE_CACHE["bot_messages"].pop(message_id, None)
+    _invalidate_runtime_caches("messages")
+    logger.warning("BOT MESSAGE DELETED message_id=%s", message_id)
+    return bool(result.deleted_count)
+
+
+def toggle_bot_message(message_id: str) -> bool:
+    """Toggle bot message enabled/disabled"""
+    doc = _mongo_db()["bot_messages"].find_one({"_id": ObjectId(message_id)})
+    if not doc:
+        return False
+    new_enabled = not bool(doc.get("enabled", True))
+    return update_bot_message(message_id, enabled=new_enabled)
+
+
+def list_bot_messages(enabled_only: bool = True) -> list[dict[str, Any]]:
+    """List bot messages, optionally filtered by enabled status"""
+    query = {"enabled": True} if enabled_only else {}
+    docs = _mongo_db()["bot_messages"].find(query).sort("created_at", 1)
+    messages = []
+    for doc in docs:
+        msg = {k: v for k, v in doc.items() if k != "_id"}
+        msg["_id"] = str(doc["_id"])
+        messages.append(msg)
+    return messages
+
+
+async def aadd_bot_message(content: str) -> str:
+    return await asyncio.to_thread(add_bot_message, content)
+
+
+async def aupdate_bot_message(message_id: str, **changes: Any) -> bool:
+    return await asyncio.to_thread(update_bot_message, message_id, **changes)
+
+
+async def adelete_bot_message(message_id: str) -> bool:
+    return await asyncio.to_thread(delete_bot_message, message_id)
+
+
+async def atoggle_bot_message(message_id: str) -> bool:
+    return await asyncio.to_thread(toggle_bot_message, message_id)
+
+
+async def alist_bot_messages_enabled() -> list[dict[str, Any]]:
+    return await asyncio.to_thread(list_bot_messages, True)
+
+
+# ===================================================
+# NEW GROUP MESSAGES SYSTEM (First-class native)
+# ===================================================
+
+def add_group_message(content: str) -> str:
+    """Add new group message, return ObjectId as string"""
+    doc = {
+        "content": content,
+        "enabled": True,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        "sent_count": 0,
+    }
+    result = _mongo_db()["group_messages"].insert_one(doc)
+    _MESSAGE_CACHE["group_messages"].pop(result.inserted_id, None)
+    _invalidate_runtime_caches("messages")
+    logger.warning("GROUP MESSAGE ADDED message_id=%s content_len=%s", result.inserted_id, len(content))
+    return str(result.inserted_id)
+
+
+def update_group_message(message_id: str, **changes: Any) -> bool:
+    """Update group message fields"""
+    changes["updated_at"] = datetime.utcnow()
+    result = _mongo_db()["group_messages"].update_one(
+        {"_id": ObjectId(message_id)},
+        {"$set": changes}
+    )
+    _MESSAGE_CACHE["group_messages"].pop(message_id, None)
+    _invalidate_runtime_caches("messages")
+    logger.warning("GROUP MESSAGE UPDATED message_id=%s changes=%s", message_id, list(changes.keys()))
+    return bool(result.modified_count)
+
+
+def delete_group_message(message_id: str) -> bool:
+    """Delete group message"""
+    result = _mongo_db()["group_messages"].delete_one({"_id": ObjectId(message_id)})
+    _MESSAGE_CACHE["group_messages"].pop(message_id, None)
+    _invalidate_runtime_caches("messages")
+    logger.warning("GROUP MESSAGE DELETED message_id=%s", message_id)
+    return bool(result.deleted_count)
+
+
+def toggle_group_message(message_id: str) -> bool:
+    """Toggle group message enabled/disabled"""
+    doc = _mongo_db()["group_messages"].find_one({"_id": ObjectId(message_id)})
+    if not doc:
+        return False
+    new_enabled = not bool(doc.get("enabled", True))
+    return update_group_message(message_id, enabled=new_enabled)
+
+
+def list_group_messages(enabled_only: bool = True) -> list[dict[str, Any]]:
+    """List group messages, optionally filtered by enabled status"""
+    query = {"enabled": True} if enabled_only else {}
+    docs = _mongo_db()["group_messages"].find(query).sort("created_at", 1)
+    messages = []
+    for doc in docs:
+        msg = {k: v for k, v in doc.items() if k != "_id"}
+        msg["_id"] = str(doc["_id"])
+        messages.append(msg)
+    return messages
+
+
+async def aadd_group_message(content: str) -> str:
+    return await asyncio.to_thread(add_group_message, content)
+
+
+async def aupdate_group_message(message_id: str, **changes: Any) -> bool:
+    return await asyncio.to_thread(update_group_message, message_id, **changes)
+
+
+async def adelete_group_message(message_id: str) -> bool:
+    return await asyncio.to_thread(delete_group_message, message_id)
+
+
+async def atoggle_group_message(message_id: str) -> bool:
+    return await asyncio.to_thread(toggle_group_message, message_id)
+
+
+async def alist_group_messages_enabled() -> list[dict[str, Any]]:
+    return await asyncio.to_thread(list_group_messages, True)
+
+
+# ===================================================
+# NEW STICKER SYSTEM (Stores file_id directly)
+# ===================================================
+
+def add_sticker(file_id: str, emoji: str | None = None) -> str:
+    """Add sticker with file_id, return ObjectId as string"""
+    doc = {
+        "file_id": file_id,
+        "emoji": emoji or "",
+        "enabled": True,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        "sent_count": 0,
+    }
+    result = _mongo_db()["promotion_stickers"].insert_one(doc)
+    _MESSAGE_CACHE["promotion_stickers"].pop(result.inserted_id, None)
+    _invalidate_runtime_caches("messages")
+    logger.warning("STICKER ADDED sticker_id=%s file_id=%s emoji=%s", result.inserted_id, file_id, emoji)
+    return str(result.inserted_id)
+
+
+def delete_sticker(sticker_id: str) -> bool:
+    """Delete sticker"""
+    result = _mongo_db()["promotion_stickers"].delete_one({"_id": ObjectId(sticker_id)})
+    _MESSAGE_CACHE["promotion_stickers"].pop(sticker_id, None)
+    _invalidate_runtime_caches("messages")
+    logger.warning("STICKER DELETED sticker_id=%s", sticker_id)
+    return bool(result.deleted_count)
+
+
+def toggle_sticker(sticker_id: str) -> bool:
+    """Toggle sticker enabled/disabled"""
+    doc = _mongo_db()["promotion_stickers"].find_one({"_id": ObjectId(sticker_id)})
+    if not doc:
+        return False
+    new_enabled = not bool(doc.get("enabled", True))
+    return update_sticker(sticker_id, enabled=new_enabled)
+
+
+def update_sticker(sticker_id: str, **changes: Any) -> bool:
+    """Update sticker fields"""
+    changes["updated_at"] = datetime.utcnow()
+    result = _mongo_db()["promotion_stickers"].update_one(
+        {"_id": ObjectId(sticker_id)},
+        {"$set": changes}
+    )
+    _MESSAGE_CACHE["promotion_stickers"].pop(sticker_id, None)
+    _invalidate_runtime_caches("messages")
+    logger.warning("STICKER UPDATED sticker_id=%s changes=%s", sticker_id, list(changes.keys()))
+    return bool(result.modified_count)
+
+
+def list_stickers(enabled_only: bool = True) -> list[dict[str, Any]]:
+    """List stickers, optionally filtered by enabled status"""
+    query = {"enabled": True} if enabled_only else {}
+    docs = _mongo_db()["promotion_stickers"].find(query).sort("created_at", 1)
+    stickers = []
+    for doc in docs:
+        sticker = {k: v for k, v in doc.items() if k != "_id"}
+        sticker["_id"] = str(doc["_id"])
+        stickers.append(sticker)
+    return stickers
+
+
+async def aadd_sticker(file_id: str, emoji: str | None = None) -> str:
+    return await asyncio.to_thread(add_sticker, file_id, emoji)
+
+
+async def adelete_sticker(sticker_id: str) -> bool:
+    return await asyncio.to_thread(delete_sticker, sticker_id)
+
+
+async def atoggle_sticker(sticker_id: str) -> bool:
+    return await asyncio.to_thread(toggle_sticker, sticker_id)
+
+
+async def alist_stickers_enabled() -> list[dict[str, Any]]:
+    return await asyncio.to_thread(list_stickers, True)
 
 
 def _normalize_category(category: str) -> str:
@@ -250,7 +492,6 @@ def add_category_message(
     content: str,
     media_type: str | None = None,
     media_file_id: str | None = None,
-    is_active: bool = True,
     delay_minutes: int | None = None,
 ) -> int:
     collection = _normalize_category(category)
@@ -268,7 +509,6 @@ def add_category_message(
         "content": content,
         "media_type": media_type,
         "media_file_id": media_file_id,
-        "is_active": is_active,
         "enabled": True,
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
@@ -278,7 +518,6 @@ def add_category_message(
     if collection == "promotion_stickers":
         doc["content"] = ""
         doc["media_type"] = "sticker"
-        doc["is_active"] = True
     try:
         _collection(collection).insert_one(doc)
     except Exception:
@@ -412,13 +651,35 @@ def increment_message_performance(category: str, message_id: int, **increments: 
 
 def list_category_messages(category: str, active_only: bool = True) -> list[dict[str, Any]]:
     collection = _normalize_category(category)
-    query = {"is_active": True} if active_only and collection != "promotion_stickers" else {}
+    query = {"enabled": True} if active_only else {}
     messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in _collection(collection).find(query).sort("id", 1)]
     cache = _category_cache(collection)
     for message in messages:
         message.setdefault("enabled", True)
         cache[int(message["id"])] = dict(message)
     return messages
+
+
+# OLD list_bot_messages - will be replaced by new function above
+# Kept for compatibility - delegates to new schema when needed
+def _legacy_list_bot_messages(enabled: bool = True) -> list[dict[str, Any]]:
+    """DEPRECATED - use new list_bot_messages() from native bot_messages collection"""
+    try:
+        return list_bot_messages(enabled_only=enabled)
+    except Exception as e:
+        logger.warning("list_bot_messages fallback to legacy failed: %s", e)
+        return []
+
+
+# OLD list_group_messages - will be replaced by new function above  
+# Kept for compatibility - delegates to new schema when needed
+def _legacy_list_group_messages(enabled: bool = True) -> list[dict[str, Any]]:
+    """DEPRECATED - use new list_group_messages() from native group_messages collection"""
+    try:
+        return list_group_messages(enabled_only=enabled)
+    except Exception as e:
+        logger.warning("list_group_messages fallback to legacy failed: %s", e)
+        return []
 
 
 def update_category_message(category: str, message_id: int, **changes: Any) -> bool:
@@ -618,7 +879,7 @@ def repair_promotion_data() -> dict[str, Any]:
     return {
         "total_bots": len(bots),
         "total_groups": len(groups),
-        "total_active_messages": len([message for message in messages if message.get("is_active", message.get("active", False)) and message.get("content")]),
+        "total_active_messages": len([message for message in messages if bool(message.get("enabled", False)) and message.get("content")]),
         "groups_missing_assignments": missing_assignments,
         "groups_invalid_assignments": invalid_assignments,
         "groups_repaired": repaired_groups,
@@ -676,7 +937,7 @@ def migrate_legacy_promotion_messages() -> dict[str, Any]:
                 "media_type": doc.get("media_type"),
                 "media_file_id": doc.get("media_file_id"),
                 "delay_minutes": _extract_delay_minutes(doc),
-                "is_active": True,
+                "enabled": True,
                 "created_at": _extract_created_at(doc),
             }
             _collection("bot_messages").insert_one(new_doc)
@@ -712,9 +973,7 @@ def _mongo_db():
 
 def init_db() -> None:
     db = _mongo_db()
-    db["settings"].update_one({"_id": "promotion_mode"}, {"$setOnInsert": {"value": "message"}}, upsert=True)
-    db["settings"].update_one({"_id": "promotion_asset_channel"}, {"$setOnInsert": {"value": None}}, upsert=True)
-    db["settings"].update_one({"_id": "promotion_sticker_message_id"}, {"$setOnInsert": {"value": None}}, upsert=True)
+    db["settings"].update_one({"_id": "promotion_mode"}, {"$setOnInsert": {"value": "MESSAGE"}}, upsert=True)
     db["settings"].update_one({"_id": "default_promotion_mode"}, {"$setOnInsert": {"value": "MESSAGE"}}, upsert=True)
     db["settings"].update_one({"_id": "default_conversation_sequence"}, {"$setOnInsert": {"value": []}}, upsert=True)
     db["settings"].update_one({"_id": "default_no_response_timeout"}, {"$setOnInsert": {"value": 0}}, upsert=True)
@@ -727,13 +986,12 @@ def init_db() -> None:
     db["groups"].create_index([("status", 1), ("cooldown_until", 1)])
     db["groups"].create_index([("status", 1), ("group_id", 1)])
     db["bots"].create_index([("enabled", 1), ("_id", 1)])
-    for collection_name in ("conversational_messages", "bot_messages", "group_messages"):
-        db[collection_name].create_index([("is_active", 1), ("id", 1)])
-        db[collection_name].create_index([("enabled", 1), ("is_active", 1), ("id", 1)])
+    for collection_name in ("conversational_messages", "bot_messages", "group_messages", "promotion_stickers"):
+        db[collection_name].create_index([("enabled", 1), ("created_at", 1)])
     migrate_message_ids()
     for collection_name in ("conversational_messages", "bot_messages", "group_messages"):
         db[collection_name].create_index([("id", 1)], unique=True)
-    db["promotion_stickers"].create_index([("id", 1)], unique=True)
+    db["promotion_stickers"].create_index([("file_id", 1)], unique=True)
     db["bot_settings"].create_index([("bot_name", 1)], unique=True)
 
 
@@ -1055,7 +1313,7 @@ def add_message(content: str, delay_minutes: int, media_type: str | None = None,
         "media_type": media_type,
         "media_file_id": media_file_id,
         "delay_minutes": delay_minutes,
-        "is_active": True,
+        "enabled": True,
         "created_at": datetime.utcnow(),
     }
     _collection("bot_messages").insert_one(doc)
@@ -1085,7 +1343,7 @@ def list_messages(active_only: bool = True) -> list[dict[str, Any]]:
         record_operation("list_messages", elapsed_ms, True, "mongo", {"cache_hit": True, "active_only": active_only})
         return cached
     if active_only:
-        query = {"is_active": True}
+        query = {"enabled": True}
         docs = _timed_db_call("list_messages_find_active", lambda: list(_collection("bot_messages").find(query).sort("id", 1)))
         messages = [{k: v for k, v in doc.items() if k != "_id"} for doc in docs]
         for message in messages:
@@ -1133,8 +1391,8 @@ def set_category_message_enabled(category: str, message_id: int, enabled: bool) 
         cached["enabled"] = bool(enabled)
     if collection == "bot_messages":
         cached_bot = _message_cache_for("bot_messages").get(int(message_id))
-    if cached_bot is not None:
-        cached_bot["enabled"] = bool(enabled)
+        if cached_bot is not None:
+            cached_bot["enabled"] = bool(enabled)
     _MESSAGE_LIST_CACHE["ts"] = 0.0
     return True
 

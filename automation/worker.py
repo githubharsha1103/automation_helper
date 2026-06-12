@@ -19,8 +19,9 @@ from storage.db import (
     aget_bots,
     aget_setting,
     alist_groups,
-    alist_category_messages,
-    alist_messages,
+    alist_bot_messages_enabled,
+    alist_group_messages_enabled,
+    alist_stickers_enabled,
     aset_bot_paused,
     aset_setting,
     aupdate_group_runtime,
@@ -28,13 +29,10 @@ from storage.db import (
     list_enabled_bots,
     list_enabled_groups,
     repair_promotion_data,
-    get_promotion_asset_channel,
-    get_promotion_sticker_message_id,
     record_operation,
     telemetry_snapshot,
     get_bot,
     get_bots,
-    get_bot_settings,
     get_bot_settings,
     update_bot_runtime,
     increment_bot_runtime,
@@ -46,7 +44,9 @@ from storage.db import (
     is_bot_paused,
     list_groups,
     list_category_messages,
-    list_messages,
+    list_bot_messages,
+    list_group_messages,
+    list_stickers,
     set_bot_paused,
     set_setting,
     get_group,
@@ -489,7 +489,14 @@ class AutomationService:
             event.set()
 
     def _choose_message(self, category: str) -> dict[str, object] | None:
-        messages = list_category_messages(category, active_only=True)
+        if category == "bot_messages":
+            messages = list_bot_messages(enabled=True)
+        elif category == "group_messages":
+            messages = list_group_messages(enabled=True)
+        elif category == "promotion_stickers":
+            messages = list_stickers(enabled=True)
+        else:
+            messages = list_category_messages(category, active_only=False)
         if not messages:
             return None
         enabled_messages = [message for message in messages if bool(message.get("enabled", True))]
@@ -501,7 +508,7 @@ class AutomationService:
     def _choose_conversation_message(self, message_ids: list[int]) -> dict[str, object] | None:
         if not message_ids:
             return None
-        indexed = {int(message["id"]): message for message in list_category_messages("conversational_messages", active_only=True)}
+        indexed = {int(message["id"]): message for message in list_category_messages("conversational_messages", active_only=False) if bool(message.get("enabled", True))}
         candidates = []
         for message_id in message_ids:
             message = indexed.get(message_id)
@@ -540,13 +547,13 @@ class AutomationService:
         promo_delay = self._delay_bounds(settings, "promotion_delay", 0.0, 0.0)
         cleaned_sequence: list[int] = []
         if sequence:
-            indexed = {int(message["id"]): message for message in list_category_messages("conversational_messages", active_only=True)}
+            indexed = {int(message["id"]): message for message in list_category_messages("conversational_messages", active_only=False) if bool(message.get("enabled", True))}
             for message_id in sequence:
                 message = indexed.get(message_id) or get_category_message("conversational_messages", message_id)
                 if not message:
                     logger.warning("BOT CONFIG CLEANUP bot=%s reason=missing_conversational_message message_id=%s", bot_name, message_id)
                     continue
-                if not bool(message.get("enabled", True)) or not bool(message.get("is_active", True)):
+                if not bool(message.get("enabled", True)):
                     logger.warning("BOT CONFIG CLEANUP bot=%s reason=disabled_conversational_message message_id=%s", bot_name, message_id)
                     continue
                 cleaned_sequence.append(int(message_id))
@@ -654,8 +661,7 @@ class AutomationService:
             logger.info("PROMOTION DISABLED bot=%s", bot_name)
             self._set_bot_runtime(bot_name, "IDLE")
             return
-        promotion_messages = list_category_messages("bot_messages", active_only=True)
-        promotion_messages = [message for message in promotion_messages if bool(message.get("enabled", True))]
+        promotion_messages = list_bot_messages(enabled=True)
         if not promotion_messages:
             logger.warning("PROMOTION SKIP bot=%s reason=no_enabled_bot_messages", bot_name)
             self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="no_bot_messages", last_failure_ts=self._utc_now().isoformat())
@@ -739,7 +745,7 @@ class AutomationService:
                     logger.info("BOT CONVERSATION STOPPED bot=%s reason=engaged message_id=%s", bot_name, message_id)
                     break
                 message = get_category_message("conversational_messages", message_id)
-                if not message or not message.get("is_active", True):
+                if not message:
                     logger.warning("BOT CONVERSATION SKIP bot=%s reason=missing_message message_id=%s", bot_name, message_id)
                     continue
                 if not bool(message.get("enabled", True)):
@@ -790,105 +796,69 @@ class AutomationService:
 
     @staticmethod
     def _promotion_mode() -> str:
-        mode = str(get_setting("promotion_mode", "message") or "message").strip().lower()
-        return mode if mode in {"message", "sticker", "both"} else "message"
+        mode = str(get_setting("promotion_mode", "MESSAGE") or "MESSAGE").strip().upper()
+        return mode if mode in {"MESSAGE", "STICKER", "BOTH"} else "MESSAGE"
 
-    @staticmethod
-    def _promotion_asset_channel() -> str | None:
-        asset_channel = get_promotion_asset_channel()
-        return str(asset_channel) if asset_channel else None
-
-    @staticmethod
-    def _promotion_sticker_message_id() -> int | None:
-        value = get_promotion_sticker_message_id()
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    async def _send_asset_sticker(self, target: str) -> bool:
+    async def _send_promotion_sticker(self, bot_name: str) -> bool:
+        """Send sticker directly from promotion_stickers collection using file_id"""
         cycle_start = time.monotonic()
-        asset_channel = self._promotion_asset_channel()
-        sticker_message_id = self._promotion_sticker_message_id()
-        logger.warning(
-            "BEFORE _send_asset_sticker(): target=%s asset_channel=%s message_id=%s",
-            target,
-            asset_channel,
-            sticker_message_id,
-        )
-        if not asset_channel or not sticker_message_id:
-            logger.info("ASSET STICKER NOT CONFIGURED target=%s asset_channel=%s message_id=%s", target, asset_channel, sticker_message_id)
+        stickers = list_stickers(enabled=True)
+        if not stickers:
+            logger.warning("STICKER PROMOTION SKIP bot=%s reason=no_enabled_stickers", bot_name)
             record_operation(
-                "promotion_sticker",
+                "send_sticker",
                 (time.monotonic() - cycle_start) * 1000,
                 False,
                 "promotion",
-                {"target": target, "error": "missing_asset_configuration"},
+                {"bot": bot_name, "error": "no_stickers_available"},
+            )
+            return False
+        sticker = random.choice(stickers)
+        file_id = sticker.get("file_id")
+        if not file_id:
+            logger.warning("STICKER PROMOTION SKIP bot=%s reason=missing_file_id sticker_id=%s", bot_name, sticker.get("_id"))
+            record_operation(
+                "send_sticker",
+                (time.monotonic() - cycle_start) * 1000,
+                False,
+                "promotion",
+                {"bot": bot_name, "error": "missing_file_id"},
             )
             return False
         try:
             await self.telegram.ensure_connected()
-            target_entity = await self.telegram.resolve_entity(target)
-            asset_entity = await self.telegram.resolve_entity(asset_channel)
             client = self.telegram._ensure_client()
-            logger.info(
-                "ASSET STICKER FORWARD START target=%s asset_channel=%s message_id=%s",
-                target,
-                asset_channel,
-                sticker_message_id,
-            )
-            await client.forward_messages(target_entity, sticker_message_id, from_peer=asset_entity)
-            logger.info(
-                "ASSET STICKER FORWARD SUCCESS target=%s asset_channel=%s message_id=%s",
-                target,
-                asset_channel,
-                sticker_message_id,
-            )
-            logger.warning(
-                "AFTER _send_asset_sticker(): target=%s asset_channel=%s message_id=%s",
-                target,
-                asset_channel,
-                sticker_message_id,
-            )
+            # Send sticker to self/storage
+            logger.info("STICKER SEND START bot=%s sticker_id=%s file_id=%s", bot_name, sticker.get("_id"), file_id[:20])
+            await client.send_file("me", file_id)
+            logger.info("STICKER SEND SUCCESS bot=%s sticker_id=%s", bot_name, sticker.get("_id"))
             self.telegram.last_send_success = True
             self.telegram.last_error = None
             self.telegram.last_send_ms = (time.monotonic() - cycle_start) * 1000
             record_operation(
-                "promotion_sticker",
+                "send_sticker",
                 self.telegram.last_send_ms,
                 True,
                 "promotion",
-                {"target": target, "asset_channel": asset_channel, "message_id": sticker_message_id},
+                {"bot": bot_name, "sticker_id": str(sticker.get("_id"))},
             )
             metrics = CURRENT_CYCLE.get()
             if metrics is not None:
                 metrics.messages_sent += 1
             return True
         except Exception as exc:
-            logger.exception(
-                "ASSET STICKER FORWARD FAILED target=%s asset_channel=%s message_id=%s error=%s",
-                target,
-                asset_channel,
-                sticker_message_id,
-                exc,
-            )
+            logger.exception("STICKER SEND FAILED bot=%s sticker_id=%s error=%s", bot_name, sticker.get("_id"), exc)
             self.telegram.last_send_success = False
             self.telegram.last_error = str(exc)
             self.telegram.last_send_ms = (time.monotonic() - cycle_start) * 1000
             record_operation(
-                "promotion_sticker",
+                "send_sticker",
                 self.telegram.last_send_ms,
                 False,
                 "promotion",
-                {"target": target, "asset_channel": asset_channel, "message_id": sticker_message_id, "error": str(exc)},
+                {"bot": bot_name, "error": str(exc)},
             )
             return False
-
-    async def _send_promotion_sticker(self, target: str) -> bool:
-        asset_sent = await self._send_asset_sticker(target)
-        return asset_sent
 
     async def _send_group_promotion(self, group: dict, message: dict) -> None:
         mode = self._promotion_mode()
@@ -1043,9 +1013,12 @@ class AutomationService:
                 enabled_groups_count = len(groups)
                 self._log_timing("DB READ list_enabled_groups", db_groups_start, timings)
                 db_messages_start = time.monotonic()
-                messages = await alist_messages(active_only=True)
+                bot_messages = await alist_bot_messages(enabled=True)
+                group_messages = await alist_group_messages(enabled=True)
+                stickers = await alist_stickers(enabled=True)
+                messages = bot_messages + group_messages + stickers
                 active_messages_count = len(messages)
-                self._log_timing("DB READ list_messages", db_messages_start, timings)
+                self._log_timing("DB READ list_message_collections", db_messages_start, timings)
                 mongo_total_ms = sum(elapsed for label, elapsed in timings if label.startswith("DB READ"))
                 logger.info(
                     "WORKER MONGO TOTAL elapsed_ms=%.2f enabled_bots=%s enabled_groups=%s active_messages=%s",
@@ -1540,7 +1513,7 @@ def get_client() -> TelegramClient:
 def get_worker_status() -> dict[str, object]:
     enabled_bots = list_enabled_bots()
     enabled_groups = list_enabled_groups()
-    active_messages = list_messages(active_only=True)
+    active_messages = list_bot_messages(enabled=True) + list_group_messages(enabled=True) + list_stickers(enabled=True)
     return {
         "worker_running": automation_service.is_running,
         "worker_paused": automation_service.is_paused,

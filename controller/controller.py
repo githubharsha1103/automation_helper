@@ -22,46 +22,51 @@ from automation.worker import automation_service, telegram_service
 from storage.db import (
     add_bot,
     add_group,
-    add_category_message,
-    add_promotion_sticker,
     add_message,
+    add_bot_message,
+    add_group_message,
+    add_sticker,
     clear_group_special_message,
-    delete_category_message,
     delete_bot,
     delete_group,
     delete_message,
+    delete_bot_message,
+    delete_group_message,
+    delete_sticker,
     get_bot,
     get_bots,
     get_group,
-    get_category_message,
     get_bot_settings,
     get_bot_runtime,
     get_message,
     get_setting,
-    get_promotion_asset_channel,
-    get_promotion_sticker_message_id,
     is_bot_enabled,
     is_bot_paused,
     list_groups,
     list_category_messages,
-    list_messages,
+    list_bot_messages,
+    list_group_messages,
+    list_stickers,
     get_message_performance,
     set_category_message_enabled,
     is_category_message_enabled,
     set_group_special_message,
-    set_promotion_asset_channel,
-    set_promotion_sticker_message_id,
-    update_category_message,
+    toggle_bot_message,
+    toggle_group_message,
+    toggle_sticker,
+    update_bot_message,
+    update_group_message,
+    update_bot_runtime,
+    increment_bot_runtime,
     set_bot_enabled,
     set_bot_paused,
     set_group_status,
     set_bot_settings,
-    update_bot_runtime,
-    increment_bot_runtime,
     set_setting,
     update_group_delay,
     update_group_name,
     update_group_time_window,
+    _invalidate_runtime_caches,
 )
 
 load_dotenv()
@@ -90,9 +95,6 @@ EDIT_BOT_MATCH_TRIGGERS = 509
 EDIT_BOT_SECURITY_TRIGGERS = 510
 EDIT_BOT_AFTER_MATCH_DELAY = 511
 EDIT_BOT_AFTER_CHAT_DELAY = 512
-SET_PROMOTION_STICKER = 600
-SET_PROMOTION_ASSET_CHANNEL = 601
-TEST_PROMOTION_STICKER = 602
 SET_BOT_PROMOTION_MODE = 700
 SET_BOT_CONVERSATION_SEQUENCE = 701
 SET_BOT_NO_RESPONSE_TIMEOUT = 702
@@ -100,6 +102,9 @@ SET_BOT_CONV_DELAY_MIN = 703
 SET_BOT_CONV_DELAY_MAX = 704
 SET_BOT_PROMO_DELAY_MIN = 705
 SET_BOT_PROMO_DELAY_MAX = 706
+ADD_BOT_MESSAGE = 750
+ADD_GROUP_MESSAGE = 751
+ADD_STICKER = 752
 
 
 def _env(name: str, default: str = "") -> str:
@@ -399,9 +404,7 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
     runtime_state = "RUNNING" if enabled and not paused else "IDLE"
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
-    promotion_mode = get_setting("promotion_mode", "message") or "message"
-    promotion_asset_channel = get_promotion_asset_channel()
-    promotion_sticker_message_id = get_promotion_sticker_message_id()
+    promotion_mode = get_bot_settings(bot_name).get("promotion_mode", "MESSAGE")
     runtime = get_bot_runtime(bot_name)
     conversations_started = int(runtime.get("conversations_started", 0) or 0)
     partner_replies = int(runtime.get("partner_replies", 0) or 0)
@@ -409,11 +412,13 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
     error_count = int(runtime.get("error_count", 0) or 0)
     reply_rate = round(partner_replies / conversations_started, 4) if conversations_started else 0.0
     promotion_coverage = round(promotions_sent / conversations_started, 4) if conversations_started else 0.0
-    sticker_configured = "Yes" if promotion_sticker_message_id else "No"
+    enabled_bot_messages = len(list_bot_messages(enabled_only=True))
+    enabled_group_messages = len(list_group_messages(enabled_only=True))
+    enabled_stickers = len(list_stickers(enabled_only=True))
     mode_label = {
-        "message": "Message",
-        "sticker": "Sticker",
-        "both": "Message + Sticker",
+        "MESSAGE": "Message",
+        "STICKER": "Sticker",
+        "BOTH": "Message + Sticker",
     }.get(str(promotion_mode), "Message")
     return (
         f"Bot: {bot_name}\n"
@@ -430,9 +435,9 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
         f"Reply Rate: {reply_rate}\n"
         f"Promotion Coverage: {promotion_coverage}\n"
         f"Promotion Mode: {mode_label}\n"
-        f"Asset Channel Configured: {'Yes' if promotion_asset_channel else 'No'}\n"
-        f"Sticker Message ID: {promotion_sticker_message_id or 'N/A'}\n"
-        f"Sticker Configured: {sticker_configured}\n"
+        f"Enabled Bot Messages: {enabled_bot_messages}\n"
+        f"Enabled Group Messages: {enabled_group_messages}\n"
+        f"Enabled Stickers: {enabled_stickers}\n"
         f"Paused: {'Yes' if paused else 'No'}\n"
         f"Start cmd: {bot.get('start_cmd', '-')}\n"
         f"Stop cmd: {bot.get('stop_cmd', '-')}\n"
@@ -548,8 +553,9 @@ def _state_name(state: int) -> str:
         EDIT_GROUP_DELAY: "EDIT_GROUP_DELAY",
         EDIT_GROUP_TIME_START: "EDIT_GROUP_TIME_START",
         EDIT_GROUP_TIME_END: "EDIT_GROUP_TIME_END",
-        SET_PROMOTION_ASSET_CHANNEL: "SET_PROMOTION_ASSET_CHANNEL",
-        SET_PROMOTION_STICKER: "SET_PROMOTION_STICKER",
+        ADD_BOT_MESSAGE: "ADD_BOT_MESSAGE",
+        ADD_GROUP_MESSAGE: "ADD_GROUP_MESSAGE",
+        ADD_STICKER: "ADD_STICKER",
     }
     return state_names.get(state, f"STATE_{state}")
 
@@ -644,25 +650,25 @@ async def _render_bot_settings(update: Update, bot_name: str) -> None:
 def _automation_status_text() -> str:
     state = get_setting("automation_state", "IDLE")
     enabled_groups = len(list_groups(enabled_only=True))
-    messages_count = len(list_messages())
+    bot_messages_count = len(list_bot_messages(enabled_only=True))
+    group_messages_count = len(list_group_messages(enabled_only=True))
+    stickers_count = len(list_stickers(enabled_only=True))
     active_bots = sum(1 for bot in get_bots().values() if bool(bot.get("enabled", False)))
     last_execution_time = get_setting("automation_last_execution_time", "Never")
-    promotion_mode = get_setting("promotion_mode", "message") or "message"
-    promotion_asset_channel = get_promotion_asset_channel()
-    promotion_sticker_message_id = get_promotion_sticker_message_id()
+    promotion_mode = get_setting("promotion_mode", "MESSAGE") or "MESSAGE"
     mode_label = {
-        "message": "Message",
-        "sticker": "Sticker",
-        "both": "Message + Sticker",
+        "MESSAGE": "Message",
+        "STICKER": "Sticker",
+        "BOTH": "Message + Sticker",
     }.get(str(promotion_mode), "Message")
     return (
         f"Automation is {'running' if state == 'RUNNING' else 'paused' if state == 'PAUSED' else 'idle'}\n"
         f"Runtime state: {state}\n"
         f"Promotion Mode: {mode_label}\n"
-        f"Asset Channel Configured: {'Yes' if promotion_asset_channel else 'No'}\n"
-        f"Sticker Message ID: {promotion_sticker_message_id or 'N/A'}\n"
+        f"Enabled Bot Messages: {bot_messages_count}\n"
+        f"Enabled Group Messages: {group_messages_count}\n"
+        f"Enabled Stickers: {stickers_count}\n"
         f"Enabled groups: {enabled_groups}\n"
-        f"Active messages: {messages_count}\n"
         f"Active bot count: {active_bots}\n"
         f"Last execution time: {last_execution_time}"
     )
@@ -670,22 +676,17 @@ def _automation_status_text() -> str:
 
 def _promotion_mode_label(mode: str | None) -> str:
     return {
-        "message": "Message",
-        "sticker": "Sticker",
-        "both": "Message + Sticker",
-    }.get(str(mode or "message"), "Message")
+        "MESSAGE": "Message",
+        "STICKER": "Sticker",
+        "BOTH": "Message + Sticker",
+    }.get(str(mode or "MESSAGE"), "Message")
 
 
 def _promotion_settings_text() -> str:
-    mode = get_setting("promotion_mode", "message") or "message"
-    asset_channel = get_promotion_asset_channel()
-    sticker_message_id = get_promotion_sticker_message_id()
+    mode = get_setting("promotion_mode", "MESSAGE") or "MESSAGE"
     return (
         "Promotion Settings\n\n"
-        f"Current Mode: {mode}\n"
-        f"Asset Channel Configured: {'Yes' if asset_channel else 'No'}\n"
-        f"Asset Channel ID: {asset_channel or 'N/A'}\n"
-        f"Sticker Message ID: {sticker_message_id or 'N/A'}\n\n"
+        f"Current Mode: {mode}\n\n"
         "Choose an option."
     )
 
@@ -694,17 +695,16 @@ def _promotion_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Promotion Mode", callback_data="promotion:mode")],
-            [InlineKeyboardButton("Set Asset Channel", callback_data="promotion:set_channel")],
-            [InlineKeyboardButton("Set Sticker Message ID", callback_data="promotion:set_message_id")],
-            [InlineKeyboardButton("View Current Asset Settings", callback_data="promotion:view_asset")],
-            [InlineKeyboardButton("Test Promotion Sticker", callback_data="promotion:test_sticker")],
+            [InlineKeyboardButton("Add Bot Message", callback_data="promotion:add_bot_message")],
+            [InlineKeyboardButton("Add Group Message", callback_data="promotion:add_group_message")],
+            [InlineKeyboardButton("Add Sticker", callback_data="promotion:add_sticker")],
             [InlineKeyboardButton("Back", callback_data="menu:automation")],
         ]
     )
 
 
 def _promotion_mode_text() -> str:
-    mode = get_setting("promotion_mode", "message") or "message"
+    mode = get_setting("promotion_mode", "MESSAGE") or "MESSAGE"
     return (
         "Promotion Mode\n\n"
         f"Current Mode: {mode}\n\n"
@@ -715,9 +715,9 @@ def _promotion_mode_text() -> str:
 def _promotion_mode_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Message", callback_data="promotion:mode:message")],
-            [InlineKeyboardButton("Sticker", callback_data="promotion:mode:sticker")],
-            [InlineKeyboardButton("Message + Sticker", callback_data="promotion:mode:both")],
+            [InlineKeyboardButton("Message", callback_data="promotion:mode:MESSAGE")],
+            [InlineKeyboardButton("Sticker", callback_data="promotion:mode:STICKER")],
+            [InlineKeyboardButton("Message + Sticker", callback_data="promotion:mode:BOTH")],
             [InlineKeyboardButton("Back", callback_data="promotion:settings")],
         ]
     )
@@ -774,107 +774,6 @@ async def promotion_mode_set_callback(update: Update, context: ContextTypes.DEFA
     mode = query.data.split(":", 2)[2]
     set_setting("promotion_mode", mode)
     await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
-
-
-async def promotion_asset_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await _safe_callback_answer(query)
-    context.user_data.clear()
-    context.user_data["promotion_asset_channel_flow"] = True
-    await _send_or_edit(
-        update,
-        "Send the private Telegram channel @username or numeric channel id to use as the promotion asset repository.\n\nPress Cancel to abort.",
-        _cancel_menu(),
-    )
-
-
-async def promotion_asset_channel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _safe_callback_answer(update.callback_query)
-    context.user_data.clear()
-    context.user_data["promotion_asset_channel_flow"] = True
-    await _send_or_edit(
-        update,
-        "Send the private Telegram channel @username or numeric channel id to use as the promotion asset repository.\n\nPress Cancel to abort.",
-        _cancel_menu(),
-    )
-    return SET_PROMOTION_ASSET_CHANNEL
-
-
-async def promotion_asset_channel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.message.text:
-        await update.message.reply_text("Please send a channel username or channel id.")
-        return SET_PROMOTION_ASSET_CHANNEL
-    raw_value = update.message.text.strip()
-    if not raw_value:
-        await update.message.reply_text("Channel value cannot be empty.")
-        return SET_PROMOTION_ASSET_CHANNEL
-    set_promotion_asset_channel(raw_value)
-    context.user_data.clear()
-    await update.message.reply_text("Promotion asset channel updated successfully.")
-    await update.message.reply_text(_promotion_settings_text(), reply_markup=_promotion_settings_keyboard())
-    return ConversationHandler.END
-
-
-async def promotion_asset_channel_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _audit_state_handler(update, context, SET_PROMOTION_ASSET_CHANNEL, promotion_asset_channel_handler)
-
-
-async def promotion_sticker_message_id_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _safe_callback_answer(update.callback_query)
-    context.user_data.clear()
-    context.user_data["promotion_sticker_message_id_flow"] = True
-    await _send_or_edit(
-        update,
-        "Send the Telegram message ID of the sticker stored in your asset channel.",
-        _cancel_menu(),
-    )
-    return SET_PROMOTION_STICKER
-
-
-async def promotion_sticker_message_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.message.text:
-        await update.message.reply_text("Please send a numeric message ID.")
-        return SET_PROMOTION_STICKER
-    raw_value = update.message.text.strip()
-    try:
-        message_id = int(raw_value)
-    except ValueError:
-        await update.message.reply_text("Message ID must be a number.")
-        return SET_PROMOTION_STICKER
-    set_promotion_sticker_message_id(message_id)
-    context.user_data.clear()
-    await update.message.reply_text("Sticker message ID updated successfully.")
-    await update.message.reply_text(_promotion_settings_text(), reply_markup=_promotion_settings_keyboard())
-    return ConversationHandler.END
-
-
-async def promotion_sticker_message_id_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _audit_state_handler(update, context, SET_PROMOTION_STICKER, promotion_sticker_message_id_handler)
-
-
-async def promotion_asset_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _safe_callback_answer(update.callback_query)
-    await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
-
-
-async def promotion_test_sticker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _safe_callback_answer(update.callback_query)
-    asset_channel = get_promotion_asset_channel()
-    sticker_message_id = get_promotion_sticker_message_id()
-    if not asset_channel or not sticker_message_id:
-        await _send_or_edit(update, "❌ Sticker Forward Test Failed Asset channel or sticker message ID is missing.", _promotion_settings_keyboard())
-        return
-    try:
-        await telegram_service.ensure_connected()
-        client = telegram_service._ensure_client()
-        asset_entity = await telegram_service.resolve_entity(str(asset_channel))
-        logger.info("ASSET STICKER FORWARD START channel_id=%s message_id=%s target=me", asset_channel, sticker_message_id)
-        await client.forward_messages("me", int(sticker_message_id), from_peer=asset_entity)
-        logger.info("ASSET STICKER FORWARD SUCCESS channel_id=%s message_id=%s target=me", asset_channel, sticker_message_id)
-        await _send_or_edit(update, "✅ Sticker Forward Test Successful", _promotion_settings_keyboard())
-    except Exception as exc:
-        logger.exception("ASSET STICKER FORWARD FAILED channel_id=%s message_id=%s target=me error=%s", asset_channel, sticker_message_id, exc)
-        await _send_or_edit(update, f"❌ Sticker Forward Test Failed {exc}", _promotion_settings_keyboard())
 
 
 async def promotion_settings_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1981,14 +1880,36 @@ async def bypass_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await _send_or_edit(update, f"Resumed {bot_name}", _main_menu())
 
 
+async def add_bot_message_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for adding a bot message"""
+    await _safe_callback_answer(update.callback_query)
+    context.user_data.clear()
+    await _send_or_edit(update, "Send the bot message text:", _cancel_menu())
+    return ADD_BOT_MESSAGE
+
+
+async def add_group_message_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for adding a group message"""
+    await _safe_callback_answer(update.callback_query)
+    context.user_data.clear()
+    await _send_or_edit(update, "Send the group message text:", _cancel_menu())
+    return ADD_GROUP_MESSAGE
+
+
+async def add_sticker_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for adding a sticker"""
+    await _safe_callback_answer(update.callback_query)
+    context.user_data.clear()
+    await _send_or_edit(update, "Send the sticker to add:", _cancel_menu())
+    return ADD_STICKER
+
+
 async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.callback_query:
         await _safe_callback_answer(update.callback_query)
     bot_name = context.user_data.get("edit_bot_name")
     group_id = context.user_data.get("edit_group_id")
     group_back_view = context.user_data.get("group_back_view")
-    promotion_asset_channel_flow = context.user_data.get("promotion_asset_channel_flow")
-    promotion_sticker_message_id_flow = context.user_data.get("promotion_sticker_message_id_flow")
     context.user_data.clear()
     if bot_name:
         await _render_bot_settings(update, bot_name)
@@ -2001,11 +1922,88 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if group:
             await _render_group_details(update, group_id)
             return ConversationHandler.END
-    if promotion_asset_channel_flow or promotion_sticker_message_id_flow:
-        await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
-        return ConversationHandler.END
-    await _send_or_edit(update, "Cancelled.", _main_menu())
+    await _send_or_edit(update, _automation_status_text(), _automation_menu())
     return ConversationHandler.END
+
+
+async def add_bot_message_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handler for adding a bot message text"""
+    if not update.message or not update.message.text:
+        await update.message.reply_text("Please send a message text.")
+        return ADD_BOT_MESSAGE
+    message_text = update.message.text.strip()
+    if not message_text:
+        await update.message.reply_text("Message text cannot be empty.")
+        return ADD_BOT_MESSAGE
+    try:
+        message_id = add_bot_message(message_text)
+        _invalidate_runtime_caches("messages")
+        context.user_data.clear()
+        await update.message.reply_text(f"✅ Bot message added successfully (ID: {message_id})")
+        await update.message.reply_text(_automation_status_text(), reply_markup=_automation_menu())
+        return ConversationHandler.END
+    except Exception as exc:
+        logger.exception("ADD BOT MESSAGE FAILED")
+        await update.message.reply_text(f"❌ Failed to add bot message: {exc}")
+        return ADD_BOT_MESSAGE
+
+
+async def add_group_message_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handler for adding a group message text"""
+    if not update.message or not update.message.text:
+        await update.message.reply_text("Please send a message text.")
+        return ADD_GROUP_MESSAGE
+    message_text = update.message.text.strip()
+    if not message_text:
+        await update.message.reply_text("Message text cannot be empty.")
+        return ADD_GROUP_MESSAGE
+    try:
+        message_id = add_group_message(message_text)
+        _invalidate_runtime_caches("messages")
+        context.user_data.clear()
+        await update.message.reply_text(f"✅ Group message added successfully (ID: {message_id})")
+        await update.message.reply_text(_automation_status_text(), reply_markup=_automation_menu())
+        return ConversationHandler.END
+    except Exception as exc:
+        logger.exception("ADD GROUP MESSAGE FAILED")
+        await update.message.reply_text(f"❌ Failed to add group message: {exc}")
+        return ADD_GROUP_MESSAGE
+
+
+async def add_sticker_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handler for adding a sticker"""
+    if not update.message:
+        await update.message.reply_text("Please send a sticker.")
+        return ADD_STICKER
+    
+    if update.message.sticker:
+        # User sent a sticker
+        sticker = update.message.sticker
+        file_id = sticker.file_id
+        emoji = getattr(sticker, "emoji", None)
+        try:
+            sticker_id = add_sticker(file_id, emoji)
+            _invalidate_runtime_caches("messages")
+            context.user_data.clear()
+            await update.message.reply_text(f"✅ Sticker added successfully (ID: {sticker_id})")
+            await update.message.reply_text(_automation_status_text(), reply_markup=_automation_menu())
+            return ConversationHandler.END
+        except Exception as exc:
+            logger.exception("ADD STICKER FAILED")
+            await update.message.reply_text(f"❌ Failed to add sticker: {exc}")
+            return ADD_STICKER
+    elif update.message.text:
+        # User might have sent text instead
+        await update.message.reply_text("Please send a sticker, not text.")
+        return ADD_STICKER
+    else:
+        await update.message.reply_text("Please send a sticker.")
+        return ADD_STICKER
+
+
+async def promotion_settings_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _safe_callback_answer(update.callback_query)
+    await _send_or_edit(update, _automation_status_text(), _automation_menu())
 
 
 def _conversation_state_map() -> list[tuple[int, str]]:
@@ -2037,8 +2035,9 @@ def _conversation_state_map() -> list[tuple[int, str]]:
         (SET_GROUP_MESSAGE, "group_set_message_handler_audited"),
         (EDIT_GROUP_TIME_START, "group_time_start_handler_audited"),
         (EDIT_GROUP_TIME_END, "group_time_end_handler_audited"),
-        (SET_PROMOTION_ASSET_CHANNEL, "promotion_asset_channel_handler_audited"),
-        (SET_PROMOTION_STICKER, "promotion_sticker_message_id_handler_audited"),
+        (ADD_BOT_MESSAGE, "add_bot_message_handler_audited"),
+        (ADD_GROUP_MESSAGE, "add_group_message_handler_audited"),
+        (ADD_STICKER, "add_sticker_handler_audited"),
     ]
 
 
@@ -2060,9 +2059,6 @@ def _log_conversation_audit() -> None:
         EDIT_BOT_SECURITY_TRIGGERS,
         EDIT_BOT_AFTER_MATCH_DELAY,
         EDIT_BOT_AFTER_CHAT_DELAY,
-        SET_PROMOTION_STICKER,
-        SET_PROMOTION_ASSET_CHANNEL,
-        TEST_PROMOTION_STICKER,
         SET_BOT_PROMOTION_MODE,
         SET_BOT_CONVERSATION_SEQUENCE,
         SET_BOT_NO_RESPONSE_TIMEOUT,
@@ -2075,6 +2071,9 @@ def _log_conversation_audit() -> None:
         SET_GROUP_MESSAGE,
         EDIT_GROUP_TIME_START,
         EDIT_GROUP_TIME_END,
+        ADD_BOT_MESSAGE,
+        ADD_GROUP_MESSAGE,
+        ADD_STICKER,
     }
     logger.info("CONVERSATION STATE MAP START")
     for state_id, handler_name in state_map:
@@ -2103,6 +2102,9 @@ async def start_controller() -> None:
         entry_points=[
             CallbackQueryHandler(add_group_entry, pattern="^group:add$"),
             CallbackQueryHandler(add_message_entry, pattern="^message:add$"),
+            CallbackQueryHandler(add_bot_message_entry, pattern="^promotion:add_bot_message$"),
+            CallbackQueryHandler(add_group_message_entry, pattern="^promotion:add_group_message$"),
+            CallbackQueryHandler(add_sticker_entry, pattern="^promotion:add_sticker$"),
             CallbackQueryHandler(add_bot_entry, pattern="^bot:add$"),
             CallbackQueryHandler(conversational_message_callback, pattern="^msg:conversational:add$|^msg:conversational:edit:"),
             CallbackQueryHandler(group_edit_name_entry, pattern="^group:edit_name:"),
@@ -2126,10 +2128,6 @@ async def start_controller() -> None:
             CallbackQueryHandler(promotion_settings_callback, pattern="^promotion:settings$"),
             CallbackQueryHandler(promotion_mode_callback, pattern="^promotion:mode$"),
             CallbackQueryHandler(promotion_mode_set_callback, pattern="^promotion:mode:"),
-            CallbackQueryHandler(promotion_asset_channel_entry, pattern="^promotion:set_channel$"),
-            CallbackQueryHandler(promotion_asset_view_callback, pattern="^promotion:view_asset$"),
-            CallbackQueryHandler(promotion_test_sticker_callback, pattern="^promotion:test_sticker$"),
-            CallbackQueryHandler(promotion_sticker_message_id_entry, pattern="^promotion:set_message_id$"),
         ],
         states={
             ADD_GROUP_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_chat_id_audited)],
@@ -2161,8 +2159,9 @@ async def start_controller() -> None:
             SET_GROUP_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_set_message_handler_audited)],
             EDIT_GROUP_TIME_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_start_handler_audited)],
             EDIT_GROUP_TIME_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_time_end_handler_audited)],
-            SET_PROMOTION_ASSET_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, promotion_asset_channel_handler_audited)],
-            SET_PROMOTION_STICKER: [MessageHandler(filters.TEXT & ~filters.COMMAND, promotion_sticker_message_id_handler_audited)],
+            ADD_BOT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_bot_message_handler_audited)],
+            ADD_GROUP_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_group_message_handler_audited)],
+            ADD_STICKER: [MessageHandler(filters.Sticker | (filters.TEXT & ~filters.COMMAND), add_sticker_handler_audited)],
         },
         fallbacks=[
             CallbackQueryHandler(cancel_callback, pattern="^nav:cancel$"),
