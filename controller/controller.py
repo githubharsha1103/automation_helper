@@ -2371,7 +2371,6 @@ async def start_controller() -> None:
     _application.add_handler(CallbackQueryHandler(automation_stop, pattern="^automation:stop$"))
     _application.add_handler(CallbackQueryHandler(automation_pause, pattern="^automation:pause$"))
     _application.add_handler(CallbackQueryHandler(automation_resume, pattern="^automation:resume$"))
-    _application.add_handler(CallbackQueryHandler(message_category_callback, pattern="^msg:[a-z_]+:"))
     _application.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
 
     try:
