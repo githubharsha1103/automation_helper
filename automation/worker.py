@@ -697,38 +697,41 @@ class AutomationService:
         mode = str(get_setting("promotion_mode", "MESSAGE") or "MESSAGE").strip().upper()
         return mode if mode in {"MESSAGE", "STICKER", "BOTH"} else "MESSAGE"
 
-    async def _send_promotion_sticker(self, bot_name: str) -> bool:
-        """Send sticker directly from promotion_stickers collection using file_id"""
+    async def _send_promotion_sticker(self, target: str) -> bool:
+        """Send sticker directly from promotion_stickers collection using file_id.
+        target can be a bot username or group_id."""
         cycle_start = time.monotonic()
         stickers = list_stickers(enabled_only=True)
         if not stickers:
-            logger.warning("STICKER PROMOTION SKIP bot=%s reason=no_enabled_stickers", bot_name)
+            logger.warning("STICKER PROMOTION SKIP target=%s reason=no_enabled_stickers", target)
             record_operation(
                 "send_sticker",
                 (time.monotonic() - cycle_start) * 1000,
                 False,
                 "promotion",
-                {"bot": bot_name, "error": "no_stickers_available"},
+                {"target": target, "error": "no_stickers_available"},
             )
             return False
         sticker = random.choice(stickers)
         file_id = sticker.get("file_id")
         if not file_id:
-            logger.warning("STICKER PROMOTION SKIP bot=%s reason=missing_file_id sticker_id=%s", bot_name, sticker.get("id"))
+            logger.warning("STICKER PROMOTION SKIP target=%s reason=missing_file_id sticker_id=%s", target, sticker.get("id"))
             record_operation(
                 "send_sticker",
                 (time.monotonic() - cycle_start) * 1000,
                 False,
                 "promotion",
-                {"bot": bot_name, "error": "missing_file_id"},
+                {"target": target, "error": "missing_file_id"},
             )
             return False
         try:
             await self.telegram.ensure_connected()
             client = self.telegram._ensure_client()
-            logger.info("STICKER SEND START bot=%s sticker_id=%s file_id=%s", bot_name, sticker.get("id"), file_id[:20])
-            await client.send_file(bot_name, file_id)
-            logger.info("STICKER SEND SUCCESS bot=%s sticker_id=%s", bot_name, sticker.get("id"))
+            logger.debug("STICKER_ENTITY_RESOLVE target=%s", target)
+            entity = await self.telegram.resolve_entity(target)
+            logger.info("STICKER_SEND_ATTEMPT target=%s sticker_id=%s file_id=%s entity_type=%s entity_id=%s", target, sticker.get("id"), file_id[:30] if file_id else None, type(entity).__name__, getattr(entity, "id", None))
+            result = await client.send_file(entity, file_id)
+            logger.info("STICKER_SEND_SUCCESS target=%s sticker_id=%s result_type=%s", target, sticker.get("id"), type(result).__name__)
             self.telegram.last_send_success = True
             self.telegram.last_error = None
             self.telegram.last_send_ms = (time.monotonic() - cycle_start) * 1000
@@ -737,14 +740,14 @@ class AutomationService:
                 self.telegram.last_send_ms,
                 True,
                 "promotion",
-                {"bot": bot_name, "sticker_id": str(sticker.get("id"))},
+                {"target": target, "sticker_id": str(sticker.get("id"))},
             )
             metrics = CURRENT_CYCLE.get()
             if metrics is not None:
                 metrics.messages_sent += 1
             return True
         except Exception as exc:
-            logger.exception("STICKER SEND FAILED bot=%s sticker_id=%s error=%s", bot_name, sticker.get("id"), exc)
+            logger.exception("STICKER_SEND_FAILURE target=%s sticker_id=%s file_id=%s error=%s", target, sticker.get("id"), file_id, exc)
             self.telegram.last_send_success = False
             self.telegram.last_error = str(exc)
             self.telegram.last_send_ms = (time.monotonic() - cycle_start) * 1000
@@ -753,7 +756,7 @@ class AutomationService:
                 self.telegram.last_send_ms,
                 False,
                 "promotion",
-                {"bot": bot_name, "error": str(exc)},
+                {"target": target, "error": str(exc)},
             )
             return False
 
@@ -772,7 +775,7 @@ class AutomationService:
             group.get("next_run_at"),
             group.get("cooldown_until"),
             mode,
-message.get("id"),
+            message.get("id"),
         )
         if mode in {"STICKER", "BOTH"}:
             sticker_sent = await self._send_promotion_sticker(group["group_id"])

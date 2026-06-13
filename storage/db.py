@@ -447,6 +447,8 @@ def list_stickers(enabled_only: bool = True) -> list[dict[str, Any]]:
     for doc in docs:
         sticker = {k: v for k, v in doc.items() if k not in ("_id",)}
         sticker["id"] = doc.get("id", doc["_id"])
+        if "file_id" not in sticker and "media_file_id" in sticker:
+            sticker["file_id"] = sticker["media_file_id"]
         stickers.append(sticker)
     return stickers
 
