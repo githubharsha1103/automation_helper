@@ -1079,7 +1079,7 @@ async def bot_after_chat_delay_handler(update: Update, context: ContextTypes.DEF
     context.user_data.clear()
     await update.message.reply_text(
         _bot_details_text(bot_name, saved_config),
-        reply_markup=_bot_details_keyboard(bot_name, bool(bot.get("enabled", False))),
+        reply_markup=_bot_details_keyboard(bot_name, bool(saved_config.get("enabled", False))),
     )
     return ConversationHandler.END
 
