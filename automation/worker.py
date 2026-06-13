@@ -647,7 +647,8 @@ class AutomationService:
             no_response_timeout,
         )
         try:
-            if not is_bot_enabled(bot_name, False):
+            bot = get_bot(bot_name)
+            if not bot or not bot.get("enabled", True):
                 logger.warning("BOT CONVERSATION ABORTED bot=%s reason=disabled", bot_name)
                 self._set_bot_runtime(bot_name, "CLEANUP")
                 return
@@ -1340,7 +1341,7 @@ async def start_worker() -> None:
             metrics.bots = len(bots)
             for bot_name, config in bots.items():
                 start_cmd = _normalize_command(config.get("start_cmd"))
-                if is_bot_enabled(bot_name, False) and start_cmd:
+                if bots[bot_name].get("enabled", True) and start_cmd:
                     try:
                         await client.send_message(bot_name, start_cmd)
                         metrics.messages_sent += 1
