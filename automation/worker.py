@@ -3,7 +3,6 @@ import logging
 import os
 import random
 import time
-from collections.abc import Iterable
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -430,36 +429,6 @@ class AutomationService:
         return datetime.now(timezone.utc)
 
     @staticmethod
-    def _parse_sequence(raw_sequence: object) -> list[int]:
-        if isinstance(raw_sequence, str):
-            items: Iterable[object] = [item.strip() for item in raw_sequence.split(",")]
-        elif isinstance(raw_sequence, Iterable):
-            items = raw_sequence
-        else:
-            items = []
-        result: list[int] = []
-        for item in items:
-            try:
-                value = int(str(item).strip())
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                result.append(value)
-        return result
-
-    @staticmethod
-    def _delay_bounds(settings: dict[str, object], prefix: str, default_min: float = 0.0, default_max: float = 0.0) -> tuple[float, float]:
-        # Get min value
-        raw_min = settings.get(f"{prefix}_min", default_min)
-        min_value = AutomationService._safe_float(raw_min, default_min)
-        # Get max value
-        raw_max = settings.get(f"{prefix}_max", default_max)
-        max_value = AutomationService._safe_float(raw_max, default_max)
-        if max_value < min_value:
-            max_value = min_value
-        return min_value, max_value
-
-    @staticmethod
     def _safe_int(value: Any, default: int = 0) -> int:
         try:
             if isinstance(value, int):
@@ -545,23 +514,6 @@ class AutomationService:
             return None
         return random.choice(enabled_messages)
 
-    def _choose_conversation_message(self, message_ids: list[int]) -> dict[str, object] | None:
-        if not message_ids:
-            return None
-        indexed = {int(message["id"]): message for message in list_category_messages("conversational_messages", active_only=False) if bool(message.get("enabled", True))}
-        candidates = []
-        for message_id in message_ids:
-            message = indexed.get(message_id)
-            if not message:
-                continue
-            if not bool(message.get("enabled", True)):
-                logger.info("CONVERSATION MESSAGE SKIP reason=disabled message_id=%s", message_id)
-                continue
-            candidates.append(message)
-        if not candidates:
-            return None
-        return random.choice(candidates)
-
     async def _sleep_with_wakeup(self, seconds: float) -> bool:
         if seconds <= 0:
             return False
@@ -584,35 +536,6 @@ class AutomationService:
         except (TypeError, ValueError):
             return default
         return parsed if parsed > 0 else default
-
-    def _validate_bot_settings(self, bot_name: str, settings: dict[str, object]) -> tuple[list[int], float, tuple[float, float], tuple[float, float]]:
-        sequence = self._parse_sequence(settings.get("conversation_sequence", []))
-        no_response_timeout = self._safe_positive_float(settings.get("no_response_timeout", 0), 0.0)
-        conv_delay = self._delay_bounds(settings, "conversation_delay", 0.0, 0.0)
-        promo_delay = self._delay_bounds(settings, "promotion_delay", 0.0, 0.0)
-        cleaned_sequence: list[int] = []
-        if sequence:
-            indexed = {int(message["id"]): message for message in list_category_messages("conversational_messages", active_only=False) if bool(message.get("enabled", True))}
-            for message_id in sequence:
-                message = indexed.get(message_id) or get_category_message("conversational_messages", message_id)
-                if not message:
-                    logger.warning("BOT CONFIG CLEANUP bot=%s reason=missing_conversational_message message_id=%s", bot_name, message_id)
-                    continue
-                if not bool(message.get("enabled", True)):
-                    logger.warning("BOT CONFIG CLEANUP bot=%s reason=disabled_conversational_message message_id=%s", bot_name, message_id)
-                    continue
-                cleaned_sequence.append(int(message_id))
-        sequence = cleaned_sequence
-        logger.warning("BOT CONFIG CLEANED bot=%s sequence=%s", bot_name, sequence)
-        if not sequence:
-            logger.warning("BOT CONFIG INVALID bot=%s reason=empty_conversation_sequence settings=%s", bot_name, settings)
-        if no_response_timeout <= 0:
-            logger.warning("BOT CONFIG INVALID bot=%s reason=no_response_timeout_not_positive value=%s", bot_name, settings.get("no_response_timeout"))
-        if conv_delay[0] < 0 or conv_delay[1] < 0:
-            logger.warning("BOT CONFIG INVALID bot=%s reason=negative_conversation_delay min=%s max=%s", bot_name, conv_delay[0], conv_delay[1])
-        if promo_delay[0] < 0 or promo_delay[1] < 0:
-            logger.warning("BOT CONFIG INVALID bot=%s reason=negative_promotion_delay min=%s max=%s", bot_name, promo_delay[0], promo_delay[1])
-        return sequence, no_response_timeout, conv_delay, promo_delay
 
     async def _send_saved_payload_guarded(self, bot_name: str, message: dict, stage: str) -> bool:
         message_id = self._safe_int(message.get("id"), 0) if message else 0
@@ -713,7 +636,6 @@ class AutomationService:
             self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="no_bot_messages", last_failure_ts=self._utc_now().isoformat())
             return
         selected_message = random.choice(promotion_messages)
-        promotion_delay_min, promotion_delay_max = self._delay_bounds(settings, "promotion_delay", 0.0, 0.0)
         chosen_mode = mode
         if mode == "RANDOM":
             chosen_mode = random.choice(["MESSAGE", "STICKER", "BOTH"])
@@ -743,10 +665,6 @@ class AutomationService:
                 self._increment_bot_runtime(bot_name, error_count=1)
                 return
             self._record_message_send(bot_name, "bot_messages", selected_message_id)
-            if promotion_delay_max > 0:
-                delay = random.uniform(promotion_delay_min, promotion_delay_max)
-                logger.info("PROMOTION DELAY bot=%s seconds=%.2f", bot_name, delay)
-                await self._sleep_with_wakeup(delay)
             sticker_sent = await self._send_promotion_sticker(bot_name)
             if not sticker_sent:
                 logger.warning("PROMOTION BOTH STICKER FAILED bot=%s message_id=%s", bot_name, selected_message.get("id"))
@@ -760,12 +678,7 @@ class AutomationService:
         self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="invalid_promotion_mode", last_failure_ts=self._utc_now().isoformat())
 
     async def _run_bot_conversation(self, bot_name: str, settings: dict[str, object]) -> None:
-        sequence, no_response_timeout, (conversation_delay_min, conversation_delay_max), _ = self._validate_bot_settings(bot_name, settings)
-        if not sequence:
-            logger.warning("BOT CONVERSATION SKIP bot=%s reason=no_valid_sequence", bot_name)
-            await self._send_bot_promotion(bot_name, settings)
-            self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="no_valid_sequence", last_failure_ts=self._utc_now().isoformat())
-            return
+        no_response_timeout = self._safe_positive_float(settings.get("no_response_timeout", 0), 0.0)
         session = self._bot_session(bot_name)
         session["active"] = True
         session["engaged"] = False
@@ -775,48 +688,31 @@ class AutomationService:
         self._set_bot_runtime(bot_name, "STARTING")
         self._increment_bot_runtime(bot_name, conversations_started=1)
         logger.info(
-            "BOT CONVERSATION START bot=%s sequence=%s conv_delay=%s-%s timeout=%s",
+            "BOT CONVERSATION START bot=%s timeout=%s",
             bot_name,
-            sequence,
-            conversation_delay_min,
-            conversation_delay_max,
             no_response_timeout,
         )
         try:
-            for message_id in sequence:
-                if not is_bot_enabled(bot_name, False):
-                    logger.warning("BOT CONVERSATION ABORTED bot=%s reason=disabled mid_sequence", bot_name)
-                    self._set_bot_runtime(bot_name, "CLEANUP")
-                    break
-                if session.get("engaged"):
-                    logger.info("BOT CONVERSATION STOPPED bot=%s reason=engaged message_id=%s", bot_name, message_id)
-                    break
-                message = get_category_message("conversational_messages", message_id)
-                if not message:
-                    logger.warning("BOT CONVERSATION SKIP bot=%s reason=missing_message message_id=%s", bot_name, message_id)
-                    continue
-                if not bool(message.get("enabled", True)):
-                    logger.info("BOT CONVERSATION SKIP bot=%s reason=disabled_message message_id=%s", bot_name, message_id)
-                    continue
+            if not is_bot_enabled(bot_name, False):
+                logger.warning("BOT CONVERSATION ABORTED bot=%s reason=disabled", bot_name)
+                self._set_bot_runtime(bot_name, "CLEANUP")
+                return
+            if session.get("engaged"):
+                logger.info("BOT CONVERSATION STOPPED bot=%s reason=already_engaged", bot_name)
+                return
+            conversational_messages = list_category_messages("conversational_messages", active_only=True)
+            if not conversational_messages:
+                logger.info("BOT CONVERSATION SKIP bot=%s reason=no_conversational_messages", bot_name)
+            else:
+                message = random.choice(conversational_messages)
                 self._set_bot_runtime(bot_name, "SENDING_CONVERSATION")
+                message_id = self._safe_int(message.get("id"), 0)
                 sent = await self._send_saved_payload_guarded(bot_name, message, "conversation")
-                if not sent:
-                    logger.warning("BOT CONVERSATION CONTINUE bot=%s reason=send_failed message_id=%s", bot_name, message_id)
-                    continue
-                session["last_conversation_message_id"] = int(message_id)
-                self._record_message_send(bot_name, "conversational_messages", int(message_id))
-                if conversation_delay_max > 0:
-                    delay = random.uniform(conversation_delay_min, conversation_delay_max)
-                    logger.info("BOT CONVERSATION DELAY bot=%s seconds=%.2f after_message_id=%s", bot_name, delay, message_id)
-                    self._set_bot_runtime(bot_name, "WAITING_REPLY")
-                    interrupted = await self._sleep_with_wakeup(delay)
-                    if interrupted:
-                        logger.info("BOT CONVERSATION WAKEUP bot=%s reason=external_event", bot_name)
-                if reply_event.is_set():
-                    session["engaged"] = True
-                    session["last_partner_reply_at"] = self._utc_now().isoformat()
-                    self._increment_bot_runtime(bot_name, partner_replies=1)
-                    break
+                if sent:
+                    session["last_conversation_message_id"] = message_id
+                    self._record_message_send(bot_name, "conversational_messages", message_id)
+                else:
+                    logger.warning("BOT CONVERSATION SEND FAILED bot=%s message_id=%s", bot_name, message_id)
             if not session.get("engaged"):
                 self._set_bot_runtime(bot_name, "WAITING_TIMEOUT")
                 replied = await self._wait_for_partner_reply(bot_name, no_response_timeout)

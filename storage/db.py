@@ -718,12 +718,7 @@ def get_bot_settings(bot_name: str) -> dict[str, Any]:
         settings = {
             "bot_name": bot_name,
             "promotion_mode": "MESSAGE",
-            "conversation_sequence": [],
             "no_response_timeout": 0,
-            "conversation_delay_min": 0,
-            "conversation_delay_max": 0,
-            "promotion_delay_min": 0,
-            "promotion_delay_max": 0,
             "runtime": {
                 "current_stage": "IDLE",
                 "last_activity_ts": None,
@@ -737,22 +732,23 @@ def get_bot_settings(bot_name: str) -> dict[str, Any]:
         }
         _BOT_SETTINGS_CACHE[bot_name] = dict(settings)
         return settings
-    settings = {k: v for k, v in doc.items() if k != "_id"}
-    settings.setdefault(
-        "runtime",
-        {
-            "current_stage": "IDLE",
-            "last_activity_ts": None,
-            "last_failure_reason": None,
-            "last_failure_ts": None,
-            "conversations_started": 0,
-            "partner_replies": 0,
-            "promotions_sent": 0,
-            "error_count": 0,
-        },
-    )
-    _BOT_SETTINGS_CACHE[bot_name] = dict(settings)
-    return settings
+    else:
+        settings = {k: v for k, v in doc.items() if k != "_id"}
+        settings.setdefault(
+            "runtime",
+            {
+                "current_stage": "IDLE",
+                "last_activity_ts": None,
+                "last_failure_reason": None,
+                "last_failure_ts": None,
+                "conversations_started": 0,
+                "partner_replies": 0,
+                "promotions_sent": 0,
+                "error_count": 0,
+            },
+        )
+        _BOT_SETTINGS_CACHE[bot_name] = dict(settings)
+        return settings
 
 
 def set_bot_settings(bot_name: str, **changes: Any) -> bool:
@@ -973,14 +969,8 @@ def _mongo_db():
 
 def init_db() -> None:
     db = _mongo_db()
-    db["settings"].update_one({"_id": "promotion_mode"}, {"$setOnInsert": {"value": "MESSAGE"}}, upsert=True)
     db["settings"].update_one({"_id": "default_promotion_mode"}, {"$setOnInsert": {"value": "MESSAGE"}}, upsert=True)
-    db["settings"].update_one({"_id": "default_conversation_sequence"}, {"$setOnInsert": {"value": []}}, upsert=True)
     db["settings"].update_one({"_id": "default_no_response_timeout"}, {"$setOnInsert": {"value": 0}}, upsert=True)
-    db["settings"].update_one({"_id": "default_conversation_delay_min"}, {"$setOnInsert": {"value": 0}}, upsert=True)
-    db["settings"].update_one({"_id": "default_conversation_delay_max"}, {"$setOnInsert": {"value": 0}}, upsert=True)
-    db["settings"].update_one({"_id": "default_promotion_delay_min"}, {"$setOnInsert": {"value": 0}}, upsert=True)
-    db["settings"].update_one({"_id": "default_promotion_delay_max"}, {"$setOnInsert": {"value": 0}}, upsert=True)
     db["groups"].create_index([("status", 1), ("updated_at", 1)])
     db["groups"].create_index([("status", 1), ("next_run_at", 1)])
     db["groups"].create_index([("status", 1), ("cooldown_until", 1)])

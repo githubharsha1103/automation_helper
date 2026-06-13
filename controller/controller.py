@@ -102,12 +102,7 @@ EDIT_BOT_SECURITY_TRIGGERS = 510
 EDIT_BOT_AFTER_MATCH_DELAY = 511
 EDIT_BOT_AFTER_CHAT_DELAY = 512
 SET_BOT_PROMOTION_MODE = 700
-SET_BOT_CONVERSATION_SEQUENCE = 701
 SET_BOT_NO_RESPONSE_TIMEOUT = 702
-SET_BOT_CONV_DELAY_MIN = 703
-SET_BOT_CONV_DELAY_MAX = 704
-SET_BOT_PROMO_DELAY_MIN = 705
-SET_BOT_PROMO_DELAY_MAX = 706
 ADD_BOT_MESSAGE = 750
 ADD_GROUP_MESSAGE = 751
 ADD_STICKER = 752
@@ -490,10 +485,7 @@ def _bot_message_settings_text(bot_name: str) -> str:
     return (
         f"Automation Settings: {bot_name}\n\n"
         f"Promotion Mode: {settings.get('promotion_mode', 'MESSAGE')}\n"
-        f"Conversation Sequence: {','.join(map(str, settings.get('conversation_sequence', []))) or 'None'}\n"
-        f"No Response Timeout: {settings.get('no_response_timeout', 0)} sec\n"
-        f"Conversation Delay: {settings.get('conversation_delay_min', 0)}-{settings.get('conversation_delay_max', 0)} sec\n"
-        f"Promotion Delay: {settings.get('promotion_delay_min', 0)}-{settings.get('promotion_delay_max', 0)} sec"
+        f"No Response Timeout: {settings.get('no_response_timeout', 0)} sec"
     )
 
 
@@ -501,12 +493,7 @@ def _bot_message_settings_keyboard(bot_name: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Promotion Mode", callback_data=f"botmsg:mode:{bot_name}")],
-            [InlineKeyboardButton("Conversation Sequence", callback_data=f"botmsg:sequence:{bot_name}")],
             [InlineKeyboardButton("No Response Timeout", callback_data=f"botmsg:timeout:{bot_name}")],
-            [InlineKeyboardButton("Conversation Delay Min", callback_data=f"botmsg:conv_min:{bot_name}")],
-            [InlineKeyboardButton("Conversation Delay Max", callback_data=f"botmsg:conv_max:{bot_name}")],
-            [InlineKeyboardButton("Promotion Delay Min", callback_data=f"botmsg:promo_min:{bot_name}")],
-            [InlineKeyboardButton("Promotion Delay Max", callback_data=f"botmsg:promo_max:{bot_name}")],
             [InlineKeyboardButton("Back", callback_data=f"bot:view:{bot_name}")],
         ]
     )
@@ -553,13 +540,8 @@ def _state_name(state: int) -> str:
         EDIT_BOT_SECURITY_TRIGGERS: "EDIT_BOT_SECURITY_TRIGGERS",
         EDIT_BOT_AFTER_MATCH_DELAY: "EDIT_BOT_AFTER_MATCH_DELAY",
         EDIT_BOT_AFTER_CHAT_DELAY: "EDIT_BOT_AFTER_CHAT_DELAY",
-        SET_BOT_PROMOTION_MODE: "SET_BOT_PROMOTION_MODE",
-        SET_BOT_CONVERSATION_SEQUENCE: "SET_BOT_CONVERSATION_SEQUENCE",
+SET_BOT_PROMOTION_MODE: "SET_BOT_PROMOTION_MODE",
         SET_BOT_NO_RESPONSE_TIMEOUT: "SET_BOT_NO_RESPONSE_TIMEOUT",
-        SET_BOT_CONV_DELAY_MIN: "SET_BOT_CONV_DELAY_MIN",
-        SET_BOT_CONV_DELAY_MAX: "SET_BOT_CONV_DELAY_MAX",
-        SET_BOT_PROMO_DELAY_MIN: "SET_BOT_PROMO_DELAY_MIN",
-        SET_BOT_PROMO_DELAY_MAX: "SET_BOT_PROMO_DELAY_MAX",
         SET_GROUP_MESSAGE: "SET_GROUP_MESSAGE",
         EDIT_GROUP_NAME: "EDIT_GROUP_NAME",
         EDIT_GROUP_DELAY: "EDIT_GROUP_DELAY",
@@ -919,28 +901,8 @@ async def botmsg_value_entry(update: Update, context: ContextTypes.DEFAULT_TYPE,
     return state
 
 
-async def botmsg_sequence_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_value_entry(update, context, "conversation_sequence", "Send comma-separated conversational message IDs, e.g. 1,2,3", SET_BOT_CONVERSATION_SEQUENCE)
-
-
 async def botmsg_timeout_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await botmsg_value_entry(update, context, "no_response_timeout", "Send no-response timeout in seconds.", SET_BOT_NO_RESPONSE_TIMEOUT)
-
-
-async def botmsg_conv_min_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_value_entry(update, context, "conversation_delay_min", "Send conversation delay minimum in seconds.", SET_BOT_CONV_DELAY_MIN)
-
-
-async def botmsg_conv_max_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_value_entry(update, context, "conversation_delay_max", "Send conversation delay maximum in seconds.", SET_BOT_CONV_DELAY_MAX)
-
-
-async def botmsg_promo_min_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_value_entry(update, context, "promotion_delay_min", "Send promotion delay minimum in seconds.", SET_BOT_PROMO_DELAY_MIN)
-
-
-async def botmsg_promo_max_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_value_entry(update, context, "promotion_delay_max", "Send promotion delay maximum in seconds.", SET_BOT_PROMO_DELAY_MAX)
 
 
 async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -950,18 +912,11 @@ async def botmsg_generic_value_handler(update: Update, context: ContextTypes.DEF
         return ConversationHandler.END
     logger.info("TEXT RECEIVED botmsg_generic_value_handler bot=%s field=%s text=%s", bot_name, field, getattr(getattr(update, "message", None), "text", None))
     raw = update.message.text.strip()
-    if field == "conversation_sequence":
-        try:
-            value = [int(item.strip()) for item in raw.split(",") if item.strip()]
-        except ValueError:
-            await update.message.reply_text("Use comma-separated numeric IDs.")
-            return context.user_data.get("state", ConversationHandler.END)
-    else:
-        try:
-            value = int(raw)
-        except ValueError:
-            await update.message.reply_text("Send a whole number.")
-            return context.user_data.get("state", ConversationHandler.END)
+    try:
+        value = int(raw)
+    except ValueError:
+        await update.message.reply_text("Send a whole number.")
+        return context.user_data.get("state", ConversationHandler.END)
     settings = get_bot_settings(bot_name)
     settings[field] = value
     settings.pop("bot_name", None)
@@ -1333,22 +1288,6 @@ async def bot_settings_after_chat_handler_audited(update: Update, context: Conte
 
 
 async def botmsg_timeout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_generic_value_handler(update, context)
-
-
-async def botmsg_conv_min_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_generic_value_handler(update, context)
-
-
-async def botmsg_conv_max_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_generic_value_handler(update, context)
-
-
-async def botmsg_promo_min_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await botmsg_generic_value_handler(update, context)
-
-
-async def botmsg_promo_max_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await botmsg_generic_value_handler(update, context)
 
 
@@ -2049,13 +1988,8 @@ def _conversation_state_map() -> list[tuple[int, str]]:
         (EDIT_BOT_SECURITY_TRIGGERS, "bot_settings_security_handler_audited"),
         (EDIT_BOT_AFTER_MATCH_DELAY, "bot_settings_after_match_handler_audited"),
         (EDIT_BOT_AFTER_CHAT_DELAY, "bot_settings_after_chat_handler_audited"),
-        (SET_BOT_PROMOTION_MODE, "botmsg_mode_handler_audited"),
-        (SET_BOT_CONVERSATION_SEQUENCE, "botmsg_generic_value_handler_audited"),
+(SET_BOT_PROMOTION_MODE, "botmsg_mode_handler_audited"),
         (SET_BOT_NO_RESPONSE_TIMEOUT, "botmsg_generic_value_handler_audited"),
-        (SET_BOT_CONV_DELAY_MIN, "botmsg_generic_value_handler_audited"),
-        (SET_BOT_CONV_DELAY_MAX, "botmsg_generic_value_handler_audited"),
-        (SET_BOT_PROMO_DELAY_MIN, "botmsg_generic_value_handler_audited"),
-        (SET_BOT_PROMO_DELAY_MAX, "botmsg_generic_value_handler_audited"),
         (EDIT_GROUP_NAME, "group_edit_name_handler_audited"),
         (EDIT_GROUP_DELAY, "group_edit_delay_handler_audited"),
         (SET_GROUP_MESSAGE, "group_set_message_handler_audited"),
@@ -2085,13 +2019,8 @@ def _log_conversation_audit() -> None:
         EDIT_BOT_SECURITY_TRIGGERS,
         EDIT_BOT_AFTER_MATCH_DELAY,
         EDIT_BOT_AFTER_CHAT_DELAY,
-        SET_BOT_PROMOTION_MODE,
-        SET_BOT_CONVERSATION_SEQUENCE,
+SET_BOT_PROMOTION_MODE,
         SET_BOT_NO_RESPONSE_TIMEOUT,
-        SET_BOT_CONV_DELAY_MIN,
-        SET_BOT_CONV_DELAY_MAX,
-        SET_BOT_PROMO_DELAY_MIN,
-        SET_BOT_PROMO_DELAY_MAX,
         EDIT_GROUP_NAME,
         EDIT_GROUP_DELAY,
         SET_GROUP_MESSAGE,
@@ -2140,13 +2069,8 @@ async def start_controller() -> None:
             CallbackQueryHandler(group_set_message_entry, pattern="^group:set_message:"),
             CallbackQueryHandler(group_time_start_entry, pattern="^group:time_start:"),
             CallbackQueryHandler(group_time_end_entry, pattern="^group:time_end:"),
-            CallbackQueryHandler(botmsg_mode_entry, pattern="^botmsg:mode:"),
-            CallbackQueryHandler(botmsg_sequence_entry, pattern="^botmsg:sequence:"),
+CallbackQueryHandler(botmsg_mode_entry, pattern="^botmsg:mode:"),
             CallbackQueryHandler(botmsg_timeout_entry, pattern="^botmsg:timeout:"),
-            CallbackQueryHandler(botmsg_conv_min_entry, pattern="^botmsg:conv_min:"),
-            CallbackQueryHandler(botmsg_conv_max_entry, pattern="^botmsg:conv_max:"),
-            CallbackQueryHandler(botmsg_promo_min_entry, pattern="^botmsg:promo_min:"),
-            CallbackQueryHandler(botmsg_promo_max_entry, pattern="^botmsg:promo_max:"),
             CallbackQueryHandler(bot_settings_start_cmd_entry, pattern="^botcfg:start:"),
             CallbackQueryHandler(bot_settings_stop_cmd_entry, pattern="^botcfg:stop:"),
             CallbackQueryHandler(bot_settings_match_entry, pattern="^botcfg:match:"),
@@ -2175,13 +2099,8 @@ async def start_controller() -> None:
             EDIT_BOT_SECURITY_TRIGGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_security_handler_audited)],
             EDIT_BOT_AFTER_MATCH_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_after_match_handler_audited)],
             EDIT_BOT_AFTER_CHAT_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_settings_after_chat_handler_audited)],
-            SET_BOT_PROMOTION_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_mode_handler_audited)],
-            SET_BOT_CONVERSATION_SEQUENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
+SET_BOT_PROMOTION_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_mode_handler_audited)],
             SET_BOT_NO_RESPONSE_TIMEOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
-            SET_BOT_CONV_DELAY_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
-            SET_BOT_CONV_DELAY_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
-            SET_BOT_PROMO_DELAY_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
-            SET_BOT_PROMO_DELAY_MAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, botmsg_generic_value_handler_audited)],
             EDIT_GROUP_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_name_handler_audited)],
             EDIT_GROUP_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_edit_delay_handler_audited)],
             SET_GROUP_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_set_message_handler_audited)],
@@ -2223,13 +2142,8 @@ async def start_controller() -> None:
             "CallbackQueryHandler(bot:bypass:)",
             "CallbackQueryHandler(bot:delete:)",
             "CallbackQueryHandler(botmsg:view:)",
-            "CallbackQueryHandler(botmsg:mode:)",
-            "CallbackQueryHandler(botmsg:sequence:)",
+"CallbackQueryHandler(botmsg:mode:)",
             "CallbackQueryHandler(botmsg:timeout:)",
-            "CallbackQueryHandler(botmsg:conv_min:)",
-            "CallbackQueryHandler(botmsg:conv_max:)",
-            "CallbackQueryHandler(botmsg:promo_min:)",
-            "CallbackQueryHandler(botmsg:promo_max:)",
             "CallbackQueryHandler(group:list)",
             "CallbackQueryHandler(group:view:)",
             "CallbackQueryHandler(group:toggle:)",
