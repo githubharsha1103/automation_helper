@@ -1,14 +1,16 @@
+# pyright: reportMissingImports=false
 import asyncio
 import logging
 import os
 import traceback
 from pathlib import Path
+from typing import cast
 
-from dotenv import load_dotenv
-from telethon import utils as telethon_utils
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
-from telegram.ext import (
+from dotenv import load_dotenv  # type: ignore[import-not-found]
+from telethon import utils as telethon_utils  # type: ignore[import-not-found]
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update  # type: ignore[import-not-found]
+from telegram.error import BadRequest  # type: ignore[import-not-found]
+from telegram.ext import (  # type: ignore[import-not-found]
     Application,
     CallbackQueryHandler,
     CommandHandler,
@@ -39,6 +41,10 @@ from storage.db import (
     get_bot_settings,
     get_bot_runtime,
     get_message,
+    get_category_message,
+    add_category_message,
+    update_category_message,
+    delete_category_message,
     get_setting,
     is_bot_enabled,
     is_bot_paused,
@@ -307,6 +313,7 @@ async def _render_group_details(update: Update, group_id: str) -> None:
     if not group:
         await _send_or_edit(update, "Group not found", InlineKeyboardMarkup(_group_rows()))
         return
+    group = _safe_group(group)
     await _send_or_edit(
         update,
         _group_details_text(group),
@@ -319,6 +326,7 @@ async def _render_group_time_window(update: Update, group_id: str) -> None:
     if not group:
         await _send_or_edit(update, "Group not found", InlineKeyboardMarkup(_group_rows()))
         return
+    group = _safe_group(group)
     await _send_or_edit(update, _group_time_window_text(group), _group_time_window_keyboard(group_id))
 
 
@@ -518,11 +526,15 @@ def _bot_settings_keyboard(bot_name: str) -> InlineKeyboardMarkup:
     )
 
 
-def _normalize_command(value: str) -> str:
-    cleaned = value.strip()
+def _normalize_command(value: str | None) -> str:
+    cleaned = str(value or "").strip()
     if not cleaned:
         return cleaned
     return cleaned if cleaned.startswith("/") else f"/{cleaned}"
+
+
+def _safe_group(group: dict | None) -> dict:
+    return cast(dict, group or {})
 
 
 def _state_name(state: int) -> str:
@@ -776,7 +788,7 @@ async def promotion_mode_set_callback(update: Update, context: ContextTypes.DEFA
     await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
 
 
-async def promotion_settings_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def promotion_settings_back_callback_legacy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _safe_callback_answer(update.callback_query)
     await _send_or_edit(update, _automation_status_text(), _automation_menu())
 
@@ -813,6 +825,7 @@ async def toggle_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not bot:
         await _send_or_edit(update, "Bot not found", InlineKeyboardMarkup(_bot_rows()))
         return
+    await telegram_service.ensure_connected()
     new_enabled = not bool(bot.get("enabled", False))
     set_bot_enabled(bot_name, new_enabled)
     if not new_enabled:
@@ -820,14 +833,20 @@ async def toggle_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         stop_cmd = _normalize_command(bot.get("stop_cmd"))
         if stop_cmd:
             try:
-                await telegram_service.client.send_message(bot_name, stop_cmd)
+                await telegram_service.ensure_connected()
+                client = telegram_service.client
+                assert client is not None
+                await client.send_message(bot_name, stop_cmd)
             except Exception:
                 logger.exception("Failed to send stop command to %s", bot_name)
     else:
         start_cmd = _normalize_command(bot.get("start_cmd"))
         if start_cmd:
             try:
-                await telegram_service.client.send_message(bot_name, start_cmd)
+                await telegram_service.ensure_connected()
+                client = telegram_service.client
+                assert client is not None
+                await client.send_message(bot_name, start_cmd)
             except Exception:
                 logger.exception("Failed to send start command to %s", bot_name)
     await _render_bot_details(update, bot_name)
@@ -1385,6 +1404,7 @@ async def group_edit_name_handler(update: Update, context: ContextTypes.DEFAULT_
     update_group_name(group_id, new_name)
     context.user_data.clear()
     group = get_group(group_id)
+    assert group is not None
     await update.message.reply_text(
         _group_details_text(group),
         reply_markup=_group_details_keyboard(group_id, group["status"] == "enabled"),
@@ -1424,6 +1444,7 @@ async def group_edit_delay_handler(update: Update, context: ContextTypes.DEFAULT
     update_group_delay(group_id, delay_min, delay_max)
     context.user_data.clear()
     group = get_group(group_id)
+    assert group is not None
     await update.message.reply_text(
         _group_details_text(group),
         reply_markup=_group_details_keyboard(group_id, group["status"] == "enabled"),
@@ -1467,7 +1488,7 @@ async def group_time_start_handler(update: Update, context: ContextTypes.DEFAULT
     except ValueError:
         await update.message.reply_text("Start hour must be a number from 0 to 23.")
         return EDIT_GROUP_TIME_START
-    group = get_group(group_id) or {}
+    group = _safe_group(get_group(group_id))
     update_group_time_window(group_id, start_hour, group.get("active_end_hour"))
     context.user_data["group_back_view"] = "time_window"
     await update.message.reply_text("Start hour saved.")
@@ -1501,7 +1522,7 @@ async def group_time_end_handler(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError:
         await update.message.reply_text("End hour must be a number from 0 to 23.")
         return EDIT_GROUP_TIME_END
-    group = get_group(group_id) or {}
+    group = _safe_group(get_group(group_id))
     update_group_time_window(group_id, group.get("active_start_hour"), end_hour)
     context.user_data["group_back_view"] = "time_window"
     await update.message.reply_text("End hour saved.")
@@ -1546,6 +1567,7 @@ async def group_set_message_handler(update: Update, context: ContextTypes.DEFAUL
     set_group_special_message(group_id, message_text)
     context.user_data.clear()
     group = get_group(group_id)
+    assert group is not None
     await update.message.reply_text(
         _group_details_text(group),
         reply_markup=_group_details_keyboard(group_id, group["status"] == "enabled"),
@@ -1602,7 +1624,7 @@ async def add_group_chat_id_audited(update: Update, context: ContextTypes.DEFAUL
 
 
 def set_group_assigned_bot(group_id: str, bot_name: str | None) -> bool:
-    group = get_group(group_id) or {}
+    group = _safe_group(get_group(group_id))
     group["assigned_bot"] = bot_name
     group["bot_username"] = bot_name
     return bool(
@@ -1874,7 +1896,10 @@ async def bypass_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     start_cmd = _normalize_command(bot.get("start_cmd")) if bot else None
     if bot and bool(bot.get("enabled", False)) and start_cmd:
         try:
-            await telegram_service.client.send_message(bot_name, start_cmd)
+            await telegram_service.ensure_connected()
+            client = telegram_service.client
+            assert client is not None
+            await client.send_message(bot_name, start_cmd)
         except Exception:
             logger.exception("Failed to resume bot %s after bypass", bot_name)
     await _send_or_edit(update, f"Resumed {bot_name}", _main_menu())
@@ -1929,7 +1954,8 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def add_bot_message_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handler for adding a bot message text"""
     if not update.message or not update.message.text:
-        await update.message.reply_text("Please send a message text.")
+        if update.message:
+            await update.message.reply_text("Please send a message text.")
         return ADD_BOT_MESSAGE
     message_text = update.message.text.strip()
     if not message_text:
@@ -1951,7 +1977,8 @@ async def add_bot_message_handler_audited(update: Update, context: ContextTypes.
 async def add_group_message_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handler for adding a group message text"""
     if not update.message or not update.message.text:
-        await update.message.reply_text("Please send a message text.")
+        if update.message:
+            await update.message.reply_text("Please send a message text.")
         return ADD_GROUP_MESSAGE
     message_text = update.message.text.strip()
     if not message_text:
@@ -1973,7 +2000,6 @@ async def add_group_message_handler_audited(update: Update, context: ContextType
 async def add_sticker_handler_audited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handler for adding a sticker"""
     if not update.message:
-        await update.message.reply_text("Please send a sticker.")
         return ADD_STICKER
     
     if update.message.sticker:
@@ -2096,6 +2122,8 @@ async def start_controller() -> None:
     print("[STARTUP] Building Telegram control application...")
     logger.info("[STARTUP] Building Telegram control application...")
     _application = Application.builder().token(TOKEN).build()
+    app = _application
+    assert app is not None
     _log_conversation_audit()
 
     conv_handler = ConversationHandler(
@@ -2228,45 +2256,45 @@ async def start_controller() -> None:
     if missing_in_map or orphaned_map:
         logger.warning("CONVERSATION HANDLER AUDIT MISMATCH missing_in_map=%s orphaned_map=%s", missing_in_map, orphaned_map)
 
-    _application.add_handler(CommandHandler("start", start_command))
-    _application.add_handler(conv_handler)
-    _application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
-    _application.add_handler(CallbackQueryHandler(list_bots_callback, pattern="^bot:list$"))
-    _application.add_handler(CallbackQueryHandler(view_bot_callback, pattern="^bot:view:"))
-    _application.add_handler(CallbackQueryHandler(refresh_bot_callback, pattern="^bot:refresh:"))
-    _application.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^bot:toggle:"))
-    _application.add_handler(CallbackQueryHandler(edit_bot_callback, pattern="^bot:edit:"))
-    _application.add_handler(CallbackQueryHandler(bypass_bot_callback, pattern="^bot:bypass:"))
-    _application.add_handler(CallbackQueryHandler(delete_bot_callback, pattern="^bot:delete:"))
-    _application.add_handler(CallbackQueryHandler(bot_message_settings_callback, pattern="^botmsg:view:"))
-    _application.add_handler(CallbackQueryHandler(list_groups_callback, pattern="^group:list$"))
-    _application.add_handler(CallbackQueryHandler(view_group_callback, pattern="^group:view:"))
-    _application.add_handler(CallbackQueryHandler(toggle_group_callback, pattern="^group:toggle:"))
-    _application.add_handler(CallbackQueryHandler(group_time_window_menu, pattern="^group:time_window:"))
-    _application.add_handler(CallbackQueryHandler(group_time_clear_callback, pattern="^group:time_clear:"))
-    _application.add_handler(CallbackQueryHandler(clear_group_message_callback, pattern="^group:clear_message:"))
-    _application.add_handler(CallbackQueryHandler(delete_group_callback, pattern="^group:delete:"))
-    _application.add_handler(CallbackQueryHandler(messages_list_callback, pattern="^message:list$"))
-    _application.add_handler(CallbackQueryHandler(message_view_callback, pattern="^msg:[a-z_]+:view:"))
-    _application.add_handler(CallbackQueryHandler(message_toggle_callback, pattern="^msg:[a-z_]+:(enable|disable):"))
-    _application.add_handler(CallbackQueryHandler(delete_message_menu, pattern="^message:delete$"))
-    _application.add_handler(CallbackQueryHandler(delete_one_message, pattern="^msg:[a-z_]+:delete:"))
-    _application.add_handler(CallbackQueryHandler(automation_start, pattern="^automation:start$"))
-    _application.add_handler(CallbackQueryHandler(automation_stop, pattern="^automation:stop$"))
-    _application.add_handler(CallbackQueryHandler(automation_pause, pattern="^automation:pause$"))
-    _application.add_handler(CallbackQueryHandler(automation_resume, pattern="^automation:resume$"))
-    _application.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
+    app.add_handler(CallbackQueryHandler(list_bots_callback, pattern="^bot:list$"))
+    app.add_handler(CallbackQueryHandler(view_bot_callback, pattern="^bot:view:"))
+    app.add_handler(CallbackQueryHandler(refresh_bot_callback, pattern="^bot:refresh:"))
+    app.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^bot:toggle:"))
+    app.add_handler(CallbackQueryHandler(edit_bot_callback, pattern="^bot:edit:"))
+    app.add_handler(CallbackQueryHandler(bypass_bot_callback, pattern="^bot:bypass:"))
+    app.add_handler(CallbackQueryHandler(delete_bot_callback, pattern="^bot:delete:"))
+    app.add_handler(CallbackQueryHandler(bot_message_settings_callback, pattern="^botmsg:view:"))
+    app.add_handler(CallbackQueryHandler(list_groups_callback, pattern="^group:list$"))
+    app.add_handler(CallbackQueryHandler(view_group_callback, pattern="^group:view:"))
+    app.add_handler(CallbackQueryHandler(toggle_group_callback, pattern="^group:toggle:"))
+    app.add_handler(CallbackQueryHandler(group_time_window_menu, pattern="^group:time_window:"))
+    app.add_handler(CallbackQueryHandler(group_time_clear_callback, pattern="^group:time_clear:"))
+    app.add_handler(CallbackQueryHandler(clear_group_message_callback, pattern="^group:clear_message:"))
+    app.add_handler(CallbackQueryHandler(delete_group_callback, pattern="^group:delete:"))
+    app.add_handler(CallbackQueryHandler(messages_list_callback, pattern="^message:list$"))
+    app.add_handler(CallbackQueryHandler(message_view_callback, pattern="^msg:[a-z_]+:view:"))
+    app.add_handler(CallbackQueryHandler(message_toggle_callback, pattern="^msg:[a-z_]+:(enable|disable):"))
+    app.add_handler(CallbackQueryHandler(delete_message_menu, pattern="^message:delete$"))
+    app.add_handler(CallbackQueryHandler(delete_one_message, pattern="^msg:[a-z_]+:delete:"))
+    app.add_handler(CallbackQueryHandler(automation_start, pattern="^automation:start$"))
+    app.add_handler(CallbackQueryHandler(automation_stop, pattern="^automation:stop$"))
+    app.add_handler(CallbackQueryHandler(automation_pause, pattern="^automation:pause$"))
+    app.add_handler(CallbackQueryHandler(automation_resume, pattern="^automation:resume$"))
+    app.add_handler(CallbackQueryHandler(noop_callback, pattern="^noop$"))
 
     try:
         print("[STARTUP] Initializing Telegram control application...")
         logger.info("[STARTUP] Initializing Telegram control application...")
-        await _application.initialize()
+        await app.initialize()
         print("[STARTUP] Starting Telegram control application...")
         logger.info("[STARTUP] Starting Telegram control application...")
-        await _application.start()
+        await app.start()
         print("[STARTUP] Starting Telegram polling...")
         logger.info("[STARTUP] Starting Telegram polling...")
-        await _application.updater.start_polling()
+        await app.updater.start_polling()
     except Exception:
         print("FATAL ERROR: Telegram controller failed to start")
         print(traceback.format_exc())
@@ -2277,8 +2305,8 @@ async def start_controller() -> None:
         while True:
             await asyncio.sleep(3600)
     finally:
-        await _application.updater.stop()
-        await _application.stop()
-        await _application.shutdown()
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 

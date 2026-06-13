@@ -8,11 +8,16 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
-from dotenv import load_dotenv
-from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
-from telethon.sessions import StringSession
+try:
+    from dotenv import load_dotenv  # type: ignore[import-not-found]
+except ImportError:
+    def load_dotenv() -> None:
+        pass
+from telethon import TelegramClient, events  # type: ignore[import-not-found]
+from telethon.errors import FloodWaitError  # type: ignore[import-not-found]
+from telethon.sessions import StringSession  # type: ignore[import-not-found]
 
 from storage.db import (
     aget_bot,
@@ -44,6 +49,7 @@ from storage.db import (
     is_bot_paused,
     list_groups,
     list_category_messages,
+    get_category_message,
     list_bot_messages,
     list_group_messages,
     list_stickers,
@@ -101,6 +107,8 @@ class TelegramService:
         self._connect_lock = asyncio.Lock()
         self._entity_cache: OrderedDict[str, tuple[float, object]] = OrderedDict()
         self._dialog_cache_primed = False
+        self._authorized = False
+        self._bot_event_handler_registered = False
         self._configured = bool(API_ID and API_ID.isdigit() and API_HASH)
         self._session_source = "env:SESSION_STRING" if SESSION_STRING else f"file:{SESSION_NAME}.session"
         self.last_ensure_connected_ms = 0.0
@@ -131,6 +139,7 @@ class TelegramService:
                 reconnected = True
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram session is not authorized")
+            self._authorized = True
             if not self._dialog_cache_primed:
                 await self._prime_dialog_cache(client)
         elapsed_ms = (time.monotonic() - start) * 1000
@@ -189,6 +198,7 @@ class TelegramService:
                 await client.connect()
 
             if await client.is_user_authorized():
+                self._authorized = True
                 return
 
             logger.warning(
@@ -198,6 +208,7 @@ class TelegramService:
 
             if not await client.is_user_authorized():
                 raise RuntimeError("Telegram login did not complete successfully")
+            self._authorized = True
 
     async def resolve_entity(self, chat_ref: str):
         start = time.monotonic()
@@ -313,7 +324,7 @@ class TelegramService:
     def status(self) -> dict[str, object]:
         return {
             "connected": bool(self.client and self.client.is_connected()),
-            "authorized": bool(self.client and self.client.is_user_authorized()) if self.client else False,
+            "authorized": self._authorized,
             "session_source": self._session_source,
             "entity_cache_size": len(self._entity_cache),
             "last_ensure_connected_ms": round(self.last_ensure_connected_ms, 2),
@@ -321,11 +332,11 @@ class TelegramService:
             "last_send_ms": round(self.last_send_ms, 2),
             "last_send_success": self.last_send_success,
             "last_error": self.last_error,
-            "last_skip_reason": self.last_skip_reason,
-            "eligible_groups_count": self.last_eligible_groups_count,
-            "active_messages_count": self.last_active_messages_count,
-            "last_promotion_attempt": self.last_promotion_attempt,
-            "last_successful_promotion": self.last_successful_promotion,
+            "last_skip_reason": getattr(self, "last_skip_reason", None),
+            "eligible_groups_count": getattr(self, "last_eligible_groups_count", 0),
+            "active_messages_count": getattr(self, "last_active_messages_count", 0),
+            "last_promotion_attempt": getattr(self, "last_promotion_attempt", None),
+            "last_successful_promotion": getattr(self, "last_successful_promotion", None),
         }
 
 @dataclass
@@ -406,8 +417,8 @@ class AutomationService:
 
     def _load_snapshot(self) -> AutomationSnapshot:
         return AutomationSnapshot(
-            group_index=int(get_setting("automation_group_index", 0) or 0),
-            message_index=int(get_setting("automation_message_index", 0) or 0),
+            group_index=self._safe_int(get_setting("automation_group_index", 0), 0),
+            message_index=self._safe_int(get_setting("automation_message_index", 0), 0),
         )
 
     def _save_snapshot(self, snapshot: AutomationSnapshot) -> None:
@@ -438,17 +449,46 @@ class AutomationService:
 
     @staticmethod
     def _delay_bounds(settings: dict[str, object], prefix: str, default_min: float = 0.0, default_max: float = 0.0) -> tuple[float, float]:
-        try:
-            min_value = float(settings.get(f"{prefix}_min", default_min) or default_min)
-        except (TypeError, ValueError):
-            min_value = default_min
-        try:
-            max_value = float(settings.get(f"{prefix}_max", default_max) or default_max)
-        except (TypeError, ValueError):
-            max_value = default_max
+        # Get min value
+        raw_min = settings.get(f"{prefix}_min", default_min)
+        min_value = AutomationService._safe_float(raw_min, default_min)
+        # Get max value
+        raw_max = settings.get(f"{prefix}_max", default_max)
+        max_value = AutomationService._safe_float(raw_max, default_max)
         if max_value < min_value:
             max_value = min_value
         return min_value, max_value
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            if isinstance(value, str):
+                return int(value.strip())
+            return default
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                return float(value.strip())
+            return default
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_str(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     @staticmethod
     def _promotion_mode_for(settings: dict[str, object]) -> str:
@@ -470,7 +510,7 @@ class AutomationService:
         return session
 
     def _set_bot_runtime(self, bot_name: str, stage: str, **changes: object) -> None:
-        payload = {"current_stage": stage, "last_activity_ts": self._utc_now().isoformat()}
+        payload: dict[str, object] = {"current_stage": stage, "last_activity_ts": self._utc_now().isoformat()}
         payload.update(changes)
         update_bot_runtime(bot_name, **payload)
         logger.info("BOT RUNTIME UPDATE bot=%s stage=%s changes=%s", bot_name, stage, changes)
@@ -490,11 +530,11 @@ class AutomationService:
 
     def _choose_message(self, category: str) -> dict[str, object] | None:
         if category == "bot_messages":
-            messages = list_bot_messages(enabled=True)
+            messages = list_bot_messages(enabled_only=True)
         elif category == "group_messages":
-            messages = list_group_messages(enabled=True)
+            messages = list_group_messages(enabled_only=True)
         elif category == "promotion_stickers":
-            messages = list_stickers(enabled=True)
+            messages = list_stickers(enabled_only=True)
         else:
             messages = list_category_messages(category, active_only=False)
         if not messages:
@@ -533,9 +573,14 @@ class AutomationService:
             return False
 
     @staticmethod
-    def _safe_positive_float(value: object, default: float = 0.0) -> float:
+    def _safe_positive_float(value: Any, default: float = 0.0) -> float:
         try:
-            parsed = float(value if value is not None else default)
+            if isinstance(value, (int, float)):
+                parsed = float(value)
+            elif isinstance(value, str):
+                parsed = float(value.strip())
+            else:
+                return default
         except (TypeError, ValueError):
             return default
         return parsed if parsed > 0 else default
@@ -570,18 +615,19 @@ class AutomationService:
         return sequence, no_response_timeout, conv_delay, promo_delay
 
     async def _send_saved_payload_guarded(self, bot_name: str, message: dict, stage: str) -> bool:
-        if not message or not message.get("id"):
+        message_id = self._safe_int(message.get("id"), 0) if message else 0
+        if not message or not message_id:
             logger.warning("BOT SEND SKIP bot=%s stage=%s reason=missing_message_payload message=%s", bot_name, stage, message)
             return False
         try:
             await asyncio.wait_for(self.telegram.send_saved_payload(bot_name, message), timeout=60)
-            logger.info("BOT SEND OK bot=%s stage=%s message_id=%s", bot_name, stage, message.get("id"))
+            logger.info("BOT SEND OK bot=%s stage=%s message_id=%s", bot_name, stage, message_id)
             return True
         except asyncio.TimeoutError:
-            logger.exception("BOT SEND TIMEOUT bot=%s stage=%s message_id=%s", bot_name, stage, message.get("id"))
+            logger.exception("BOT SEND TIMEOUT bot=%s stage=%s message_id=%s", bot_name, stage, message_id)
             return False
         except Exception as exc:
-            logger.exception("BOT SEND FAILED bot=%s stage=%s message_id=%s error=%s", bot_name, stage, message.get("id"), exc)
+            logger.exception("BOT SEND FAILED bot=%s stage=%s message_id=%s error=%s", bot_name, stage, message_id, exc)
             return False
 
     def _record_message_send(self, bot_name: str, category: str, message_id: int) -> None:
@@ -661,7 +707,7 @@ class AutomationService:
             logger.info("PROMOTION DISABLED bot=%s", bot_name)
             self._set_bot_runtime(bot_name, "IDLE")
             return
-        promotion_messages = list_bot_messages(enabled=True)
+        promotion_messages = list_bot_messages(enabled_only=True)
         if not promotion_messages:
             logger.warning("PROMOTION SKIP bot=%s reason=no_enabled_bot_messages", bot_name)
             self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="no_bot_messages", last_failure_ts=self._utc_now().isoformat())
@@ -672,9 +718,10 @@ class AutomationService:
         if mode == "RANDOM":
             chosen_mode = random.choice(["MESSAGE", "STICKER", "BOTH"])
         logger.info("PROMOTION STAGE bot=%s mode=%s selected_mode=%s message_id=%s", bot_name, mode, chosen_mode, selected_message.get("id"))
+        selected_message_id = self._safe_int(selected_message.get("id"), 0)
         if chosen_mode == "MESSAGE":
             await self._send_saved_payload_guarded(bot_name, selected_message, "promotion_message")
-            self._record_message_send(bot_name, "bot_messages", int(selected_message.get("id")))
+            self._record_message_send(bot_name, "bot_messages", selected_message_id)
             self._increment_bot_runtime(bot_name, promotions_sent=1)
             self._set_bot_runtime(bot_name, "IDLE")
             return
@@ -695,7 +742,7 @@ class AutomationService:
                 self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="promotion_message_failed", last_failure_ts=self._utc_now().isoformat())
                 self._increment_bot_runtime(bot_name, error_count=1)
                 return
-            self._record_message_send(bot_name, "bot_messages", int(selected_message.get("id")))
+            self._record_message_send(bot_name, "bot_messages", selected_message_id)
             if promotion_delay_max > 0:
                 delay = random.uniform(promotion_delay_min, promotion_delay_max)
                 logger.info("PROMOTION DELAY bot=%s seconds=%.2f", bot_name, delay)
@@ -802,7 +849,7 @@ class AutomationService:
     async def _send_promotion_sticker(self, bot_name: str) -> bool:
         """Send sticker directly from promotion_stickers collection using file_id"""
         cycle_start = time.monotonic()
-        stickers = list_stickers(enabled=True)
+        stickers = list_stickers(enabled_only=True)
         if not stickers:
             logger.warning("STICKER PROMOTION SKIP bot=%s reason=no_enabled_stickers", bot_name)
             record_operation(
@@ -877,9 +924,9 @@ class AutomationService:
             mode,
             message.get("id"),
         )
-        if mode in {"sticker", "both"}:
+        if mode in {"STICKER", "BOTH"}:
             sticker_sent = await self._send_promotion_sticker(group["group_id"])
-            if mode == "sticker":
+            if mode == "STICKER":
                 if sticker_sent:
                     self.last_successful_promotion = dict(self.last_promotion_attempt)
                 return
@@ -905,7 +952,7 @@ class AutomationService:
             logger.warning("AFTER send_saved_message(): group_id=%s message_id=%s", group.get("group_id"), message.get("id"))
         self.last_successful_promotion = dict(self.last_promotion_attempt)
 
-    async def _send_bot_promotion(self, bot_username: str, message: dict) -> None:
+    async def _send_bot_promotion_payload(self, bot_username: str, message: dict) -> None:
         mode = self._promotion_mode()
         logger.warning(
             "BOT PROMOTION DISPATCH: bot=%s mode=%s message_id=%s",
@@ -913,9 +960,9 @@ class AutomationService:
             mode,
             message.get("id"),
         )
-        if mode in {"sticker", "both"}:
+        if mode in {"STICKER", "BOTH"}:
             sticker_sent = await self._send_promotion_sticker(bot_username)
-            if mode == "sticker":
+            if mode == "STICKER":
                 return
             if sticker_sent:
                 await asyncio.sleep(1)
@@ -936,15 +983,11 @@ class AutomationService:
             snapshot.message_index = (snapshot.message_index + 1) % messages_count
         self._save_snapshot(snapshot)
 
-    @staticmethod
-    def _utc_now() -> datetime:
-        return datetime.now(timezone.utc)
-
-    def _parse_timestamp(self, value: str | None) -> datetime | None:
+    def _parse_timestamp(self, value: object | None) -> datetime | None:
         if not value:
             return None
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except ValueError:
             return None
         if parsed.tzinfo is None:
@@ -1013,9 +1056,9 @@ class AutomationService:
                 enabled_groups_count = len(groups)
                 self._log_timing("DB READ list_enabled_groups", db_groups_start, timings)
                 db_messages_start = time.monotonic()
-                bot_messages = await alist_bot_messages(enabled=True)
-                group_messages = await alist_group_messages(enabled=True)
-                stickers = await alist_stickers(enabled=True)
+                bot_messages = await alist_bot_messages_enabled()
+                group_messages = await alist_group_messages_enabled()
+                stickers = await alist_stickers_enabled()
                 messages = bot_messages + group_messages + stickers
                 active_messages_count = len(messages)
                 self._log_timing("DB READ list_message_collections", db_messages_start, timings)
@@ -1133,7 +1176,7 @@ class AutomationService:
                         continue
 
                     if cooldown_until and now < cooldown_until:
-                        self._record_skip("cooldown", group=group, message=message)
+                        self._record_skip("cooldown", group=group, message=current_message)
                         self.last_failure_summary = {"group_id": group.get("group_id"), "reason": "cooldown"}
                         logger.warning(
                             "WORKER LOOP SKIP CONDITION: cooldown group_id=%s now=%s cooldown_until=%s",
@@ -1141,12 +1184,12 @@ class AutomationService:
                             now.isoformat(),
                             cooldown_until.isoformat(),
                         )
-                        scheduled_next_run = self._compute_next_run_at(group, message, now)
+                        scheduled_next_run = self._compute_next_run_at(group, current_message, now)
                         await aupdate_group_runtime(
                             group["group_id"],
                             last_status="cooldown",
-                            fail_count=int(group.get("fail_count", 0) or 0),
-                            last_failed_at=group.get("last_failed_at"),
+                            fail_count=self._safe_int(group.get("fail_count", 0), 0),
+                            last_failed_at=self._safe_str(group.get("last_failed_at")),
                             cooldown_until=cooldown_until.isoformat(),
                             next_run_at=scheduled_next_run,
                         )
@@ -1158,7 +1201,7 @@ class AutomationService:
                         continue
 
                     if not self._is_within_active_window(group, now):
-                        self._record_skip("inactive_window", group=group, message=message)
+                        self._record_skip("inactive_window", group=group, message=current_message)
                         self.last_failure_summary = {"group_id": group.get("group_id"), "reason": "inactive_window"}
                         logger.warning(
                             "WORKER LOOP SKIP CONDITION: inactive_window group_id=%s now_hour=%s active_start=%s active_end=%s",
@@ -1167,7 +1210,7 @@ class AutomationService:
                             group.get("active_start_hour"),
                             group.get("active_end_hour"),
                         )
-                        existing_next_run_at = self._parse_timestamp(group.get("next_run_at"))
+                        existing_next_run_at = self._parse_timestamp(self._safe_str(group.get("next_run_at")))
                         next_run_candidate = now + timedelta(minutes=5)
                         if existing_next_run_at is not None:
                             next_run_candidate = min(existing_next_run_at, next_run_candidate)
@@ -1218,7 +1261,7 @@ class AutomationService:
                         self.last_failure_summary = None
                     except FloodWaitError as exc:
                         wait_seconds = max(int(getattr(exc, "seconds", 0) or 0), 1)
-                        fail_count = min(int(group.get("fail_count", 0) or 0) + 1, GROUP_FAILURE_THRESHOLD)
+                        fail_count = min(self._safe_int(group.get("fail_count", 0), 0) + 1, GROUP_FAILURE_THRESHOLD)
                         failed_at = self._utc_now()
                         cooldown_value = None
                         if fail_count >= GROUP_FAILURE_THRESHOLD:
@@ -1248,12 +1291,12 @@ class AutomationService:
                         logger.info("[CYCLE COMPLETE] result=flood_wait group_id=%s", group.get("group_id"))
                         continue
                     except Exception as exc:
-                        fail_count = min(int(group.get("fail_count", 0) or 0) + 1, GROUP_FAILURE_THRESHOLD)
+                        fail_count = min(self._safe_int(group.get("fail_count", 0), 0) + 1, GROUP_FAILURE_THRESHOLD)
                         failed_at = self._utc_now()
                         cooldown_value = None
                         if fail_count >= GROUP_FAILURE_THRESHOLD:
                             cooldown_value = (failed_at + timedelta(minutes=GROUP_FAILURE_COOLDOWN_MINUTES)).isoformat()
-                        next_run_at_value = self._compute_next_run_at(group, message, failed_at)
+                        next_run_at_value = self._compute_next_run_at(group, current_message, failed_at)
                         await aupdate_group_runtime(
                             group["group_id"],
                             last_status="error",
@@ -1274,7 +1317,7 @@ class AutomationService:
                             "automation_group_failure group_id=%s group_name=%s message_id=%s error=%s",
                             group.get("group_id"),
                             group.get("group_name"),
-                            message.get("id"),
+                            current_message.get("id"),
                             exc,
                         )
                         logger.info("[CYCLE COMPLETE] result=failed group_id=%s", group.get("group_id"))
@@ -1390,7 +1433,10 @@ async def handle_bot_automation(event) -> None:
             reply_event.set()
             automation_service._set_bot_runtime(bot_name, "WAITING_REPLY", last_activity_ts=automation_service._utc_now().isoformat())
             automation_service._increment_bot_runtime(bot_name, partner_replies=1)
-            automation_service._record_message_reply(bot_name, session.get("last_conversation_message_id"))
+            automation_service._record_message_reply(
+                bot_name,
+                automation_service._safe_int(session.get("last_conversation_message_id"), 0) or None,
+            )
             logger.info("BOT PARTNER REPLY DETECTED bot=%s chat=%s text=%s", bot_name, chat_username, text[:120])
             return
 
@@ -1437,7 +1483,9 @@ async def start_worker() -> None:
         try:
             await telegram_service.ensure_connected()
             client = telegram_service._ensure_client()
-            client.add_event_handler(handle_bot_automation, events.NewMessage(incoming=True))
+            if not getattr(telegram_service, "_bot_event_handler_registered", False):
+                client.add_event_handler(handle_bot_automation, events.NewMessage(incoming=True))
+                telegram_service._bot_event_handler_registered = True
             logger.info("Telegram user session connected")
             validation = repair_promotion_data()
             logger.warning(
@@ -1503,7 +1551,9 @@ async def send_command(bot_username: str, command: str) -> None:
     await telegram_service.ensure_connected()
     normalized = _normalize_command(command)
     if normalized:
-        await telegram_service.client.send_message(bot_username, normalized)
+        client = telegram_service.client
+        assert client is not None
+        await client.send_message(bot_username, normalized)
 
 
 def get_client() -> TelegramClient:
@@ -1513,7 +1563,7 @@ def get_client() -> TelegramClient:
 def get_worker_status() -> dict[str, object]:
     enabled_bots = list_enabled_bots()
     enabled_groups = list_enabled_groups()
-    active_messages = list_bot_messages(enabled=True) + list_group_messages(enabled=True) + list_stickers(enabled=True)
+    active_messages = list_bot_messages(enabled_only=True) + list_group_messages(enabled_only=True) + list_stickers(enabled_only=True)
     return {
         "worker_running": automation_service.is_running,
         "worker_paused": automation_service.is_paused,
