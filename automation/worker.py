@@ -43,14 +43,9 @@ from storage.db import (
     get_bot_runtime,
     get_setting,
     increment_message_performance,
-    is_category_message_enabled,
-    is_bot_enabled,
     is_bot_paused,
     list_groups,
     list_category_messages,
-    get_category_message,
-    list_bot_messages,
-    list_group_messages,
     list_stickers,
     set_bot_paused,
     set_setting,
@@ -497,23 +492,6 @@ class AutomationService:
         if event is not None:
             event.set()
 
-    def _choose_message(self, category: str) -> dict[str, object] | None:
-        if category == "bot_messages":
-            messages = list_bot_messages(enabled_only=True)
-        elif category == "group_messages":
-            messages = list_group_messages(enabled_only=True)
-        elif category == "promotion_stickers":
-            messages = list_stickers(enabled_only=True)
-        else:
-            messages = list_category_messages(category, active_only=False)
-        if not messages:
-            return None
-        enabled_messages = [message for message in messages if bool(message.get("enabled", True))]
-        if not enabled_messages:
-            logger.warning("MESSAGE CHOICE SKIP category=%s reason=no_enabled_messages", category)
-            return None
-        return random.choice(enabled_messages)
-
     async def _sleep_with_wakeup(self, seconds: float) -> bool:
         if seconds <= 0:
             return False
@@ -595,32 +573,14 @@ class AutomationService:
             return False
 
     async def _resolve_event_bot_name(self, event) -> str | None:
-        chat = await event.get_chat()
         sender = await event.get_sender()
-        chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
         sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
+        
         if getattr(sender, "bot", False) and sender_username:
+            logger.debug("EVENT OWNERSHIP: sender_is_bot username=%s", sender_username)
             return sender_username
-        if chat_username:
-            return chat_username
-        for ref in (
-            getattr(event, "chat_id", None),
-            getattr(event, "sender_id", None),
-            getattr(getattr(event, "peer_id", None), "chat_id", None),
-            getattr(getattr(event, "peer_id", None), "channel_id", None),
-            getattr(getattr(event, "peer_id", None), "user_id", None),
-        ):
-            if ref is None:
-                continue
-            try:
-                entity = await self.telegram.resolve_entity(str(ref))
-            except Exception:
-                continue
-            resolved_username = str(getattr(entity, "username", "") or "").lstrip("@")
-            if resolved_username:
-                return resolved_username
-        if sender_username:
-            return sender_username
+        
+        logger.debug("EVENT OWNERSHIP: REJECTED - not_a_bot_sender sender=%s", sender_username)
         return None
 
     async def _send_bot_promotion(self, bot_name: str, settings: dict[str, object]) -> None:
@@ -651,11 +611,8 @@ class AutomationService:
             sticker_sent = await self._send_promotion_sticker(bot_name)
             if not sticker_sent:
                 logger.warning("PROMOTION STICKER FAILED bot=%s message_id=%s", bot_name, selected_message.get("id"))
-                self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="promotion_sticker_failed", last_failure_ts=self._utc_now().isoformat())
-                self._increment_bot_runtime(bot_name, error_count=1)
-            else:
-                self._increment_bot_runtime(bot_name, promotions_sent=1)
-                self._set_bot_runtime(bot_name, "IDLE")
+            self._increment_bot_runtime(bot_name, promotions_sent=1)
+            self._set_bot_runtime(bot_name, "IDLE")
             return
         if chosen_mode == "BOTH":
             message_sent = await self._send_saved_payload_guarded(bot_name, selected_message, "promotion_both_message")
@@ -668,11 +625,8 @@ class AutomationService:
             sticker_sent = await self._send_promotion_sticker(bot_name)
             if not sticker_sent:
                 logger.warning("PROMOTION BOTH STICKER FAILED bot=%s message_id=%s", bot_name, selected_message.get("id"))
-                self._set_bot_runtime(bot_name, "ERROR", last_failure_reason="promotion_sticker_failed", last_failure_ts=self._utc_now().isoformat())
-                self._increment_bot_runtime(bot_name, error_count=1)
-            else:
-                self._increment_bot_runtime(bot_name, promotions_sent=1)
-                self._set_bot_runtime(bot_name, "IDLE")
+            self._increment_bot_runtime(bot_name, promotions_sent=1)
+            self._set_bot_runtime(bot_name, "IDLE")
             return
         logger.warning("PROMOTION SKIP bot=%s reason=invalid_mode resolved_mode=%s", bot_name, chosen_mode)
         self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="invalid_promotion_mode", last_failure_ts=self._utc_now().isoformat())
@@ -771,9 +725,8 @@ class AutomationService:
         try:
             await self.telegram.ensure_connected()
             client = self.telegram._ensure_client()
-            # Send sticker to self/storage
             logger.info("STICKER SEND START bot=%s sticker_id=%s file_id=%s", bot_name, sticker.get("_id"), file_id[:20])
-            await client.send_file("me", file_id)
+            await client.send_file(bot_name, file_id)
             logger.info("STICKER SEND SUCCESS bot=%s sticker_id=%s", bot_name, sticker.get("_id"))
             self.telegram.last_send_success = True
             self.telegram.last_error = None
@@ -818,13 +771,12 @@ class AutomationService:
             group.get("next_run_at"),
             group.get("cooldown_until"),
             mode,
-            message.get("id"),
+message.get("id"),
         )
         if mode in {"STICKER", "BOTH"}:
             sticker_sent = await self._send_promotion_sticker(group["group_id"])
             if mode == "STICKER":
-                if sticker_sent:
-                    self.last_successful_promotion = dict(self.last_promotion_attempt)
+                self.last_successful_promotion = dict(self.last_promotion_attempt) if sticker_sent else None
                 return
             if sticker_sent:
                 await asyncio.sleep(1)
@@ -955,8 +907,8 @@ class AutomationService:
                 bot_messages = await alist_bot_messages_enabled()
                 group_messages = await alist_group_messages_enabled()
                 stickers = await alist_stickers_enabled()
-                messages = bot_messages + group_messages + stickers
-                active_messages_count = len(messages)
+                promotion_messages = bot_messages + group_messages
+                active_messages_count = len(promotion_messages)
                 self._log_timing("DB READ list_message_collections", db_messages_start, timings)
                 mongo_total_ms = sum(elapsed for label, elapsed in timings if label.startswith("DB READ"))
                 logger.info(
@@ -989,7 +941,7 @@ class AutomationService:
                     group_ids,
                 )
 
-                if not groups or not messages or not bots:
+                if not groups or not promotion_messages or not bots:
                     self._record_skip("missing_groups_or_messages", groups=enabled_groups_count, messages=active_messages_count, bots=enabled_bots_count)
                     logger.warning(
                         "WORKER LOOP SKIP: groups_or_messages_missing groups=%s messages=%s bots=%s",
@@ -1003,7 +955,7 @@ class AutomationService:
                 now = self._utc_now()
                 for offset in range(len(groups)):
                     group = groups[(snapshot.group_index + offset) % len(groups)]
-                    current_message = messages[snapshot.message_index % len(messages)]
+                    current_message = promotion_messages[snapshot.message_index % len(promotion_messages)]
                     assigned_bot_name = str(group.get("assigned_bot") or group.get("bot_username") or "").strip().lstrip("@")
                     logger.debug(
                         "GROUP BOT ASSIGNMENT: group_id=%s group_username=%s assigned_bot=%s",
@@ -1022,7 +974,7 @@ class AutomationService:
                         bool(bot),
                         bot.get("enabled") if bot else None,
                     )
-                    if not bot or not is_bot_enabled(assigned_bot_name, False):
+                    if not bot or not bot.get("enabled", True):
                         self._record_skip("assigned_bot_missing_or_disabled", group=group)
                         self.last_failure_summary = {"group_id": group.get("group_id"), "reason": "assigned_bot_missing_or_disabled"}
                         continue
@@ -1278,21 +1230,11 @@ async def handle_bot_automation(event) -> None:
         sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
         bot_name = await automation_service._resolve_event_bot_name(event)
         text = (event.raw_text or "").strip().lower()
-        enabled_bots = {name: bot for name, bot in get_bots().items() if bool(bot.get("enabled", False))}
-        if not bot_name and len(enabled_bots) == 1:
-            bot_name = next(iter(enabled_bots))
-            logger.info("BOT EVENT FALLBACK reason=single_enabled_bot bot=%s", bot_name)
         if not bot_name:
             logger.debug("BOT EVENT SKIP reason=no_bot_name chat=%s sender=%s", chat_username, sender_username)
             return
 
         bot = get_bot(bot_name) or await aget_bot(bot_name)
-        if bot is None and len(enabled_bots) == 1:
-            fallback_bot_name, fallback_bot = next(iter(enabled_bots.items()))
-            if fallback_bot_name != bot_name:
-                logger.warning("BOT EVENT FALLBACK reason=resolved_bot_missing requested=%s fallback=%s", bot_name, fallback_bot_name)
-            bot_name = fallback_bot_name
-            bot = fallback_bot
         enabled = bool(bot and bot.get("enabled", False))
         if not bot or not enabled:
             logger.debug("BOT EVENT SKIP bot=%s exists=%s enabled=%s", bot_name, bool(bot), enabled if bot else None)
