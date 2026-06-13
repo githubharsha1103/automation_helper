@@ -714,7 +714,7 @@ class AutomationService:
         sticker = random.choice(stickers)
         file_id = sticker.get("file_id")
         if not file_id:
-            logger.warning("STICKER PROMOTION SKIP bot=%s reason=missing_file_id sticker_id=%s", bot_name, sticker.get("_id"))
+            logger.warning("STICKER PROMOTION SKIP bot=%s reason=missing_file_id sticker_id=%s", bot_name, sticker.get("id"))
             record_operation(
                 "send_sticker",
                 (time.monotonic() - cycle_start) * 1000,
@@ -726,9 +726,9 @@ class AutomationService:
         try:
             await self.telegram.ensure_connected()
             client = self.telegram._ensure_client()
-            logger.info("STICKER SEND START bot=%s sticker_id=%s file_id=%s", bot_name, sticker.get("_id"), file_id[:20])
+            logger.info("STICKER SEND START bot=%s sticker_id=%s file_id=%s", bot_name, sticker.get("id"), file_id[:20])
             await client.send_file(bot_name, file_id)
-            logger.info("STICKER SEND SUCCESS bot=%s sticker_id=%s", bot_name, sticker.get("_id"))
+            logger.info("STICKER SEND SUCCESS bot=%s sticker_id=%s", bot_name, sticker.get("id"))
             self.telegram.last_send_success = True
             self.telegram.last_error = None
             self.telegram.last_send_ms = (time.monotonic() - cycle_start) * 1000
@@ -737,14 +737,14 @@ class AutomationService:
                 self.telegram.last_send_ms,
                 True,
                 "promotion",
-                {"bot": bot_name, "sticker_id": str(sticker.get("_id"))},
+                {"bot": bot_name, "sticker_id": str(sticker.get("id"))},
             )
             metrics = CURRENT_CYCLE.get()
             if metrics is not None:
                 metrics.messages_sent += 1
             return True
         except Exception as exc:
-            logger.exception("STICKER SEND FAILED bot=%s sticker_id=%s error=%s", bot_name, sticker.get("_id"), exc)
+            logger.exception("STICKER SEND FAILED bot=%s sticker_id=%s error=%s", bot_name, sticker.get("id"), exc)
             self.telegram.last_send_success = False
             self.telegram.last_error = str(exc)
             self.telegram.last_send_ms = (time.monotonic() - cycle_start) * 1000

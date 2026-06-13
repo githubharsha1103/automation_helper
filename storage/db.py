@@ -389,9 +389,11 @@ async def alist_group_messages_enabled() -> list[dict[str, Any]]:
 # NEW STICKER SYSTEM (Stores file_id directly)
 # ===================================================
 
-def add_sticker(file_id: str, emoji: str | None = None) -> str:
-    """Add sticker with file_id, return ObjectId as string"""
+def add_sticker(file_id: str, emoji: str | None = None) -> int:
+    """Add sticker with file_id, return integer id for consistency with other messages"""
+    message_id = _next_message_id("promotion_stickers")
     doc = {
+        "id": message_id,
         "file_id": file_id,
         "emoji": emoji or "",
         "enabled": True,
@@ -402,33 +404,33 @@ def add_sticker(file_id: str, emoji: str | None = None) -> str:
     result = _mongo_db()["promotion_stickers"].insert_one(doc)
     _MESSAGE_CACHE["promotion_stickers"].pop(result.inserted_id, None)
     _invalidate_runtime_caches("messages")
-    logger.warning("STICKER ADDED sticker_id=%s file_id=%s emoji=%s", result.inserted_id, file_id, emoji)
-    return str(result.inserted_id)
+    logger.warning("STICKER ADDED sticker_id=%s file_id=%s emoji=%s", message_id, file_id, emoji)
+    return message_id
 
 
-def delete_sticker(sticker_id: str) -> bool:
+def delete_sticker(sticker_id: int) -> bool:
     """Delete sticker"""
-    result = _mongo_db()["promotion_stickers"].delete_one({"_id": ObjectId(sticker_id)})
+    result = _mongo_db()["promotion_stickers"].delete_one({"id": int(sticker_id)})
     _MESSAGE_CACHE["promotion_stickers"].pop(sticker_id, None)
     _invalidate_runtime_caches("messages")
     logger.warning("STICKER DELETED sticker_id=%s", sticker_id)
     return bool(result.deleted_count)
 
 
-def toggle_sticker(sticker_id: str) -> bool:
+def toggle_sticker(sticker_id: int) -> bool:
     """Toggle sticker enabled/disabled"""
-    doc = _mongo_db()["promotion_stickers"].find_one({"_id": ObjectId(sticker_id)})
+    doc = _mongo_db()["promotion_stickers"].find_one({"id": int(sticker_id)})
     if not doc:
         return False
     new_enabled = not bool(doc.get("enabled", True))
     return update_sticker(sticker_id, enabled=new_enabled)
 
 
-def update_sticker(sticker_id: str, **changes: Any) -> bool:
+def update_sticker(sticker_id: int, **changes: Any) -> bool:
     """Update sticker fields"""
     changes["updated_at"] = datetime.utcnow()
     result = _mongo_db()["promotion_stickers"].update_one(
-        {"_id": ObjectId(sticker_id)},
+        {"id": int(sticker_id)},
         {"$set": changes}
     )
     _MESSAGE_CACHE["promotion_stickers"].pop(sticker_id, None)
@@ -443,8 +445,8 @@ def list_stickers(enabled_only: bool = True) -> list[dict[str, Any]]:
     docs = _mongo_db()["promotion_stickers"].find(query).sort("created_at", 1)
     stickers = []
     for doc in docs:
-        sticker = {k: v for k, v in doc.items() if k != "_id"}
-        sticker["_id"] = str(doc["_id"])
+        sticker = {k: v for k, v in doc.items() if k not in ("_id",)}
+        sticker["id"] = doc.get("id", doc["_id"])
         stickers.append(sticker)
     return stickers
 
@@ -609,6 +611,38 @@ def migrate_message_ids() -> dict[str, Any]:
         "skipped_total": skipped_total,
         "details": details,
     }
+
+
+def migrate_sticker_ids() -> dict[str, Any]:
+    """Migrate stickers from ObjectId _id to integer id field"""
+    collection = _mongo_db()["promotion_stickers"]
+    docs = list(collection.find({"$or": [{"id": {"$exists": False}}, {"id": None}]}))
+    if not docs:
+        return {"migrated": 0, "skipped": 0, "details": {}}
+    
+    existing_ids = {
+        int(doc["id"])
+        for doc in collection.find({"id": {"$type": "int"}}, {"id": 1})
+        if doc.get("id") is not None
+    }
+    next_id = max(existing_ids) + 1 if existing_ids else 1
+    migrated = 0
+    skipped = 0
+    
+    for doc in docs:
+        legacy_id = doc.get("id")
+        if isinstance(legacy_id, int) and legacy_id > 0:
+            skipped += 1
+            continue
+        while next_id in existing_ids:
+            next_id += 1
+        collection.update_one({"_id": doc["_id"]}, {"$set": {"id": next_id, "updated_at": datetime.utcnow()}})
+        existing_ids.add(next_id)
+        next_id += 1
+        migrated += 1
+    
+    logger.info("STICKER ID MIGRATION migrated=%s skipped=%s", migrated, skipped)
+    return {"migrated": migrated, "skipped": skipped, "details": {"promotion_stickers": {"migrated": migrated, "skipped": skipped}}}
 
 
 def get_message_performance(category: str, message_id: int) -> dict[str, int]:
@@ -979,9 +1013,11 @@ def init_db() -> None:
     for collection_name in ("conversational_messages", "bot_messages", "group_messages", "promotion_stickers"):
         db[collection_name].create_index([("enabled", 1), ("created_at", 1)])
     migrate_message_ids()
+    migrate_sticker_ids()
     for collection_name in ("conversational_messages", "bot_messages", "group_messages"):
         db[collection_name].create_index([("id", 1)], unique=True)
     db["promotion_stickers"].create_index([("file_id", 1)], unique=True)
+    db["promotion_stickers"].create_index([("id", 1)], unique=True)
     db["bot_settings"].create_index([("bot_name", 1)], unique=True)
 
 
