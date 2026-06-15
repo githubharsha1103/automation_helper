@@ -31,6 +31,7 @@ from storage.db import (
     aupdate_group_runtime,
     db_status,
     list_enabled_bots,
+    list_enabled_bots_dict,
     list_enabled_groups,
     repair_promotion_data,
     record_operation,
@@ -632,6 +633,7 @@ class AutomationService:
         self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="invalid_promotion_mode", last_failure_ts=self._utc_now().isoformat())
 
     async def _run_bot_conversation(self, bot_name: str, settings: dict[str, object]) -> None:
+        logger.warning("CONVERSATION FUNCTION ENTERED: %s", bot_name)
         no_response_timeout = self._safe_positive_float(settings.get("no_response_timeout", 0), 0.0)
         session = self._bot_session(bot_name)
         session["active"] = True
@@ -641,7 +643,7 @@ class AutomationService:
         reply_event.clear()
         self._set_bot_runtime(bot_name, "CONVERSATION_START")
         self._increment_bot_runtime(bot_name, conversations_started=1)
-        logger.warning("CONVERSATION STARTED: %s", bot_name)
+        logger.info("CONVERSATION_START bot=%s timeout=%s", bot_name, no_response_timeout)
         
         try:
             if not is_bot_enabled(bot_name, False):
@@ -728,6 +730,7 @@ class AutomationService:
             self._set_bot_runtime(bot_name, "CLEANUP")
             self._set_bot_runtime(bot_name, "IDLE")
             logger.info("CONVERSATION_ENDED bot=%s", bot_name)
+            logger.warning("CONVERSATION FUNCTION EXITED: %s", bot_name)
 
     @staticmethod
     def _promotion_mode() -> str:
@@ -1407,24 +1410,28 @@ async def start_group_worker() -> None:
 
 async def run_bot_automation() -> None:
     logger.warning("BOT AUTOMATION STARTED")
+    logger.warning("ABOUT TO RUN CONVERSATION")
     while True:
         try:
+            logger.warning("ABOUT TO RUN CONVERSATION - LOOP START")
             await telegram_service.ensure_connected()
-            bots = list_enabled_bots()
-            if not bots:
+            logger.warning("TELEGRAM CONNECTED")
+            bots_dict = list_enabled_bots_dict()
+            logger.warning("RAW ENABLED BOTS: type=%s repr=%s", type(bots_dict).__name__, repr(bots_dict)[:500])
+            logger.warning("ENABLED BOTS RESULT: enabled_count=%s", len(bots_dict))
+            if not bots_dict:
                 await asyncio.sleep(5)
                 continue
             
-            for bot in bots:
-                bot_name = bot.get("_id") or bot.get("username") or bot.get("bot_name")
-                if not bot_name:
-                    continue
+            for bot_name, bot in bots_dict.items():
+                logger.warning("RAW BOT ITEM: type=%s repr=%s", type(bot).__name__, repr(bot)[:200])
+                logger.warning("EXTRACTED BOT NAME: %s", bot_name)
                 logger.warning("BOT SELECTED: %s", bot_name)
                 settings = get_bot_settings(bot_name)
-                logger.warning("CONVERSATION STARTED: %s", bot_name)
+                logger.warning("CONVERSATION FUNCTION ENTERED: %s", bot_name)
                 try:
                     await automation_service._run_bot_conversation(bot_name, settings)
-                    logger.warning("CONVERSATION ENDED: %s", bot_name)
+                    logger.warning("CONVERSATION FUNCTION EXITED: %s", bot_name)
                 except Exception as e:
                     logger.exception("CONVERSATION FAILED: %s error=%s", bot_name, e)
             
@@ -1436,8 +1443,11 @@ async def run_bot_automation() -> None:
 
 
 async def start_bot_worker() -> None:
+    logger.warning("BOT WORKER STARTED")
+    logger.warning("ABOUT TO RUN CONVERSATION")
     while True:
         try:
+            logger.warning("ABOUT TO RUN CONVERSATION - LOOP START")
             await run_bot_automation()
         except Exception:
             logger.exception("Bot worker crashed")

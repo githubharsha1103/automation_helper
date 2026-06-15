@@ -873,6 +873,17 @@ def list_enabled_bots() -> list[dict[str, Any]]:
     return enabled
 
 
+def list_enabled_bots_dict() -> dict[str, dict[str, Any]]:
+    bots_dict = get_bots()
+    enabled = {
+        bot_name: dict(bot)
+        for bot_name, bot in bots_dict.items()
+        if bool(bot.get("enabled", False))
+    }
+    logger.warning("ENABLED BOTS RESULT: enabled_count=%s", len(enabled))
+    return enabled
+
+
 def list_enabled_groups() -> list[dict[str, Any]]:
     start = time.monotonic()
     groups = list_groups(enabled_only=False)
