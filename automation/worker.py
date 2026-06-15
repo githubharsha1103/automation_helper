@@ -585,18 +585,35 @@ class AutomationService:
         sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
         chat_id = getattr(chat, "id", None)
         sender_id = getattr(sender, "id", None)
-        
-        if getattr(sender, "bot", False):
+        chat_bot = bool(getattr(chat, "bot", False))
+        chat_is_group = bool(getattr(chat, "megagroup", False)) or str(type(chat).__name__) in ("Chat", "ChatForbidden")
+        chat_is_channel = str(type(chat).__name__) in ("Channel",)
+        chat_entity_type = type(chat).__name__
+        sender_bot = bool(getattr(sender, "bot", False))
+
+        logger.info(
+            "CHAT_ENTITY_TYPE=%s CHAT_IS_BOT=%s CHAT_IS_GROUP=%s CHAT_IS_CHANNEL=%s CHAT_USERNAME=%s CHAT_ID=%s",
+            chat_entity_type, chat_bot, chat_is_group, chat_is_channel, chat_username, chat_id,
+        )
+
+        if sender_bot:
             if sender_username:
                 logger.info("EVENT OWNERSHIP: sender_is_bot username=%s", sender_username)
                 return sender_username
             logger.info("EVENT OWNERSHIP: REJECTED - bot_sender_no_username sender=%s", sender_username)
             return None
-        
-        if chat_username:
-            logger.info("EVENT OWNERSHIP: sender_is_human target_bot=%s", chat_username)
+
+        if chat_username and chat_bot:
+            logger.info("EVENT OWNERSHIP: sender_is_human chat_is_bot target_bot=%s", chat_username)
             return chat_username
-        
+
+        if chat_username and not chat_bot:
+            logger.info(
+                "EVENT OWNERSHIP: REJECTED - chat_is_not_bot chat_entity=%s chat_username=%s chat_id=%s",
+                chat_entity_type, chat_username, chat_id,
+            )
+            return None
+
         bots_dict = get_bots()
         for bot_name, bot_config in bots_dict.items():
             if bot_config.get("enabled", False):
@@ -604,7 +621,7 @@ class AutomationService:
                 if bot_telegram_id and str(bot_telegram_id) == str(chat_id):
                     logger.info("EVENT OWNERSHIP: matched_by_chat_id bot=%s", bot_name)
                     return bot_name
-        
+
         if sender_id:
             for bot_name, bot_config in bots_dict.items():
                 if bot_config.get("enabled", False):
@@ -612,8 +629,8 @@ class AutomationService:
                     if bot_telegram_id and str(bot_telegram_id) == str(sender_id):
                         logger.info("EVENT OWNERSHIP: matched_by_sender_id bot=%s", bot_name)
                         return bot_name
-        
-        logger.info("EVENT OWNERSHIP: REJECTED - no_chat_username chat=%s chat_id=%s", chat_username, chat_id)
+
+        logger.info("EVENT OWNERSHIP: REJECTED - no_match chat=%s chat_id=%s", chat_username, chat_id)
         return None
 
     async def _send_bot_promotion(self, bot_name: str, settings: dict[str, object]) -> None:
@@ -1303,14 +1320,18 @@ async def handle_bot_automation(event) -> None:
         sender = await event.get_sender()
         chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
         sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
-        logger.info("EVENT_RECEIVED chat=%s sender=%s", chat_username, sender_username)
+        chat_bot = bool(getattr(chat, "bot", False))
+        chat_entity_type = type(chat).__name__
+        logger.info("EVENT_RECEIVED chat=%s sender=%s chat_entity=%s chat_is_bot=%s",
+                    chat_username, sender_username, chat_entity_type, chat_bot)
         bot_name = await automation_service._resolve_event_bot_name(event)
         logger.info("RESOLVE_EVENT_RESULT bot_name=%s", bot_name)
         if bot_name:
             logger.info("RESOLVE_EVENT_FORMAT bot_name_stripped=%s", bot_name.lstrip("@"))
         text = (event.raw_text or "").strip().lower()
         if not bot_name:
-            logger.warning("RETURN_REASON=no_bot_name chat=%s sender=%s", chat_username, sender_username)
+            logger.warning("RETURN_REASON=no_bot_name chat=%s sender=%s chat_entity=%s",
+                           chat_username, sender_username, chat_entity_type)
             return
         logger.info("BOT_RESOLUTION_SUCCESS bot=%s", bot_name)
         logger.info("BOT_RESOLUTION_FORMAT bot_name=%s repr=%s", bot_name, repr(bot_name))
