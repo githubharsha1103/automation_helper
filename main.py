@@ -9,7 +9,7 @@ print("[BOOT] Starting main.py import sequence")
 
 try:
     print("[BOOT] Importing automation.worker")
-    from automation.worker import telegram_service, start_group_worker, start_worker, start_bot_worker
+    from automation.worker import telegram_service, start_group_worker, start_worker
     print("[BOOT] Importing controller.controller")
     from controller.controller import TOKEN as CONTROL_BOT_TOKEN, start_controller
     print("[BOOT] Importing storage.db")
@@ -102,7 +102,6 @@ async def main() -> None:
     tasks = []
     if telegram_service._configured:
         tasks.append(asyncio.create_task(_run_named_task("worker", start_worker())))
-        tasks.append(asyncio.create_task(_run_named_task("bot worker", start_bot_worker())))
         from storage.db import list_enabled_groups
         enabled_groups = list_enabled_groups()
         if enabled_groups:

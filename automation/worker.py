@@ -53,6 +53,8 @@ from storage.db import (
     set_setting,
     get_group,
     update_group_runtime,
+    list_bot_messages,
+    list_group_messages,
 )
 
 load_dotenv()
@@ -634,111 +636,122 @@ class AutomationService:
         self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="invalid_promotion_mode", last_failure_ts=self._utc_now().isoformat())
 
     async def _run_bot_conversation(self, bot_name: str, settings: dict[str, object]) -> None:
-        logger.warning("CONVERSATION FUNCTION ENTERED: %s", bot_name)
+        logger.warning("CONVERSATION FUNCTION ENTERED: %s task_id=%s", bot_name, id(asyncio.current_task()))
         no_response_timeout = self._safe_positive_float(settings.get("no_response_timeout", 0), 0.0)
         session = self._bot_session(bot_name)
-        session["active"] = True
-        session["engaged"] = False
-        session["completed"] = False
-        reply_event = self._bot_reply_events[bot_name]
-        reply_event.clear()
-        self._set_bot_runtime(bot_name, "CONVERSATION_START")
-        self._increment_bot_runtime(bot_name, conversations_started=1)
-        logger.info("CONVERSATION_START bot=%s timeout=%s", bot_name, no_response_timeout)
         
-        try:
-            if not is_bot_enabled(bot_name, False):
-                logger.warning("CONVERSATION_ABORTED bot=%s reason=disabled", bot_name)
-                self._set_bot_runtime(bot_name, "CLEANUP")
-                return
-            if session.get("engaged"):
-                logger.info("CONVERSATION_SKIPPED bot=%s reason=already_engaged", bot_name)
-                return
-            
-            conversational_messages = list_category_messages("conversational_messages", active_only=True)
-            last_message_id = None
-            
-            opener_sent = False
-            while True:
-                if not conversational_messages:
-                    logger.info("CONVERSATION_ENDED bot=%s reason=no_messages", bot_name)
-                    break
-                
-                available_messages = [m for m in conversational_messages if m.get("id") != last_message_id]
-                if not available_messages:
-                    available_messages = conversational_messages
-                
-                message = random.choice(available_messages)
-                last_message_id = self._safe_int(message.get("id"), 0)
-                self._set_bot_runtime(bot_name, "CONVERSATION_MESSAGE_SENT")
-                logger.info("CONVERSATION_MESSAGE_SENT bot=%s message_id=%s", bot_name, last_message_id)
-                
-                if not opener_sent:
-                    logger.warning("BEFORE_OPENER_SEND: %s message_id=%s", bot_name, last_message_id)
-                
-                sent = await self._send_saved_payload_guarded(bot_name, message, "conversation")
-                if not sent:
-                    logger.warning("CONVERSATION_MESSAGE_FAILED bot=%s message_id=%s", bot_name, last_message_id)
-                    break
-                
-                if not opener_sent:
-                    logger.warning("AFTER_OPENER_SEND: %s message_id=%s", bot_name, last_message_id)
-                    opener_sent = True
-                
-                self._record_message_send(bot_name, "conversational_messages", last_message_id)
-                self._set_bot_runtime(bot_name, "WAITING_REPLY")
-                logger.warning("BEFORE_WAIT_REPLY: %s", bot_name)
-                logger.info("WAITING_REPLY bot=%s timeout=%s", bot_name, no_response_timeout)
-                
-                replied = await self._wait_for_partner_reply(bot_name, no_response_timeout)
-                session["engaged"] = bool(replied)
-                
-                if replied:
-                    logger.warning("AFTER_REPLY_RECEIVED: %s", bot_name)
-                    logger.info("PARTNER_REPLY_RECEIVED bot=%s", bot_name)
-                    session["last_partner_reply_at"] = self._utc_now().isoformat()
-                    self._increment_bot_runtime(bot_name, partner_replies=1)
-                    continue
-                else:
-                    logger.info("CONVERSATION_TIMEOUT bot=%s", bot_name)
-                    break
-            
-            self._set_bot_runtime(bot_name, "PROMOTING")
-            logger.warning("BEFORE_PROMOTION: %s", bot_name)
-            await self._send_bot_promotion(bot_name, settings)
-            logger.warning("AFTER_PROMOTION: %s", bot_name)
-            logger.warning("PROMOTION INJECTED: %s", bot_name)
-            logger.info("PROMOTION_MESSAGE_SENT bot=%s", bot_name)
-            
-            mode = self._promotion_mode()
-            if mode in {"STICKER", "BOTH"}:
-                sticker_sent = await self._send_promotion_sticker(bot_name)
-                if sticker_sent:
-                    logger.info("PROMOTION_STICKER_SENT bot=%s", bot_name)
-                else:
-                    logger.warning("PROMOTION_STICKER_FAILED bot=%s", bot_name)
-            
-            self._set_bot_runtime(bot_name, "DISCONNECTING")
-            logger.info("CHAT_DISCONNECTED bot=%s", bot_name)
-            
-            start_cmd = _normalize_command(settings.get("start_cmd"))
-            if start_cmd:
-                try:
-                    await self.telegram.ensure_connected()
-                    client = self.telegram._ensure_client()
-                    await client.send_message(bot_name, start_cmd)
-                    logger.info("SEARCH_RESTARTED bot=%s command=%s", bot_name, start_cmd)
-                except Exception:
-                    logger.exception("SEARCH_RESTART_FAILED bot=%s", bot_name)
-        finally:
+        lock = self._bot_lock(bot_name)
+        if lock.locked():
+            logger.warning("CONVERSATION SKIP bot=%s reason=already_locked", bot_name)
             session["active"] = False
-            session["completed"] = True
+            return
+        
+        async with lock:
+            logger.info("CONVERSATION LOCK_ACQUIRED bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
+            session["engaged"] = False
+            session["completed"] = False
+            reply_event = self._bot_reply_events[bot_name]
             reply_event.clear()
-            self._clear_bot_session(bot_name)
-            self._set_bot_runtime(bot_name, "CLEANUP")
-            self._set_bot_runtime(bot_name, "IDLE")
-            logger.info("CONVERSATION_ENDED bot=%s", bot_name)
-            logger.warning("CONVERSATION FUNCTION EXITED: %s", bot_name)
+            self._set_bot_runtime(bot_name, "CONVERSATION_START")
+            self._increment_bot_runtime(bot_name, conversations_started=1)
+            logger.info("CONVERSATION_START bot=%s timeout=%s", bot_name, no_response_timeout)
+            
+            try:
+                if not is_bot_enabled(bot_name, False):
+                    logger.warning("CONVERSATION_ABORTED bot=%s reason=disabled", bot_name)
+                    self._set_bot_runtime(bot_name, "CLEANUP")
+                    return
+                if session.get("engaged"):
+                    logger.info("CONVERSATION_SKIPPED bot=%s reason=already_engaged", bot_name)
+                    return
+                
+                conversational_messages = list_category_messages("conversational_messages", active_only=True)
+                last_message_id = None
+                opener_sent = False
+                
+                while True:
+                    if not conversational_messages:
+                        logger.info("CONVERSATION_ENDED bot=%s reason=no_messages", bot_name)
+                        break
+                    
+                    available_messages = [m for m in conversational_messages if m.get("id") != last_message_id]
+                    if not available_messages:
+                        available_messages = conversational_messages
+                    
+                    message = random.choice(available_messages)
+                    last_message_id = self._safe_int(message.get("id"), 0)
+                    self._set_bot_runtime(bot_name, "CONVERSATION_MESSAGE_SENT")
+                    logger.info("CONVERSATION_MESSAGE_SENT bot=%s message_id=%s", bot_name, last_message_id)
+                    
+                    if not opener_sent:
+                        logger.warning("BEFORE_OPENER_SEND: %s message_id=%s", bot_name, last_message_id)
+                    
+                    sent = await self._send_saved_payload_guarded(bot_name, message, "conversation")
+                    if not sent:
+                        logger.warning("CONVERSATION_MESSAGE_FAILED bot=%s message_id=%s", bot_name, last_message_id)
+                        break
+                    
+                    session["last_conversation_message_id"] = last_message_id
+                    
+                    if not opener_sent:
+                        logger.warning("AFTER_OPENER_SEND: %s message_id=%s", bot_name, last_message_id)
+                        opener_sent = True
+                    
+                    self._record_message_send(bot_name, "conversational_messages", last_message_id)
+                    self._set_bot_runtime(bot_name, "WAITING_REPLY")
+                    logger.warning("BEFORE_WAIT_REPLY: %s", bot_name)
+                    logger.info("WAITING_REPLY bot=%s timeout=%s", bot_name, no_response_timeout)
+                    
+                    replied = await self._wait_for_partner_reply(bot_name, no_response_timeout)
+                    session["engaged"] = bool(replied)
+                    
+                    if replied:
+                        logger.info("PARTNER_REPLY_RECEIVED bot=%s", bot_name)
+                        session["last_partner_reply_at"] = self._utc_now().isoformat()
+                        self._increment_bot_runtime(bot_name, partner_replies=1)
+                        self._set_bot_runtime(bot_name, "PARTNER_REPLY_RECEIVED")
+                        break
+                    else:
+                        logger.info("CONVERSATION_TIMEOUT bot=%s", bot_name)
+                        self._set_bot_runtime(bot_name, "CONVERSATION_TIMEOUT")
+                        break
+                
+                self._set_bot_runtime(bot_name, "PROMOTING")
+                logger.warning("BEFORE_PROMOTION: %s", bot_name)
+                logger.info("PROMOTION_SELECTED bot=%s", bot_name)
+                await self._send_bot_promotion(bot_name, settings)
+                logger.info("PROMOTION_SENT bot=%s", bot_name)
+                logger.warning("AFTER_PROMOTION: %s", bot_name)
+                
+                mode = self._promotion_mode()
+                if mode in {"STICKER", "BOTH"}:
+                    sticker_sent = await self._send_promotion_sticker(bot_name)
+                    if sticker_sent:
+                        logger.info("PROMOTION_STICKER_SENT bot=%s", bot_name)
+                    else:
+                        logger.warning("PROMOTION_STICKER_FAILED bot=%s", bot_name)
+                
+                self._set_bot_runtime(bot_name, "DISCONNECTING")
+                logger.info("CHAT_DISCONNECTED bot=%s", bot_name)
+                
+                start_cmd = _normalize_command(settings.get("start_cmd"))
+                if start_cmd:
+                    try:
+                        await self.telegram.ensure_connected()
+                        client = self.telegram._ensure_client()
+                        await client.send_message(bot_name, start_cmd)
+                        logger.info("SEARCH_RESTARTED bot=%s command=%s", bot_name, start_cmd)
+                    except Exception:
+                        logger.exception("SEARCH_RESTART_FAILED bot=%s", bot_name)
+            finally:
+                session["active"] = False
+                session["completed"] = True
+                reply_event.clear()
+                self._clear_bot_session(bot_name)
+                self._set_bot_runtime(bot_name, "CLEANUP")
+                self._set_bot_runtime(bot_name, "IDLE")
+                logger.info("CONVERSATION_ENDED bot=%s", bot_name)
+                logger.warning("CONVERSATION FUNCTION EXITED: %s", bot_name)
 
     @staticmethod
     def _promotion_mode() -> str:
@@ -1294,17 +1307,19 @@ async def handle_bot_automation(event) -> None:
                 logger.exception("Failed to notify security state for %s", bot_name)
             return
 
-        session = automation_service._bot_sessions.get(bot_name)
+        session = automation_service._bot_session(bot_name)
         if session and session.get("active") and not getattr(sender, "bot", False):
+            logger.info("REPLY_CAPTURED bot=%s chat=%s sender=%s message_id=%s text=%s",
+                        bot_name, chat_username, sender_username, event.message_id, text[:100])
             session["engaged"] = True
             session["last_partner_reply_at"] = automation_service._utc_now().isoformat()
             reply_event = automation_service._bot_reply_events.setdefault(bot_name, asyncio.Event())
             reply_event.set()
-            automation_service._set_bot_runtime(bot_name, "WAITING_REPLY", last_activity_ts=automation_service._utc_now().isoformat())
+            automation_service._set_bot_runtime(bot_name, "PARTNER_REPLY_RECEIVED", last_activity_ts=automation_service._utc_now().isoformat())
             automation_service._increment_bot_runtime(bot_name, partner_replies=1)
             automation_service._record_message_reply(
                 bot_name,
-                automation_service._safe_int(session.get("last_conversation_message_id"), 0) or None,
+                session.get("last_conversation_message_id"),
             )
             logger.info("BOT PARTNER REPLY DETECTED bot=%s chat=%s text=%s", bot_name, chat_username, text[:120])
             return
@@ -1319,19 +1334,24 @@ async def handle_bot_automation(event) -> None:
                 return
             settings = get_bot_settings(bot_name)
             lock = automation_service._bot_lock(bot_name)
+            logger.info("LOCK_ACQUIRE_ATTEMPT bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
             if lock.locked():
-                logger.warning("BOT CONVERSATION SKIP bot=%s reason=already_running", bot_name)
+                logger.warning("LOCK_ALREADY_RUNNING bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
                 return
-            async with lock:
-                logger.info("BOT CONVERSATION LOCK ACQUIRED bot=%s", bot_name)
-                await automation_service._run_bot_conversation(bot_name, settings)
-                record_operation(
-                    "bot_automation_cycle",
-                    (time.monotonic() - cycle_start) * 1000,
-                    True,
-                    "worker",
-                    {"bot": bot_name, "flow": "conversation"},
-                )
+            session = automation_service._bot_session(bot_name)
+            if session.get("active"):
+                logger.warning("SESSION_ALREADY_ACTIVE bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
+                return
+            session["active"] = True
+            logger.info("QUEUE_REPLY bot=%s", bot_name)
+            asyncio.create_task(automation_service._run_bot_conversation(bot_name, settings))
+            record_operation(
+                "bot_automation_cycle",
+                (time.monotonic() - cycle_start) * 1000,
+                True,
+                "worker",
+                {"bot": bot_name, "flow": "conversation"},
+            )
     except Exception:
         try:
             automation_service._set_bot_runtime(bot_name or "unknown", "ERROR", last_failure_reason="runtime_exception", last_failure_ts=automation_service._utc_now().isoformat())
@@ -1416,47 +1436,11 @@ async def start_group_worker() -> None:
             await asyncio.sleep(10)
 
 
-async def run_bot_automation() -> None:
-    logger.warning("BOT AUTOMATION STARTED")
-    logger.warning("ABOUT TO RUN CONVERSATION")
-    while True:
-        try:
-            logger.warning("ABOUT TO RUN CONVERSATION - LOOP START")
-            await telegram_service.ensure_connected()
-            logger.warning("TELEGRAM CONNECTED")
-            bots_dict = list_enabled_bots_dict()
-            logger.warning("RAW ENABLED BOTS: type=%s repr=%s", type(bots_dict).__name__, repr(bots_dict)[:500])
-            logger.warning("ENABLED BOTS RESULT: enabled_count=%s", len(bots_dict))
-            if not bots_dict:
-                await asyncio.sleep(5)
-                continue
-            
-            for bot_name, bot in bots_dict.items():
-                logger.warning("RAW BOT ITEM: type=%s repr=%s", type(bot).__name__, repr(bot)[:200])
-                logger.warning("EXTRACTED BOT NAME: %s", bot_name)
-                logger.warning("BOT SELECTED: %s", bot_name)
-                settings = get_bot_settings(bot_name)
-                logger.warning("CONVERSATION FUNCTION ENTERED: %s", bot_name)
-                try:
-                    await automation_service._run_bot_conversation(bot_name, settings)
-                    logger.warning("CONVERSATION FUNCTION EXITED: %s", bot_name)
-                except Exception as e:
-                    logger.exception("CONVERSATION FAILED: %s error=%s", bot_name, e)
-            
-            logger.warning("NEXT CONVERSATION SCHEDULED")
-            await asyncio.sleep(60)
-        except Exception:
-            logger.exception("BOT AUTOMATION ERROR")
-            await asyncio.sleep(30)
-
-
 async def start_bot_worker() -> None:
     logger.warning("BOT WORKER STARTED")
-    logger.warning("ABOUT TO RUN CONVERSATION")
     while True:
         try:
-            logger.warning("ABOUT TO RUN CONVERSATION - LOOP START")
-            await run_bot_automation()
+            await asyncio.sleep(10)
         except Exception:
             logger.exception("Bot worker crashed")
             await asyncio.sleep(10)
