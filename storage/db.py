@@ -853,17 +853,20 @@ def list_enabled_bots() -> list[dict[str, Any]]:
         record_operation("list_enabled_bots", elapsed_ms, True, "mongo", {"cache_hit": True, "total": len(bots), "enabled": len(bots)})
         logger.warning("ENABLED BOTS RESULT: enabled_count=%s", len(bots))
         return bots
-    bots = list(get_bots().values())
-    for bot in bots:
+    bots_dict = get_bots()
+    for bot_name, bot in bots_dict.items():
         logger.warning(
             "BOT STATUS: name=%s enabled=%s",
-            bot.get("username"),
+            bot_name,
             bot.get("enabled")
         )
-    enabled = sorted([bot for bot in bots if bool(bot.get("enabled", False))], key=lambda item: str(item.get("username") or ""))
+    enabled = sorted(
+        [bot for bot in bots_dict.values() if bool(bot.get("enabled", False))],
+        key=lambda item: str(item.get("username") or item.get("bot_name") or "")
+    )
     elapsed_ms = (time.monotonic() - start) * 1000
-    logger.info("DB READ list_enabled_bots elapsed_ms=%.2f total=%s enabled=%s", elapsed_ms, len(bots), len(enabled))
-    record_operation("list_enabled_bots", elapsed_ms, True, "mongo", {"total": len(bots), "enabled": len(enabled)})
+    logger.info("DB READ list_enabled_bots elapsed_ms=%.2f total=%s enabled=%s", elapsed_ms, len(bots_dict), len(enabled))
+    record_operation("list_enabled_bots", elapsed_ms, True, "mongo", {"total": len(bots_dict), "enabled": len(enabled)})
     _ENABLED_BOTS_CACHE["bots"] = [dict(bot) for bot in enabled]
     _ENABLED_BOTS_CACHE["ts"] = time.monotonic()
     logger.warning("ENABLED BOTS RESULT: enabled_count=%s", len(enabled))

@@ -9,7 +9,7 @@ print("[BOOT] Starting main.py import sequence")
 
 try:
     print("[BOOT] Importing automation.worker")
-    from automation.worker import telegram_service, start_group_worker, start_worker
+    from automation.worker import telegram_service, start_group_worker, start_worker, start_bot_worker
     print("[BOOT] Importing controller.controller")
     from controller.controller import TOKEN as CONTROL_BOT_TOKEN, start_controller
     print("[BOOT] Importing storage.db")
@@ -103,6 +103,7 @@ async def main() -> None:
     if telegram_service._configured:
         tasks.append(asyncio.create_task(_run_named_task("worker", start_worker())))
         tasks.append(asyncio.create_task(_run_named_task("group worker", start_group_worker())))
+        tasks.append(asyncio.create_task(_run_named_task("bot worker", start_bot_worker())))
     else:
         _log_startup("Skipping worker startup because API_ID/API_HASH are missing")
 

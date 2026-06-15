@@ -641,7 +641,7 @@ class AutomationService:
         reply_event.clear()
         self._set_bot_runtime(bot_name, "CONVERSATION_START")
         self._increment_bot_runtime(bot_name, conversations_started=1)
-        logger.info("CONVERSATION_START bot=%s timeout=%s", bot_name, no_response_timeout)
+        logger.warning("CONVERSATION STARTED: %s", bot_name)
         
         try:
             if not is_bot_enabled(bot_name, False):
@@ -655,6 +655,7 @@ class AutomationService:
             conversational_messages = list_category_messages("conversational_messages", active_only=True)
             last_message_id = None
             
+            opener_sent = False
             while True:
                 if not conversational_messages:
                     logger.info("CONVERSATION_ENDED bot=%s reason=no_messages", bot_name)
@@ -674,6 +675,10 @@ class AutomationService:
                     logger.warning("CONVERSATION_MESSAGE_FAILED bot=%s message_id=%s", bot_name, last_message_id)
                     break
                 
+                if not opener_sent:
+                    logger.warning("OPENER SENT: %s message_id=%s", bot_name, last_message_id)
+                    opener_sent = True
+                
                 self._record_message_send(bot_name, "conversational_messages", last_message_id)
                 self._set_bot_runtime(bot_name, "WAITING_REPLY")
                 logger.info("WAITING_REPLY bot=%s timeout=%s", bot_name, no_response_timeout)
@@ -692,6 +697,7 @@ class AutomationService:
             
             self._set_bot_runtime(bot_name, "PROMOTING")
             await self._send_bot_promotion(bot_name, settings)
+            logger.warning("PROMOTION INJECTED: %s", bot_name)
             logger.info("PROMOTION_MESSAGE_SENT bot=%s", bot_name)
             
             mode = self._promotion_mode()
@@ -909,10 +915,8 @@ class AutomationService:
             timings: list[tuple[str, float]] = []
             metrics = CycleMetrics(timings=timings)
             token = CURRENT_CYCLE.set(metrics)
-            bots: list[dict[str, object]] = []
             groups: list[dict[str, object]] = []
-            messages: list[dict[str, object]] = []
-            enabled_bots_count = 0
+            promotion_messages: list[dict[str, object]] = []
             enabled_groups_count = 0
             active_messages_count = 0
             try:
@@ -920,20 +924,6 @@ class AutomationService:
                 self._paused = False
                 logger.debug("[LOOP START] running=%s paused=%s", self._running, self._paused)
 
-                db_bots_start = time.monotonic()
-                bots = list_enabled_bots()
-                enabled_bots_count = len(bots)
-                self._log_timing("DB READ list_enabled_bots", db_bots_start, timings)
-                if not bots:
-                    self.last_active_messages_count = 0
-                    self.last_eligible_groups_count = 0
-                    self.last_promotion_summary = {"enabled_bots": 0, "enabled_groups": 0, "active_messages": 0}
-                    self._record_skip("no_enabled_bots")
-                    logger.warning("GROUP WORKER IDLE: enabled_bots=0")
-                    logger.warning("WORKER LOOP SKIP: enabled_bots=0, skipping group/message reads")
-                    enabled_groups_count = 0
-                    active_messages_count = 0
-                    continue
                 db_groups_start = time.monotonic()
                 groups = list_enabled_groups()
                 enabled_groups_count = len(groups)
@@ -947,20 +937,17 @@ class AutomationService:
                 self._log_timing("DB READ list_message_collections", db_messages_start, timings)
                 mongo_total_ms = sum(elapsed for label, elapsed in timings if label.startswith("DB READ"))
                 logger.info(
-                    "WORKER MONGO TOTAL elapsed_ms=%.2f enabled_bots=%s enabled_groups=%s active_messages=%s",
+                    "WORKER MONGO TOTAL elapsed_ms=%.2f enabled_groups=%s active_messages=%s",
                     mongo_total_ms,
-                    enabled_bots_count,
                     enabled_groups_count,
                     active_messages_count,
                 )
                 self.last_promotion_summary = {
-                    "enabled_bots": enabled_bots_count,
                     "enabled_groups": enabled_groups_count,
                     "active_messages": active_messages_count,
                 }
                 logger.info(
-                    "PROMOTION SCHEDULER LOAD: enabled_bots=%s enabled_groups=%s active_messages=%s",
-                    enabled_bots_count,
+                    "PROMOTION SCHEDULER LOAD: enabled_groups=%s active_messages=%s",
                     enabled_groups_count,
                     active_messages_count,
                 )
@@ -976,13 +963,12 @@ class AutomationService:
                     group_ids,
                 )
 
-                if not groups or not promotion_messages or not bots:
-                    self._record_skip("missing_groups_or_messages", groups=enabled_groups_count, messages=active_messages_count, bots=enabled_bots_count)
+                if not groups or not promotion_messages:
+                    self._record_skip("missing_groups_or_messages", groups=enabled_groups_count, messages=active_messages_count)
                     logger.warning(
-                        "WORKER LOOP SKIP: groups_or_messages_missing groups=%s messages=%s bots=%s",
+                        "WORKER LOOP SKIP: groups_or_messages_missing groups=%s messages=%s",
                         enabled_groups_count,
                         active_messages_count,
-                        enabled_bots_count,
                     )
                     continue
 
@@ -1417,6 +1403,45 @@ async def start_group_worker() -> None:
         except Exception:
             logger.exception("Group worker crashed unexpectedly. Restarting shortly.")
             record_operation("group_worker_loop", (time.monotonic() - loop_start) * 1000, False, "worker", {"error": "unexpected"})
+            await asyncio.sleep(10)
+
+
+async def run_bot_automation() -> None:
+    logger.warning("BOT AUTOMATION STARTED")
+    while True:
+        try:
+            await telegram_service.ensure_connected()
+            bots = list_enabled_bots()
+            if not bots:
+                await asyncio.sleep(5)
+                continue
+            
+            for bot in bots:
+                bot_name = bot.get("_id") or bot.get("username") or bot.get("bot_name")
+                if not bot_name:
+                    continue
+                logger.warning("BOT SELECTED: %s", bot_name)
+                settings = get_bot_settings(bot_name)
+                logger.warning("CONVERSATION STARTED: %s", bot_name)
+                try:
+                    await automation_service._run_bot_conversation(bot_name, settings)
+                    logger.warning("CONVERSATION ENDED: %s", bot_name)
+                except Exception as e:
+                    logger.exception("CONVERSATION FAILED: %s error=%s", bot_name, e)
+            
+            logger.warning("NEXT CONVERSATION SCHEDULED")
+            await asyncio.sleep(60)
+        except Exception:
+            logger.exception("BOT AUTOMATION ERROR")
+            await asyncio.sleep(30)
+
+
+async def start_bot_worker() -> None:
+    while True:
+        try:
+            await run_bot_automation()
+        except Exception:
+            logger.exception("Bot worker crashed")
             await asyncio.sleep(10)
 
 
