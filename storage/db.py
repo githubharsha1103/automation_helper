@@ -1545,7 +1545,7 @@ def migrate_add_chat_id_to_bots() -> dict[str, Any]:
     Returns migration stats."""
     collection = _bots_collection()
     bots_without_chat_id = list(collection.find({"chat_id": {"$exists": False}}))
-    if not bots_without chat_id:
+    if not bots_without_chat_id:
         return {"migrated": 0, "skipped": 0, "total": 0}
 
     migrated = 0
