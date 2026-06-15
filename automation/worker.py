@@ -1214,8 +1214,7 @@ class AutomationService:
                 promotions_sent = metrics.messages_sent
                 failures = 0 if self.last_failure_summary is None else 1
                 logger.info(
-                    "SCHEDULER SUMMARY: enabled_bots=%s enabled_groups=%s eligible_groups=%s active_messages=%s promotions_sent=%s failures=%s",
-                    enabled_bots_count,
+                    "SCHEDULER SUMMARY: enabled_groups=%s eligible_groups=%s active_messages=%s promotions_sent=%s failures=%s",
                     enabled_groups_count,
                     enabled_groups_count,
                     active_messages_count,

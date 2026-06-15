@@ -102,8 +102,14 @@ async def main() -> None:
     tasks = []
     if telegram_service._configured:
         tasks.append(asyncio.create_task(_run_named_task("worker", start_worker())))
-        tasks.append(asyncio.create_task(_run_named_task("group worker", start_group_worker())))
         tasks.append(asyncio.create_task(_run_named_task("bot worker", start_bot_worker())))
+        from storage.db import list_enabled_groups
+        enabled_groups = list_enabled_groups()
+        if enabled_groups:
+            tasks.append(asyncio.create_task(_run_named_task("group worker", start_group_worker())))
+        else:
+            _log_startup("GROUP WORKER NOT STARTED: enabled_groups=0")
+            logger.info("GROUP WORKER NOT STARTED: enabled_groups=0")
     else:
         _log_startup("Skipping worker startup because API_ID/API_HASH are missing")
 
