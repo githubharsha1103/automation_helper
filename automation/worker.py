@@ -588,13 +588,13 @@ class AutomationService:
         
         if getattr(sender, "bot", False):
             if sender_username:
-                logger.debug("EVENT OWNERSHIP: sender_is_bot username=%s", sender_username)
+                logger.info("EVENT OWNERSHIP: sender_is_bot username=%s", sender_username)
                 return sender_username
-            logger.debug("EVENT OWNERSHIP: REJECTED - bot_sender_no_username sender=%s", sender_username)
+            logger.info("EVENT OWNERSHIP: REJECTED - bot_sender_no_username sender=%s", sender_username)
             return None
         
         if chat_username:
-            logger.debug("EVENT OWNERSHIP: sender_is_human target_bot=%s", chat_username)
+            logger.info("EVENT OWNERSHIP: sender_is_human target_bot=%s", chat_username)
             return chat_username
         
         bots_dict = get_bots()
@@ -602,7 +602,7 @@ class AutomationService:
             if bot_config.get("enabled", False):
                 bot_telegram_id = bot_config.get("telegram_id") or bot_config.get("id")
                 if bot_telegram_id and str(bot_telegram_id) == str(chat_id):
-                    logger.debug("EVENT OWNERSHIP: matched_by_chat_id bot=%s", bot_name)
+                    logger.info("EVENT OWNERSHIP: matched_by_chat_id bot=%s", bot_name)
                     return bot_name
         
         if sender_id:
@@ -610,10 +610,10 @@ class AutomationService:
                 if bot_config.get("enabled", False):
                     bot_telegram_id = bot_config.get("telegram_id") or bot_config.get("id")
                     if bot_telegram_id and str(bot_telegram_id) == str(sender_id):
-                        logger.debug("EVENT OWNERSHIP: matched_by_sender_id bot=%s", bot_name)
+                        logger.info("EVENT OWNERSHIP: matched_by_sender_id bot=%s", bot_name)
                         return bot_name
         
-        logger.debug("EVENT OWNERSHIP: REJECTED - no_chat_username chat=%s chat_id=%s", chat_username, chat_id)
+        logger.info("EVENT OWNERSHIP: REJECTED - no_chat_username chat=%s chat_id=%s", chat_username, chat_id)
         return None
 
     async def _send_bot_promotion(self, bot_name: str, settings: dict[str, object]) -> None:
@@ -623,7 +623,8 @@ class AutomationService:
             logger.info("PROMOTION DISABLED bot=%s", bot_name)
             self._set_bot_runtime(bot_name, "IDLE")
             return
-        promotion_messages = list_bot_messages(enabled_only=True)
+        promotion_messages = await asyncio.to_thread(list_bot_messages, True)
+        logger.warning("PROMOTION_MESSAGES_FOUND bot=%s count=%s", bot_name, len(promotion_messages))
         if not promotion_messages:
             logger.warning("PROMOTION SKIP bot=%s reason=no_enabled_bot_messages", bot_name)
             self._set_bot_runtime(bot_name, "IDLE", last_failure_reason="no_bot_messages", last_failure_ts=self._utc_now().isoformat())
@@ -694,7 +695,8 @@ class AutomationService:
                     logger.info("CONVERSATION_SKIPPED bot=%s reason=already_engaged", bot_name)
                     return
                 
-                conversational_messages = list_category_messages("conversational_messages", active_only=True)
+                conversational_messages = await asyncio.to_thread(list_category_messages, "conversational_messages", True)
+                logger.warning("CONVERSATIONAL_MESSAGES_FOUND bot=%s count=%s", bot_name, len(conversational_messages))
                 last_message_id = None
                 opener_sent = False
                 
@@ -791,7 +793,7 @@ class AutomationService:
         """Send sticker directly from promotion_stickers collection using file_id.
         target can be a bot username or group_id."""
         cycle_start = time.monotonic()
-        stickers = list_stickers(enabled_only=True)
+        stickers = await asyncio.to_thread(list_stickers, True)
         if not stickers:
             logger.warning("STICKER PROMOTION SKIP target=%s reason=no_enabled_stickers", target)
             record_operation(
@@ -1295,7 +1297,7 @@ async def handle_bot_automation(event) -> None:
     bot_name = None
     try:
         if event is None:
-            logger.warning("BOT EVENT SKIP reason=missing_event")
+            logger.warning("RETURN_REASON=missing_event")
             return
         chat = await event.get_chat()
         sender = await event.get_sender()
@@ -1303,16 +1305,36 @@ async def handle_bot_automation(event) -> None:
         sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
         logger.info("EVENT_RECEIVED chat=%s sender=%s", chat_username, sender_username)
         bot_name = await automation_service._resolve_event_bot_name(event)
+        logger.info("RESOLVE_EVENT_RESULT bot_name=%s", bot_name)
+        if bot_name:
+            logger.info("RESOLVE_EVENT_FORMAT bot_name_stripped=%s", bot_name.lstrip("@"))
         text = (event.raw_text or "").strip().lower()
         if not bot_name:
-            logger.debug("BOT EVENT SKIP reason=no_bot_name chat=%s sender=%s", chat_username, sender_username)
+            logger.warning("RETURN_REASON=no_bot_name chat=%s sender=%s", chat_username, sender_username)
             return
         logger.info("BOT_RESOLUTION_SUCCESS bot=%s", bot_name)
+        logger.info("BOT_RESOLUTION_FORMAT bot_name=%s repr=%s", bot_name, repr(bot_name))
         
-        bot = get_bot(bot_name) or await aget_bot(bot_name)
+        bot = get_bot(bot_name)
+        logger.info("BOT_CACHE_RESULT bot=%s found=%s", bot_name, bool(bot))
+        if bot:
+            logger.info("BOT_CACHE_ENABLED bot=%s enabled=%s", bot_name, bot.get("enabled"))
+        if not bot:
+            logger.info("BOT_DB_LOOKUP_START bot=%s", bot_name)
+            bot = await aget_bot(bot_name)
+            logger.info("BOT_DB_RESULT bot=%s found=%s", bot_name, bool(bot))
+            if bot:
+                logger.info("BOT_DB_ENABLED bot=%s enabled=%s", bot_name, bot.get("enabled"))
         enabled = bool(bot and bot.get("enabled", False))
-        if not bot or not enabled:
-            logger.debug("BOT EVENT SKIP bot=%s exists=%s enabled=%s", bot_name, bool(bot), enabled if bot else None)
+        logger.info("BOT_FINAL_CHECK bot=%s exists=%s enabled=%s", bot_name, bool(bot), enabled)
+        if bot:
+            logger.info("BOT_LOOKUP_SUCCESS bot=%s found=%s enabled=%s username=%s telegram_id=%s",
+                        bot_name, bool(bot), bot.get("enabled"), bot.get("username"), bot.get("telegram_id"))
+        if not bot:
+            logger.warning("RETURN_REASON=BOT_NOT_FOUND bot=%s", bot_name)
+            return
+        if not enabled:
+            logger.warning("RETURN_REASON=BOT_DISABLED bot=%s", bot_name)
             return
 
         security_triggers = [item.lower() for item in bot.get("security_triggers", [])]
@@ -1336,6 +1358,7 @@ async def handle_bot_automation(event) -> None:
                 await notify_security(bot_name)
             except Exception:
                 logger.exception("Failed to notify security state for %s", bot_name)
+            logger.warning("RETURN_REASON=SECURITY_BLOCK bot=%s trigger=%s", bot_name, matched_trigger)
             return
 
         session = automation_service._bot_session(bot_name)
@@ -1353,30 +1376,36 @@ async def handle_bot_automation(event) -> None:
                 session.get("last_conversation_message_id"),
             )
             logger.info("BOT PARTNER REPLY DETECTED bot=%s chat=%s text=%s", bot_name, chat_username, text[:120])
+            logger.warning("RETURN_REASON=PARTNER_REPLY_PROCESSED bot=%s", bot_name)
             return
 
         if not getattr(sender, "bot", False):
+            logger.info("SENDER_IS_HUMAN bot=%s", bot_name)
             match_triggers = [item.lower() for item in (bot.get("match_triggers") or bot.get("triggers") or [])]
+            logger.info("MATCH_TRIGGER_CHECK bot=%s match_triggers=%s text=%s", bot_name, match_triggers, text[:200])
             if match_triggers and not any(trigger in text for trigger in match_triggers):
-                logger.debug("BOT EVENT SKIP bot=%s reason=no_match", bot_name)
+                logger.warning("RETURN_REASON=MATCH_FAILED bot=%s text=%s triggers=%s", bot_name, text[:200], match_triggers)
                 return
             if is_bot_paused(bot_name, False):
-                logger.warning("BOT CONVERSATION SKIP bot=%s reason=paused", bot_name)
+                logger.warning("RETURN_REASON=BOT_PAUSED bot=%s", bot_name)
                 return
             settings = get_bot_settings(bot_name)
             lock = automation_service._bot_lock(bot_name)
             logger.info("LOCK_ACQUIRE_ATTEMPT bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
             if lock.locked():
-                logger.warning("LOCK_ALREADY_RUNNING bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
+                logger.warning("RETURN_REASON=LOCKED bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
                 return
             session = automation_service._bot_session(bot_name)
+            logger.info("SESSION_CHECK bot=%s active=%s", bot_name, session.get("active"))
             if session.get("active"):
-                logger.warning("SESSION_ALREADY_ACTIVE bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
+                logger.warning("RETURN_REASON=SESSION_ACTIVE bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
                 return
             logger.info("CONVERSATION_TASK_CREATED bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
             session["active"] = True
             logger.info("QUEUE_REPLY bot=%s", bot_name)
-            asyncio.create_task(automation_service._run_bot_conversation(bot_name, settings))
+            logger.warning("ABOUT_TO_CREATE_TASK bot=%s", bot_name)
+            task = asyncio.create_task(automation_service._run_bot_conversation(bot_name, settings))
+            logger.warning("CONVERSATION_TASK_CREATED bot=%s task_id=%s task_obj_id=%s", bot_name, id(asyncio.current_task()), id(task))
             record_operation(
                 "bot_automation_cycle",
                 (time.monotonic() - cycle_start) * 1000,
@@ -1385,6 +1414,7 @@ async def handle_bot_automation(event) -> None:
                 {"bot": bot_name, "flow": "conversation"},
             )
     except Exception:
+        logger.exception("EXCEPTION_IN_HANDLE_BOT_AUTOMATION bot=%s", bot_name)
         try:
             automation_service._set_bot_runtime(bot_name or "unknown", "ERROR", last_failure_reason="runtime_exception", last_failure_ts=automation_service._utc_now().isoformat())
             if bot_name:
