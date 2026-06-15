@@ -44,6 +44,7 @@ from storage.db import (
     get_bot_runtime,
     get_setting,
     increment_message_performance,
+    is_bot_enabled,
     is_bot_paused,
     list_groups,
     list_category_messages,
@@ -672,23 +673,28 @@ class AutomationService:
                 self._set_bot_runtime(bot_name, "CONVERSATION_MESSAGE_SENT")
                 logger.info("CONVERSATION_MESSAGE_SENT bot=%s message_id=%s", bot_name, last_message_id)
                 
+                if not opener_sent:
+                    logger.warning("BEFORE_OPENER_SEND: %s message_id=%s", bot_name, last_message_id)
+                
                 sent = await self._send_saved_payload_guarded(bot_name, message, "conversation")
                 if not sent:
                     logger.warning("CONVERSATION_MESSAGE_FAILED bot=%s message_id=%s", bot_name, last_message_id)
                     break
                 
                 if not opener_sent:
-                    logger.warning("OPENER SENT: %s message_id=%s", bot_name, last_message_id)
+                    logger.warning("AFTER_OPENER_SEND: %s message_id=%s", bot_name, last_message_id)
                     opener_sent = True
                 
                 self._record_message_send(bot_name, "conversational_messages", last_message_id)
                 self._set_bot_runtime(bot_name, "WAITING_REPLY")
+                logger.warning("BEFORE_WAIT_REPLY: %s", bot_name)
                 logger.info("WAITING_REPLY bot=%s timeout=%s", bot_name, no_response_timeout)
                 
                 replied = await self._wait_for_partner_reply(bot_name, no_response_timeout)
                 session["engaged"] = bool(replied)
                 
                 if replied:
+                    logger.warning("AFTER_REPLY_RECEIVED: %s", bot_name)
                     logger.info("PARTNER_REPLY_RECEIVED bot=%s", bot_name)
                     session["last_partner_reply_at"] = self._utc_now().isoformat()
                     self._increment_bot_runtime(bot_name, partner_replies=1)
@@ -698,7 +704,9 @@ class AutomationService:
                     break
             
             self._set_bot_runtime(bot_name, "PROMOTING")
+            logger.warning("BEFORE_PROMOTION: %s", bot_name)
             await self._send_bot_promotion(bot_name, settings)
+            logger.warning("AFTER_PROMOTION: %s", bot_name)
             logger.warning("PROMOTION INJECTED: %s", bot_name)
             logger.info("PROMOTION_MESSAGE_SENT bot=%s", bot_name)
             
