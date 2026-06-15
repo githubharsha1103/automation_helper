@@ -1473,3 +1473,55 @@ def is_category_message_enabled(category: str, message_id: int, default: bool = 
     if message is None:
         return default
     return bool(message.get("enabled", default))
+
+
+def get_bot_by_telegram_id(telegram_id: int) -> dict[str, Any] | None:
+    start = time.monotonic()
+    cache_key = f"tid:{telegram_id}"
+    if cache_key in _BOT_CACHE and _cache_valid(_BOT_CACHE_META, cache_key, 0.5):
+        bot = dict(_BOT_CACHE[cache_key])
+        elapsed_ms = (time.monotonic() - start) * 1000
+        _record_db_metric("get_bot_by_telegram_id", True, elapsed_ms)
+        record_operation("get_bot_by_telegram_id", elapsed_ms, True, "mongo", {"cache_hit": True})
+        logger.warning("BOT LOADED BY_TID: telegram_id=%s from_cache=True bot_name=%s enabled=%s", telegram_id, bot.get("_id"), bot.get("enabled"))
+        return bot
+    doc = _timed_db_call("get_bot_by_tid_find_one", _bots_collection().find_one, {"telegram_id": int(telegram_id)})
+    if not doc:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        _record_db_metric("get_bot_by_telegram_id", False, elapsed_ms)
+        record_operation("get_bot_by_telegram_id", elapsed_ms, False, "mongo", {"cache_hit": False})
+        logger.warning("BOT NOT FOUND BY_TID: telegram_id=%s", telegram_id)
+        return None
+    bot = {k: v for k, v in doc.items() if k != "_id"}
+    _BOT_CACHE[cache_key] = dict(bot)
+    _touch_cache(_BOT_CACHE_META, cache_key)
+    elapsed_ms = (time.monotonic() - start) * 1000
+    _record_db_metric("get_bot_by_telegram_id", False, elapsed_ms)
+    record_operation("get_bot_by_telegram_id", elapsed_ms, True, "mongo", {"cache_hit": False})
+    logger.warning("BOT LOADED BY_TID: telegram_id=%s from_mongo=True bot_name=%s enabled=%s", telegram_id, bot.get("_id"), bot.get("enabled"))
+    return bot
+
+
+async def aget_bot_by_telegram_id(telegram_id: int) -> dict[str, Any] | None:
+    return await asyncio.to_thread(get_bot_by_telegram_id, telegram_id)
+
+
+def list_enabled_bot_ids() -> set[int]:
+    start = time.monotonic()
+    docs = _timed_db_call("list_enabled_bots_find", lambda: list(_bots_collection().find({"enabled": True}, {"telegram_id": 1})))
+    ids = set()
+    for doc in docs:
+        tid = doc.get("telegram_id")
+        if tid is not None:
+            try:
+                ids.add(int(tid))
+            except (TypeError, ValueError):
+                continue
+    elapsed_ms = (time.monotonic() - start) * 1000
+    logger.info("DB READ list_enabled_bot_ids elapsed_ms=%.2f count=%s", elapsed_ms, len(ids))
+    record_operation("list_enabled_bot_ids", elapsed_ms, True, "mongo", {"count": len(ids)})
+    return ids
+
+
+async def alist_enabled_bot_ids() -> set[int]:
+    return await asyncio.to_thread(list_enabled_bot_ids)
