@@ -32,9 +32,9 @@ _BOT_SETTINGS_CACHE: dict[str, dict[str, Any]] = {}
 _BOT_RUNTIME_CACHE: dict[str, dict[str, Any]] = {}
 _BOT_CACHE_META: dict[str, float] = {}
 _GROUP_CACHE_META: dict[str, float] = {}
-_BOT_LIST_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 3.0, "bots": {}}
+_BOT_LIST_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 0.5, "bots": {}}
 _GROUP_LIST_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 3.0, "enabled_only": None, "groups": []}
-_ENABLED_BOTS_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 3.0, "bots": []}
+_ENABLED_BOTS_CACHE: dict[str, Any] = {"ts": 0.0, "ttl": 0.5, "bots": []}
 _DB_METRICS: dict[str, dict[str, int]] = {
     "get_setting": {"hits": 0, "misses": 0, "count": 0},
     "get_bot": {"hits": 0, "misses": 0, "count": 0},
@@ -851,14 +851,22 @@ def list_enabled_bots() -> list[dict[str, Any]]:
         elapsed_ms = (time.monotonic() - start) * 1000
         logger.info("DB READ list_enabled_bots cache_hit elapsed_ms=%.2f total=%s enabled=%s", elapsed_ms, len(bots), len(bots))
         record_operation("list_enabled_bots", elapsed_ms, True, "mongo", {"cache_hit": True, "total": len(bots), "enabled": len(bots)})
+        logger.warning("ENABLED BOTS RESULT: enabled_count=%s", len(bots))
         return bots
     bots = list(get_bots().values())
+    for bot in bots:
+        logger.warning(
+            "BOT STATUS: name=%s enabled=%s",
+            bot.get("username"),
+            bot.get("enabled")
+        )
     enabled = sorted([bot for bot in bots if bool(bot.get("enabled", False))], key=lambda item: str(item.get("username") or ""))
     elapsed_ms = (time.monotonic() - start) * 1000
     logger.info("DB READ list_enabled_bots elapsed_ms=%.2f total=%s enabled=%s", elapsed_ms, len(bots), len(enabled))
     record_operation("list_enabled_bots", elapsed_ms, True, "mongo", {"total": len(bots), "enabled": len(enabled)})
     _ENABLED_BOTS_CACHE["bots"] = [dict(bot) for bot in enabled]
     _ENABLED_BOTS_CACHE["ts"] = time.monotonic()
+    logger.warning("ENABLED BOTS RESULT: enabled_count=%s", len(enabled))
     return enabled
 
 
@@ -1075,11 +1083,12 @@ def add_bot(bot_name: str, config: dict[str, Any]) -> bool:
 
 def get_bot(bot_name: str) -> dict[str, Any] | None:
     start = time.monotonic()
-    if bot_name in _BOT_CACHE and _cache_valid(_BOT_CACHE_META, bot_name, 3.0):
+    if bot_name in _BOT_CACHE and _cache_valid(_BOT_CACHE_META, bot_name, 0.5):
         bot = dict(_BOT_CACHE[bot_name])
         elapsed_ms = (time.monotonic() - start) * 1000
         _record_db_metric("get_bot", True, elapsed_ms)
         record_operation("get_bot", elapsed_ms, True, "mongo", {"cache_hit": True})
+        logger.warning("BOT LOADED: name=%s from_cache=True enabled=%s", bot_name, bot.get("enabled"))
         return bot
     doc = _timed_db_call("get_bot_find_one", _bots_collection().find_one, {"_id": bot_name})
     if not doc:
@@ -1093,6 +1102,7 @@ def get_bot(bot_name: str) -> dict[str, Any] | None:
     elapsed_ms = (time.monotonic() - start) * 1000
     _record_db_metric("get_bot", False, elapsed_ms)
     record_operation("get_bot", elapsed_ms, True, "mongo", {"cache_hit": False})
+    logger.warning("BOT LOADED: name=%s from_mongo=True enabled=%s", bot_name, bot.get("enabled"))
     return bot
 
 
@@ -1135,9 +1145,28 @@ def get_bots() -> dict[str, dict[str, Any]]:
 
 
 def set_bot_enabled(bot_name: str, enabled: bool) -> bool:
-    current = get_bot(bot_name) or {}
-    current["enabled"] = enabled
-    return add_bot(bot_name, current)
+    logger.warning("BOT ENABLE REQUEST: name=%s enabled=%s", bot_name, enabled)
+    _bots_collection().update_one({"_id": bot_name}, {"$set": {"enabled": enabled, "updated_at": datetime.utcnow()}})
+    cached = _BOT_CACHE.get(bot_name)
+    if cached is not None:
+        cached["enabled"] = enabled
+    _invalidate_runtime_caches("bots")
+    logger.warning("BOT SAVED: name=%s enabled=%s", bot_name, enabled)
+    return True
+
+
+def clear_bot_cache(bot_name: str | None = None) -> None:
+    if bot_name:
+        _BOT_CACHE.pop(bot_name, None)
+        _BOT_CACHE_META.pop(bot_name, None)
+    else:
+        _BOT_CACHE.clear()
+        _BOT_CACHE_META.clear()
+    _invalidate_runtime_caches("bots")
+
+
+def set_bot_disabled(bot_name: str) -> bool:
+    return set_bot_enabled(bot_name, False)
 
 
 def is_bot_enabled(bot_name: str, default: bool = False) -> bool:

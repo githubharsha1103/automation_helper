@@ -588,7 +588,7 @@ def _audit_state_transition(state: int, next_state: int | None) -> None:
 
 
 def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
-    existing = get_bots().get(bot_name, {})
+    existing = get_bot(bot_name) or {}
     existing_enabled = bool(bot.get("enabled", existing.get("enabled", True)))
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
@@ -617,7 +617,6 @@ def _save_bot_config(bot_name: str, bot: dict) -> dict:
     normalized = _canonical_bot_config(bot_name, bot)
     add_bot(bot_name, normalized)
     logger.warning("BOT SAVED: name=%s enabled=%s", bot_name, normalized.get("enabled"))
-    set_bot_enabled(bot_name, normalized["enabled"])
     return normalized
 
 
