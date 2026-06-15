@@ -21,13 +21,13 @@ from telethon.sessions import StringSession  # type: ignore[import-not-found]
 from storage.db import (
     aget_bot,
     aget_bots,
-    aget_bot_by_telegram_id,
+    aget_bot_by_chat_id,
     aget_setting,
     alist_groups,
     alist_bot_messages_enabled,
     alist_group_messages_enabled,
     alist_stickers_enabled,
-    alist_enabled_bot_ids,
+    alist_enabled_chat_ids,
     aset_bot_paused,
     aset_setting,
     aupdate_group_runtime,
@@ -40,7 +40,7 @@ from storage.db import (
     telemetry_snapshot,
     get_bot,
     get_bots,
-    get_bot_by_telegram_id,
+    get_bot_by_chat_id,
     get_bot_settings,
     update_bot_runtime,
     increment_bot_runtime,
@@ -364,9 +364,9 @@ class AutomationService:
         self._bot_task_locks: dict[str, asyncio.Lock] = {}
         self._configured_bot_ids: set[int] = set()
 
-    async def load_configured_bot_ids(self) -> None:
-        self._configured_bot_ids = await alist_enabled_bot_ids()
-        logger.warning("CONFIGURED_BOT_IDS_LOADED count=%s ids=%s", len(self._configured_bot_ids), sorted(self._configured_bot_ids))
+    async def load_configured_chat_ids(self) -> None:
+        self._configured_bot_ids = await alist_enabled_chat_ids()
+        logger.warning("CONFIGURED_CHAT_IDS_LOADED count=%s ids=%s", len(self._configured_bot_ids), sorted(self._configured_bot_ids))
 
     def _record_skip(self, reason: str, group: dict | None = None, message: dict | None = None, **extra: object) -> None:
         self.last_skip_reason = reason
@@ -586,44 +586,16 @@ class AutomationService:
         except asyncio.TimeoutError:
             return False
 
-    async def resolve_event_bot_by_chat_id(self, event) -> tuple[str, int] | None:
+    async def resolve_event_by_chat_id(self, event) -> int | None:
         chat = await event.get_chat()
-        sender = await event.get_sender()
         chat_id_raw = getattr(chat, "id", None)
-        chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
-        sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
-        chat_entity_type = type(chat).__name__
-        chat_bot = bool(getattr(chat, "bot", False))
-        sender_bot = bool(getattr(sender, "bot", False))
-
         if chat_id_raw is None:
-            logger.info("EVENT_REJECTED: chat_id is None entity=%s sender=%s", chat_entity_type, sender_username)
             return None
-
-        chat_id = abs(int(chat_id_raw))
-
-        logger.info(
-            "CHAT_ENTITY_TYPE=%s CHAT_IS_BOT=%s CHAT_ID=%s CHAT_USERNAME=%s SENDER_USERNAME=%s",
-            chat_entity_type, chat_bot, chat_id, chat_username, sender_username,
-        )
-
+        chat_id = int(chat_id_raw)
         if chat_id not in self._configured_bot_ids:
             logger.info("RETURN_REASON=CHAT_ID_NOT_CONFIGURED chat_id=%s", chat_id)
             return None
-
-        bot = await aget_bot_by_telegram_id(chat_id)
-        if not bot:
-            logger.warning("RETURN_REASON=BOT_LOOKUP_FAILED chat_id=%s", chat_id)
-            return None
-
-        bot_name = str(bot.get("_id") or chat_id)
-        logger.info("BOT_LOOKUP_SUCCESS bot=%s telegram_id=%s enabled=%s", bot_name, chat_id, bot.get("enabled"))
-
-        if not bot.get("enabled", False):
-            logger.warning("RETURN_REASON=BOT_DISABLED bot=%s telegram_id=%s", bot_name, chat_id)
-            return None
-
-        return (bot_name, chat_id)
+        return chat_id
 
     async def _send_bot_promotion(self, bot_name: str, settings: dict[str, object]) -> None:
         mode = self._promotion_mode_for(settings)
@@ -1303,124 +1275,93 @@ automation_service = AutomationService(telegram_service)
 
 async def handle_bot_automation(event) -> None:
     cycle_start = time.monotonic()
-    bot_name = None
+    chat_id = None
     try:
         if event is None:
-            logger.warning("RETURN_REASON=missing_event")
             return
+
         chat = await event.get_chat()
         sender = await event.get_sender()
-        chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
-        sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
         chat_id_raw = getattr(chat, "id", None)
-        chat_entity_type = type(chat).__name__
-        chat_bot = bool(getattr(chat, "bot", False))
 
-        if chat_id_raw is not None:
-            logger.info("EVENT_RECEIVED chat_id=%s chat_entity=%s chat_is_bot=%s chat_username=%s sender=%s",
-                        abs(int(chat_id_raw)), chat_entity_type, chat_bot, chat_username, sender_username)
-        else:
-            logger.info("EVENT_RECEIVED chat_id=None chat_entity=%s chat_username=%s sender=%s",
-                        chat_entity_type, chat_username, sender_username)
-
-        resolved = await automation_service.resolve_event_bot_by_chat_id(event)
-        if not resolved:
+        if chat_id_raw is None:
             return
 
-        bot_name, chat_id = resolved
-        text = (event.raw_text or "").strip().lower()
+        chat_id = int(chat_id_raw)
+        logger.info("EVENT_RECEIVED chat_id=%s", chat_id)
 
-        logger.info("BOT_RESOLUTION_SUCCESS bot=%s telegram_id=%s", bot_name, chat_id)
+        if chat_id not in automation_service._configured_chat_ids:
+            logger.info("RETURN_REASON=CHAT_ID_NOT_CONFIGURED chat_id=%s", chat_id)
+            return
 
-        bot = await aget_bot_by_telegram_id(chat_id)
+        logger.info("BOT_LOOKUP_BY_CHAT_ID chat_id=%s", chat_id)
+        bot = await aget_bot_by_chat_id(chat_id)
         if not bot:
-            logger.warning("RETURN_REASON=BOT_LOOKUP_FAILED bot=%s telegram_id=%s", bot_name, chat_id)
+            logger.warning("RETURN_REASON=BOT_NOT_FOUND chat_id=%s", chat_id)
             return
+
+        logger.info("BOT_LOOKUP_SUCCESS chat_id=%s", chat_id)
+
+        text = (event.raw_text or "").strip().lower()
 
         security_triggers = [item.lower() for item in bot.get("security_triggers", [])]
         matched_trigger = next((trigger for trigger in security_triggers if trigger in text), None)
-        logger.info(
-            "SECURITY_CHECK bot_name=%s telegram_id=%s incoming_text=%s loaded_security_triggers=%s",
-            bot_name, chat_id, text, security_triggers,
-        )
         if matched_trigger is not None:
-            logger.info("SECURITY_MATCH trigger=%s text=%s", matched_trigger, text)
-        else:
-            logger.info("SECURITY_NO_MATCH")
-        if matched_trigger is not None:
-            set_bot_paused(bot_name, True)
-            logger.warning("Security trigger hit for %s", bot_name)
+            set_bot_paused(str(chat_id), True)
             try:
                 from controller.controller import notify_security
-
-                await notify_security(bot_name)
+                await notify_security(str(chat_id))
             except Exception:
-                logger.exception("Failed to notify security state for %s", bot_name)
-            logger.warning("RETURN_REASON=SECURITY_BLOCK bot=%s trigger=%s", bot_name, matched_trigger)
+                logger.exception("Failed to notify security state for chat_id=%s", chat_id)
             return
 
-        session = automation_service._bot_session(bot_name)
+        session = automation_service._bot_session(str(chat_id))
         if session and session.get("active") and not getattr(sender, "bot", False):
-            logger.info("REPLY_CAPTURED bot=%s telegram_id=%s sender=%s message_id=%s text=%s",
-                        bot_name, chat_id, sender_username, event.message_id, text[:100])
             session["engaged"] = True
             session["last_partner_reply_at"] = automation_service._utc_now().isoformat()
-            reply_event = automation_service._bot_reply_events.setdefault(bot_name, asyncio.Event())
+            reply_event = automation_service._bot_reply_events.setdefault(str(chat_id), asyncio.Event())
             reply_event.set()
-            automation_service._set_bot_runtime(bot_name, "PARTNER_REPLY_RECEIVED", last_activity_ts=automation_service._utc_now().isoformat())
-            automation_service._increment_bot_runtime(bot_name, partner_replies=1)
+            automation_service._set_bot_runtime(str(chat_id), "PARTNER_REPLY_RECEIVED", last_activity_ts=automation_service._utc_now().isoformat())
+            automation_service._increment_bot_runtime(str(chat_id), partner_replies=1)
             automation_service._record_message_reply(
-                bot_name,
+                str(chat_id),
                 session.get("last_conversation_message_id"),
             )
-            logger.info("BOT PARTNER REPLY DETECTED bot=%s text=%s", bot_name, text[:120])
-            logger.warning("RETURN_REASON=PARTNER_REPLY_PROCESSED bot=%s", bot_name)
             return
 
         if not getattr(sender, "bot", False):
-            logger.info("SENDER_IS_HUMAN bot=%s telegram_id=%s", bot_name, chat_id)
             match_triggers = [item.lower() for item in (bot.get("match_triggers") or bot.get("triggers") or [])]
-            logger.info("MATCH_TRIGGER_CHECK bot=%s match_triggers=%s text=%s", bot_name, match_triggers, text[:200])
             if match_triggers and not any(trigger in text for trigger in match_triggers):
-                logger.warning("RETURN_REASON=MATCH_FAILED bot=%s text=%s triggers=%s", bot_name, text[:200], match_triggers)
                 return
-            if is_bot_paused(bot_name, False):
-                logger.warning("RETURN_REASON=BOT_PAUSED bot=%s", bot_name)
+            if is_bot_paused(str(chat_id), False):
                 return
-            settings = get_bot_settings(bot_name)
-            lock = automation_service._bot_lock(bot_name)
-            logger.info("LOCK_ACQUIRE_ATTEMPT bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
+            settings = get_bot_settings(str(chat_id))
+            lock = automation_service._bot_lock(str(chat_id))
             if lock.locked():
-                logger.warning("RETURN_REASON=LOCKED bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
                 return
-            session = automation_service._bot_session(bot_name)
-            logger.info("SESSION_CHECK bot=%s active=%s", bot_name, session.get("active"))
+            session = automation_service._bot_session(str(chat_id))
             if session.get("active"):
-                logger.warning("RETURN_REASON=SESSION_ACTIVE bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
                 return
-            logger.info("CONVERSATION_TASK_CREATED bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
             session["active"] = True
-            logger.info("QUEUE_REPLY bot=%s", bot_name)
-            logger.warning("ABOUT_TO_CREATE_TASK bot=%s", bot_name)
-            task = asyncio.create_task(automation_service._run_bot_conversation(bot_name, settings))
-            logger.warning("CONVERSATION_TASK_CREATED bot=%s task_id=%s task_obj_id=%s", bot_name, id(asyncio.current_task()), id(task))
+            logger.warning("ABOUT_TO_CREATE_TASK chat_id=%s", chat_id)
+            task = asyncio.create_task(automation_service._run_bot_conversation(str(chat_id), settings))
+            logger.info("CONVERSATION_TASK_CREATED chat_id=%s task_obj_id=%s", chat_id, id(task))
             record_operation(
                 "bot_automation_cycle",
                 (time.monotonic() - cycle_start) * 1000,
                 True,
                 "worker",
-                {"bot": bot_name, "flow": "conversation"},
+                {"chat_id": chat_id, "flow": "conversation"},
             )
     except Exception:
-        logger.exception("EXCEPTION_IN_HANDLE_BOT_AUTOMATION bot=%s", bot_name)
+        logger.exception("EXCEPTION_IN_HANDLE_BOT_AUTOMATION chat_id=%s", chat_id)
         try:
-            automation_service._set_bot_runtime(bot_name or "unknown", "ERROR", last_failure_reason="runtime_exception", last_failure_ts=automation_service._utc_now().isoformat())
-            if bot_name:
-                automation_service._increment_bot_runtime(bot_name, error_count=1)
+            automation_service._set_bot_runtime(str(chat_id) if chat_id else "unknown", "ERROR", last_failure_reason="runtime_exception", last_failure_ts=automation_service._utc_now().isoformat())
+            if chat_id:
+                automation_service._increment_bot_runtime(str(chat_id), error_count=1)
         except Exception:
-            logger.exception("Failed to persist bot error runtime bot=%s", bot_name)
-        record_operation("bot_automation_cycle", (time.monotonic() - cycle_start) * 1000, False, "worker", {"bot": bot_name if 'bot_name' in locals() else None})
-        logger.exception("Bot automation event handling failed bot=%s", bot_name)
+            logger.exception("Failed to persist error runtime chat_id=%s", chat_id)
+        record_operation("bot_automation_cycle", (time.monotonic() - cycle_start) * 1000, False, "worker", {"chat_id": chat_id})
 
 
 async def start_worker() -> None:
@@ -1431,7 +1372,7 @@ async def start_worker() -> None:
         token = CURRENT_CYCLE.set(metrics)
         try:
             await telegram_service.ensure_connected()
-            await automation_service.load_configured_bot_ids()
+            await automation_service.load_configured_chat_ids()
             client = telegram_service._ensure_client()
             if not getattr(telegram_service, "_bot_event_handler_registered", False):
                 client.add_event_handler(handle_bot_automation, events.NewMessage(incoming=True))

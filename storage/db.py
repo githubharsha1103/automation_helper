@@ -1043,6 +1043,13 @@ def init_db() -> None:
     db["promotion_stickers"].create_index([("file_id", 1)], unique=True)
     db["promotion_stickers"].create_index([("id", 1)], unique=True)
     db["bot_settings"].create_index([("bot_name", 1)], unique=True)
+    db["bots"].create_index([("chat_id", 1)], unique=True, sparse=True)
+    migration = migrate_add_chat_id_to_bots()
+    if migration["total"] > 0:
+        logger.warning(
+            "CHAT_ID MIGRATION: migrated=%s skipped=%s total=%s",
+            migration["migrated"], migration["skipped"], migration["total"],
+        )
 
 
 def _settings_value(doc: dict[str, Any] | None, default: Any) -> Any:
@@ -1475,53 +1482,88 @@ def is_category_message_enabled(category: str, message_id: int, default: bool = 
     return bool(message.get("enabled", default))
 
 
-def get_bot_by_telegram_id(telegram_id: int) -> dict[str, Any] | None:
+def get_bot_by_chat_id(chat_id: int) -> dict[str, Any] | None:
     start = time.monotonic()
-    cache_key = f"tid:{telegram_id}"
+    cache_key = f"cid:{chat_id}"
     if cache_key in _BOT_CACHE and _cache_valid(_BOT_CACHE_META, cache_key, 0.5):
         bot = dict(_BOT_CACHE[cache_key])
         elapsed_ms = (time.monotonic() - start) * 1000
-        _record_db_metric("get_bot_by_telegram_id", True, elapsed_ms)
-        record_operation("get_bot_by_telegram_id", elapsed_ms, True, "mongo", {"cache_hit": True})
-        logger.warning("BOT LOADED BY_TID: telegram_id=%s from_cache=True bot_name=%s enabled=%s", telegram_id, bot.get("_id"), bot.get("enabled"))
+        _record_db_metric("get_bot_by_chat_id", True, elapsed_ms)
+        record_operation("get_bot_by_chat_id", elapsed_ms, True, "mongo", {"cache_hit": True})
+        logger.warning("BOT LOADED: chat_id=%s from_cache=True enabled=%s", chat_id, bot.get("enabled"))
         return bot
-    doc = _timed_db_call("get_bot_by_tid_find_one", _bots_collection().find_one, {"telegram_id": int(telegram_id)})
+    doc = _timed_db_call("get_bot_by_cid_find_one", _bots_collection().find_one, {"chat_id": int(chat_id)})
     if not doc:
         elapsed_ms = (time.monotonic() - start) * 1000
-        _record_db_metric("get_bot_by_telegram_id", False, elapsed_ms)
-        record_operation("get_bot_by_telegram_id", elapsed_ms, False, "mongo", {"cache_hit": False})
-        logger.warning("BOT NOT FOUND BY_TID: telegram_id=%s", telegram_id)
+        _record_db_metric("get_bot_by_chat_id", False, elapsed_ms)
+        record_operation("get_bot_by_chat_id", elapsed_ms, False, "mongo", {"cache_hit": False})
         return None
     bot = {k: v for k, v in doc.items() if k != "_id"}
+    bot["chat_id"] = int(doc["chat_id"])
     _BOT_CACHE[cache_key] = dict(bot)
     _touch_cache(_BOT_CACHE_META, cache_key)
     elapsed_ms = (time.monotonic() - start) * 1000
-    _record_db_metric("get_bot_by_telegram_id", False, elapsed_ms)
-    record_operation("get_bot_by_telegram_id", elapsed_ms, True, "mongo", {"cache_hit": False})
-    logger.warning("BOT LOADED BY_TID: telegram_id=%s from_mongo=True bot_name=%s enabled=%s", telegram_id, bot.get("_id"), bot.get("enabled"))
+    _record_db_metric("get_bot_by_chat_id", False, elapsed_ms)
+    record_operation("get_bot_by_chat_id", elapsed_ms, True, "mongo", {"cache_hit": False})
+    logger.warning("BOT LOADED: chat_id=%s from_mongo=True enabled=%s", chat_id, bot.get("enabled"))
     return bot
 
 
-async def aget_bot_by_telegram_id(telegram_id: int) -> dict[str, Any] | None:
-    return await asyncio.to_thread(get_bot_by_telegram_id, telegram_id)
+async def aget_bot_by_chat_id(chat_id: int) -> dict[str, Any] | None:
+    return await asyncio.to_thread(get_bot_by_chat_id, chat_id)
 
 
-def list_enabled_bot_ids() -> set[int]:
+def list_enabled_chat_ids() -> set[int]:
     start = time.monotonic()
-    docs = _timed_db_call("list_enabled_bots_find", lambda: list(_bots_collection().find({"enabled": True}, {"telegram_id": 1})))
+    docs = _timed_db_call("list_enabled_chat_ids_find", lambda: list(
+        _bots_collection().find(
+            {"enabled": True, "chat_id": {"$exists": True}},
+            {"chat_id": 1}
+        )
+    ))
     ids = set()
     for doc in docs:
-        tid = doc.get("telegram_id")
-        if tid is not None:
+        cid = doc.get("chat_id")
+        if cid is not None:
             try:
-                ids.add(int(tid))
+                ids.add(int(cid))
             except (TypeError, ValueError):
                 continue
     elapsed_ms = (time.monotonic() - start) * 1000
-    logger.info("DB READ list_enabled_bot_ids elapsed_ms=%.2f count=%s", elapsed_ms, len(ids))
-    record_operation("list_enabled_bot_ids", elapsed_ms, True, "mongo", {"count": len(ids)})
+    logger.info("DB READ list_enabled_chat_ids elapsed_ms=%.2f count=%s", elapsed_ms, len(ids))
+    record_operation("list_enabled_chat_ids", elapsed_ms, True, "mongo", {"count": len(ids)})
     return ids
 
 
-async def alist_enabled_bot_ids() -> set[int]:
-    return await asyncio.to_thread(list_enabled_bot_ids)
+async def alist_enabled_chat_ids() -> set[int]:
+    return await asyncio.to_thread(list_enabled_chat_ids)
+
+
+def migrate_add_chat_id_to_bots() -> dict[str, Any]:
+    """One-time migration: add chat_id field to existing bot records that only have (_id, telegram_id/enabled).
+    Uses existing telegram_id field as the chat_id value if present.
+    Returns migration stats."""
+    collection = _bots_collection()
+    bots_without_chat_id = list(collection.find({"chat_id": {"$exists": False}}))
+    if not bots_without chat_id:
+        return {"migrated": 0, "skipped": 0, "total": 0}
+
+    migrated = 0
+    skipped = 0
+    for doc in bots_without_chat_id:
+        chat_id_value = doc.get("telegram_id") or doc.get("id")
+        if chat_id_value is not None:
+            try:
+                cid = int(chat_id_value)
+                collection.update_one({"_id": doc["_id"]}, {"$set": {"chat_id": cid}})
+                migrated += 1
+                logger.warning("MIGRATION: added chat_id=%s to bot _id=%s", cid, doc["_id"])
+            except (TypeError, ValueError):
+                skipped += 1
+                logger.warning("MIGRATION SKIP: bot _id=%s has no valid telegram_id", doc["_id"])
+        else:
+            skipped += 1
+            logger.warning("MIGRATION SKIP: bot _id=%s has no telegram_id or id field", doc["_id"])
+
+    _invalidate_runtime_caches("bots")
+    return {"migrated": migrated, "skipped": skipped, "total": len(bots_without_chat_id)}

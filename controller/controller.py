@@ -590,9 +590,10 @@ def _audit_state_transition(state: int, next_state: int | None) -> None:
 def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
     existing = get_bot(bot_name) or {}
     existing_enabled = bool(bot.get("enabled", existing.get("enabled", True)))
+    chat_id = bot.get("chat_id")
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
-    return {
+    config = {
         "start_cmd": _normalize_command(bot.get("start_cmd", "")),
         "stop_cmd": _normalize_command(bot.get("stop_cmd", "")),
         "match_triggers": [item.strip().lower() for item in match_triggers if str(item).strip()],
@@ -602,6 +603,12 @@ def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
         "after_chat_delay": float(bot.get("after_chat_delay", 10) or 10),
         "enabled": existing_enabled,
     }
+    if chat_id is not None:
+        try:
+            config["chat_id"] = int(chat_id)
+        except (TypeError, ValueError):
+            pass
+    return config
 
 
 def _group_assigned_bot(group: dict | None) -> str | None:
@@ -957,16 +964,24 @@ async def add_bot_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.user_data.clear()
     context.user_data["bot_flow_mode"] = "add"
     context.user_data["bot_config"] = {}
-    await _send_or_edit(update, "Enter bot username", _cancel_menu())
+    await _send_or_edit(update, "Enter the bot Telegram Chat ID (numeric, e.g. 8917584963)", _cancel_menu())
     return ADD_BOT_USERNAME
 
 
 async def bot_username_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    username = update.message.text.strip().lstrip("@")
-    if not username:
-        await update.message.reply_text("Bot username cannot be empty.")
+    raw = update.message.text.strip()
+    try:
+        chat_id = int(raw)
+    except ValueError:
+        await update.message.reply_text("Enter a numeric Telegram Chat ID (e.g. 8917584963).")
         return ADD_BOT_USERNAME
-    context.user_data.setdefault("bot_config", {})["username"] = username
+    if chat_id <= 0:
+        await update.message.reply_text("Chat ID must be a positive number.")
+        return ADD_BOT_USERNAME
+    context.user_data.setdefault("bot_config", {})["chat_id"] = chat_id
+    context.user_data["bot_config"]["username"] = str(chat_id)
+    await update.message.reply_text("Enter start command (e.g. /match)", reply_markup=_cancel_menu())
+    return ADD_BOT_START_CMD
     await update.message.reply_text("Enter start command (e.g. /match)", reply_markup=_cancel_menu())
     return ADD_BOT_START_CMD
 
