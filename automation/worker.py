@@ -21,13 +21,11 @@ from telethon.sessions import StringSession  # type: ignore[import-not-found]
 from storage.db import (
     aget_bot,
     aget_bots,
-    aget_bot_by_chat_id,
     aget_setting,
     alist_groups,
     alist_bot_messages_enabled,
     alist_group_messages_enabled,
     alist_stickers_enabled,
-    alist_enabled_chat_ids,
     aset_bot_paused,
     aset_setting,
     aupdate_group_runtime,
@@ -40,7 +38,6 @@ from storage.db import (
     telemetry_snapshot,
     get_bot,
     get_bots,
-    get_bot_by_chat_id,
     get_bot_settings,
     update_bot_runtime,
     increment_bot_runtime,
@@ -362,10 +359,15 @@ class AutomationService:
         self._bot_sessions: dict[str, dict[str, object]] = {}
         self._bot_reply_events: dict[str, asyncio.Event] = {}
         self._bot_task_locks: dict[str, asyncio.Lock] = {}
-        self._configured_bot_ids: set[int] = set()
+        self._configured_bot_ids: set[str] = set()
 
     async def load_configured_chat_ids(self) -> None:
-        self._configured_bot_ids = await alist_enabled_chat_ids()
+        bots = await aget_bots()
+        self._configured_bot_ids = set()
+        for bot_name, bot_config in bots.items():
+            if bot_config.get("enabled", False):
+                self._configured_bot_ids.add(bot_name)
+                logger.info("LOADED_BOT_RECORD name=%s enabled=%s", bot_name, bot_config.get("enabled"))
         logger.warning("CONFIGURED_CHAT_IDS_LOADED count=%s ids=%s", len(self._configured_bot_ids), sorted(self._configured_bot_ids))
 
     def _record_skip(self, reason: str, group: dict | None = None, message: dict | None = None, **extra: object) -> None:
@@ -586,16 +588,15 @@ class AutomationService:
         except asyncio.TimeoutError:
             return False
 
-    async def resolve_event_by_chat_id(self, event) -> int | None:
+    async def resolve_event_by_chat_id(self, event) -> str | None:
         chat = await event.get_chat()
-        chat_id_raw = getattr(chat, "id", None)
-        if chat_id_raw is None:
+        chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
+        if not chat_username:
             return None
-        chat_id = int(chat_id_raw)
-        if chat_id not in self._configured_bot_ids:
-            logger.info("RETURN_REASON=CHAT_ID_NOT_CONFIGURED chat_id=%s", chat_id)
+        if chat_username not in self._configured_bot_ids:
+            logger.info("RETURN_REASON=CHAT_ID_NOT_CONFIGURED chat_username=%s", chat_username)
             return None
-        return chat_id
+        return chat_username
 
     async def _send_bot_promotion(self, bot_name: str, settings: dict[str, object]) -> None:
         mode = self._promotion_mode_for(settings)
@@ -1275,56 +1276,47 @@ automation_service = AutomationService(telegram_service)
 
 async def handle_bot_automation(event) -> None:
     cycle_start = time.monotonic()
-    chat_id = None
+    bot_name = None
     try:
         if event is None:
             return
 
-        chat = await event.get_chat()
-        sender = await event.get_sender()
-        chat_id_raw = getattr(chat, "id", None)
-
-        if chat_id_raw is None:
+        bot_name = await automation_service.resolve_event_by_chat_id(event)
+        if bot_name is None:
             return
 
-        chat_id = int(chat_id_raw)
-        logger.info("EVENT_RECEIVED chat_id=%s", chat_id)
-
-        if chat_id not in automation_service._configured_chat_ids:
-            logger.info("RETURN_REASON=CHAT_ID_NOT_CONFIGURED chat_id=%s", chat_id)
-            return
-
-        logger.info("BOT_LOOKUP_BY_CHAT_ID chat_id=%s", chat_id)
-        bot = await aget_bot_by_chat_id(chat_id)
+        logger.info("BOT_LOOKUP_BY_CHAT_ID bot=%s", bot_name)
+        bot = await aget_bot(bot_name)
         if not bot:
-            logger.warning("RETURN_REASON=BOT_NOT_FOUND chat_id=%s", chat_id)
+            logger.warning("RETURN_REASON=BOT_NOT_FOUND bot=%s", bot_name)
             return
 
-        logger.info("BOT_LOOKUP_SUCCESS chat_id=%s", chat_id)
+        logger.info("BOT_LOOKUP_SUCCESS bot=%s enabled=%s", bot_name, bot.get("enabled"))
 
+        sender = await event.get_sender()
         text = (event.raw_text or "").strip().lower()
 
         security_triggers = [item.lower() for item in bot.get("security_triggers", [])]
         matched_trigger = next((trigger for trigger in security_triggers if trigger in text), None)
         if matched_trigger is not None:
-            set_bot_paused(str(chat_id), True)
+            set_bot_paused(bot_name, True)
             try:
                 from controller.controller import notify_security
-                await notify_security(str(chat_id))
+                await notify_security(bot_name)
             except Exception:
-                logger.exception("Failed to notify security state for chat_id=%s", chat_id)
+                logger.exception("Failed to notify security state for %s", bot_name)
             return
 
-        session = automation_service._bot_session(str(chat_id))
+        session = automation_service._bot_session(bot_name)
         if session and session.get("active") and not getattr(sender, "bot", False):
             session["engaged"] = True
             session["last_partner_reply_at"] = automation_service._utc_now().isoformat()
-            reply_event = automation_service._bot_reply_events.setdefault(str(chat_id), asyncio.Event())
+            reply_event = automation_service._bot_reply_events.setdefault(bot_name, asyncio.Event())
             reply_event.set()
-            automation_service._set_bot_runtime(str(chat_id), "PARTNER_REPLY_RECEIVED", last_activity_ts=automation_service._utc_now().isoformat())
-            automation_service._increment_bot_runtime(str(chat_id), partner_replies=1)
+            automation_service._set_bot_runtime(bot_name, "PARTNER_REPLY_RECEIVED", last_activity_ts=automation_service._utc_now().isoformat())
+            automation_service._increment_bot_runtime(bot_name, partner_replies=1)
             automation_service._record_message_reply(
-                str(chat_id),
+                bot_name,
                 session.get("last_conversation_message_id"),
             )
             return
@@ -1333,35 +1325,35 @@ async def handle_bot_automation(event) -> None:
             match_triggers = [item.lower() for item in (bot.get("match_triggers") or bot.get("triggers") or [])]
             if match_triggers and not any(trigger in text for trigger in match_triggers):
                 return
-            if is_bot_paused(str(chat_id), False):
+            if is_bot_paused(bot_name, False):
                 return
-            settings = get_bot_settings(str(chat_id))
-            lock = automation_service._bot_lock(str(chat_id))
+            settings = get_bot_settings(bot_name)
+            lock = automation_service._bot_lock(bot_name)
             if lock.locked():
                 return
-            session = automation_service._bot_session(str(chat_id))
+            session = automation_service._bot_session(bot_name)
             if session.get("active"):
                 return
             session["active"] = True
-            logger.warning("ABOUT_TO_CREATE_TASK chat_id=%s", chat_id)
-            task = asyncio.create_task(automation_service._run_bot_conversation(str(chat_id), settings))
-            logger.info("CONVERSATION_TASK_CREATED chat_id=%s task_obj_id=%s", chat_id, id(task))
+            logger.warning("ABOUT_TO_CREATE_TASK bot=%s", bot_name)
+            task = asyncio.create_task(automation_service._run_bot_conversation(bot_name, settings))
+            logger.info("CONVERSATION_TASK_CREATED bot=%s task_obj_id=%s", bot_name, id(task))
             record_operation(
                 "bot_automation_cycle",
                 (time.monotonic() - cycle_start) * 1000,
                 True,
                 "worker",
-                {"chat_id": chat_id, "flow": "conversation"},
+                {"bot": bot_name, "flow": "conversation"},
             )
     except Exception:
-        logger.exception("EXCEPTION_IN_HANDLE_BOT_AUTOMATION chat_id=%s", chat_id)
+        logger.exception("EXCEPTION_IN_HANDLE_BOT_AUTOMATION bot=%s", bot_name)
         try:
-            automation_service._set_bot_runtime(str(chat_id) if chat_id else "unknown", "ERROR", last_failure_reason="runtime_exception", last_failure_ts=automation_service._utc_now().isoformat())
-            if chat_id:
-                automation_service._increment_bot_runtime(str(chat_id), error_count=1)
+            automation_service._set_bot_runtime(bot_name or "unknown", "ERROR", last_failure_reason="runtime_exception", last_failure_ts=automation_service._utc_now().isoformat())
+            if bot_name:
+                automation_service._increment_bot_runtime(bot_name, error_count=1)
         except Exception:
-            logger.exception("Failed to persist error runtime chat_id=%s", chat_id)
-        record_operation("bot_automation_cycle", (time.monotonic() - cycle_start) * 1000, False, "worker", {"chat_id": chat_id})
+            logger.exception("Failed to persist error runtime bot=%s", bot_name)
+        record_operation("bot_automation_cycle", (time.monotonic() - cycle_start) * 1000, False, "worker", {"bot": bot_name})
 
 
 async def start_worker() -> None:
