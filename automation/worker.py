@@ -525,14 +525,16 @@ class AutomationService:
             logger.warning("BOT SEND SKIP bot=%s stage=%s reason=missing_message_payload message=%s", bot_name, stage, message)
             return False
         try:
+            logger.info("BEFORE_SEND bot=%s stage=%s message_id=%s", bot_name, stage, message_id)
             await asyncio.wait_for(self.telegram.send_saved_payload(bot_name, message), timeout=60)
+            logger.info("AFTER_SEND bot=%s stage=%s message_id=%s", bot_name, stage, message_id)
             logger.info("BOT SEND OK bot=%s stage=%s message_id=%s", bot_name, stage, message_id)
             return True
         except asyncio.TimeoutError:
             logger.exception("BOT SEND TIMEOUT bot=%s stage=%s message_id=%s", bot_name, stage, message_id)
             return False
         except Exception as exc:
-            logger.exception("BOT SEND FAILED bot=%s stage=%s message_id=%s error=%s", bot_name, stage, message_id, exc)
+            logger.exception("SEND_EXCEPTION bot=%s stage=%s message_id=%s error=%s", bot_name, stage, message_id, exc)
             return False
 
     def _record_message_send(self, bot_name: str, category: str, message_id: int) -> None:
@@ -577,14 +579,41 @@ class AutomationService:
             return False
 
     async def _resolve_event_bot_name(self, event) -> str | None:
+        chat = await event.get_chat()
         sender = await event.get_sender()
+        chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
         sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
+        chat_id = getattr(chat, "id", None)
+        sender_id = getattr(sender, "id", None)
         
-        if getattr(sender, "bot", False) and sender_username:
-            logger.debug("EVENT OWNERSHIP: sender_is_bot username=%s", sender_username)
-            return sender_username
+        if getattr(sender, "bot", False):
+            if sender_username:
+                logger.debug("EVENT OWNERSHIP: sender_is_bot username=%s", sender_username)
+                return sender_username
+            logger.debug("EVENT OWNERSHIP: REJECTED - bot_sender_no_username sender=%s", sender_username)
+            return None
         
-        logger.debug("EVENT OWNERSHIP: REJECTED - not_a_bot_sender sender=%s", sender_username)
+        if chat_username:
+            logger.debug("EVENT OWNERSHIP: sender_is_human target_bot=%s", chat_username)
+            return chat_username
+        
+        bots_dict = get_bots()
+        for bot_name, bot_config in bots_dict.items():
+            if bot_config.get("enabled", False):
+                bot_telegram_id = bot_config.get("telegram_id") or bot_config.get("id")
+                if bot_telegram_id and str(bot_telegram_id) == str(chat_id):
+                    logger.debug("EVENT OWNERSHIP: matched_by_chat_id bot=%s", bot_name)
+                    return bot_name
+        
+        if sender_id:
+            for bot_name, bot_config in bots_dict.items():
+                if bot_config.get("enabled", False):
+                    bot_telegram_id = bot_config.get("telegram_id") or bot_config.get("id")
+                    if bot_telegram_id and str(bot_telegram_id) == str(sender_id):
+                        logger.debug("EVENT OWNERSHIP: matched_by_sender_id bot=%s", bot_name)
+                        return bot_name
+        
+        logger.debug("EVENT OWNERSHIP: REJECTED - no_chat_username chat=%s chat_id=%s", chat_username, chat_id)
         return None
 
     async def _send_bot_promotion(self, bot_name: str, settings: dict[str, object]) -> None:
@@ -1272,12 +1301,14 @@ async def handle_bot_automation(event) -> None:
         sender = await event.get_sender()
         chat_username = str(getattr(chat, "username", "") or "").lstrip("@")
         sender_username = str(getattr(sender, "username", "") or "").lstrip("@")
+        logger.info("EVENT_RECEIVED chat=%s sender=%s", chat_username, sender_username)
         bot_name = await automation_service._resolve_event_bot_name(event)
         text = (event.raw_text or "").strip().lower()
         if not bot_name:
             logger.debug("BOT EVENT SKIP reason=no_bot_name chat=%s sender=%s", chat_username, sender_username)
             return
-
+        logger.info("BOT_RESOLUTION_SUCCESS bot=%s", bot_name)
+        
         bot = get_bot(bot_name) or await aget_bot(bot_name)
         enabled = bool(bot and bot.get("enabled", False))
         if not bot or not enabled:
@@ -1342,6 +1373,7 @@ async def handle_bot_automation(event) -> None:
             if session.get("active"):
                 logger.warning("SESSION_ALREADY_ACTIVE bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
                 return
+            logger.info("CONVERSATION_TASK_CREATED bot=%s task_id=%s", bot_name, id(asyncio.current_task()))
             session["active"] = True
             logger.info("QUEUE_REPLY bot=%s", bot_name)
             asyncio.create_task(automation_service._run_bot_conversation(bot_name, settings))
