@@ -76,6 +76,7 @@ SESSION_STRING = _env("SESSION_STRING")
 GROUP_FAILURE_THRESHOLD = int(_env("GROUP_FAILURE_THRESHOLD", "3") or "3")
 GROUP_FAILURE_COOLDOWN_MINUTES = int(_env("GROUP_FAILURE_COOLDOWN_MINUTES", "10") or "10")
 GROUP_LOOP_POLL_SECONDS = 2
+STOP_COMMAND_DELAY_SECONDS = float(_env("STOP_COMMAND_DELAY_SECONDS", "2") or "2")
 
 
 class TelegramService:
@@ -815,6 +816,10 @@ async def handle_bot_automation(event) -> None:
                 logger.exception("Failed to send promotion payload to %s", bot_username)
         stop_cmd = _normalize_command(bot.get("stop_cmd"))
         if stop_cmd:
+            if STOP_COMMAND_DELAY_SECONDS:
+                logger.debug("Waiting %s seconds before sending /stop", STOP_COMMAND_DELAY_SECONDS)
+                await asyncio.sleep(STOP_COMMAND_DELAY_SECONDS)
+                logger.debug("Sending /stop after delay")
             await telegram_service.client.send_message(bot_username, stop_cmd)
 
         if after_chat_delay:
