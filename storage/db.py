@@ -395,7 +395,12 @@ def delete_group(group_id: str) -> bool:
 
 
 def set_group_status(group_id: str, status: str) -> bool:
-    _groups_collection().update_one({"_id": str(group_id)}, {"$set": {"status": status, "updated_at": datetime.utcnow()}})
+    now = datetime.utcnow()
+    _groups_collection().update_one({"_id": str(group_id)}, {"$set": {"status": status, "updated_at": now}})
+    cached = _GROUP_CACHE.get(str(group_id))
+    if cached is not None:
+        cached["status"] = status
+        cached["updated_at"] = now
     return True
 
 
