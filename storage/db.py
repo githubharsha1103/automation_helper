@@ -317,11 +317,10 @@ def _groups_collection():
 
 
 def add_group(group_id: str, group_name: str, status: str = "enabled") -> bool:
+    now = datetime.utcnow()
     payload = {
         "_id": str(group_id),
         "group_id": str(group_id),
-        "group_name": group_name,
-        "status": status,
         "delay_min": 4,
         "delay_max": 7,
         "special_message": None,
@@ -334,12 +333,23 @@ def add_group(group_id: str, group_name: str, status: str = "enabled") -> bool:
         "last_sent_at": None,
         "active_start_hour": None,
         "active_end_hour": None,
-        "updated_at": datetime.utcnow(),
     }
-    _groups_collection().update_one({"_id": str(group_id)}, {"$setOnInsert": payload, "$set": {"group_name": group_name, "status": status, "updated_at": datetime.utcnow()}}, upsert=True)
+    _groups_collection().update_one(
+        {"_id": str(group_id)},
+        {
+            "$setOnInsert": payload,
+            "$set": {
+                "group_name": group_name,
+                "status": status,
+                "updated_at": now,
+            },
+        },
+        upsert=True,
+    )
     _GROUP_CACHE[str(group_id)] = {k: v for k, v in payload.items() if k != "_id"}
     _GROUP_CACHE[str(group_id)]["group_name"] = group_name
     _GROUP_CACHE[str(group_id)]["status"] = status
+    _GROUP_CACHE[str(group_id)]["updated_at"] = now
     return True
 
 
