@@ -829,7 +829,7 @@ async def handle_bot_automation(event) -> None:
         if not any(trigger in text for trigger in match_triggers):
             return
 
-        self.complete_security_bypass_wait(bot_username)
+        automation_service.complete_security_bypass_wait(bot_username)
 
         after_match_delay = float(bot.get("after_match_delay", 1) or 0)
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
