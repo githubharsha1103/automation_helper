@@ -1692,6 +1692,7 @@ async def start_controller() -> None:
     _application.add_handler(CommandHandler("start", start_command))
     _application.add_handler(conv_handler)
     _application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
+    _application.add_handler(CallbackQueryHandler(menu_callback, pattern="^analytics:"))
     _application.add_handler(CallbackQueryHandler(list_bots_callback, pattern="^bot:list$"))
     _application.add_handler(CallbackQueryHandler(view_bot_callback, pattern="^bot:view:"))
     _application.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^bot:toggle:"))
