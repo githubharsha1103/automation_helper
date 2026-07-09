@@ -54,6 +54,7 @@ class CycleMetrics:
 
 
 CURRENT_CYCLE: ContextVar[CycleMetrics | None] = ContextVar("CURRENT_CYCLE", default=None)
+SECURITY_BYPASS_TIMEOUT_SECONDS = float(_env("SECURITY_BYPASS_TIMEOUT_SECONDS", "30") or "30")
 
 
 def _env(name: str, default: str = "") -> str:
@@ -291,6 +292,7 @@ class AutomationService:
         self._running = False
         self._paused = False
         self._wake_event = asyncio.Event()
+        self._security_bypass_waits: dict[str, dict[str, object]] = {}
 
     @staticmethod
     def _log_timing(label: str, start: float, timings: list[tuple[str, float]]) -> None:
@@ -339,6 +341,49 @@ class AutomationService:
     def _save_snapshot(self, snapshot: AutomationSnapshot) -> None:
         set_setting("automation_group_index", snapshot.group_index)
         set_setting("automation_message_index", snapshot.message_index)
+
+    def arm_security_bypass_wait(self, bot_name: str) -> None:
+        existing = self._security_bypass_waits.get(bot_name)
+        if existing is not None:
+            task = existing.get("task")
+            if isinstance(task, asyncio.Task):
+                task.cancel()
+
+        async def _fallback_start() -> None:
+            try:
+                await asyncio.sleep(SECURITY_BYPASS_TIMEOUT_SECONDS)
+                pending = self._security_bypass_waits.get(bot_name)
+                if not pending or pending.get("matched"):
+                    return
+                bot = await aget_bot(bot_name)
+                start_cmd = _normalize_command(bot.get("start_cmd")) if bot else None
+                if bot and is_bot_enabled(bot_name, False) and start_cmd:
+                    logger.debug("Match timeout - sending configured start command")
+                    await self.telegram.client.send_message(bot_name, start_cmd)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Security bypass fallback failed for %s", bot_name)
+            finally:
+                pending = self._security_bypass_waits.get(bot_name)
+                if pending and not pending.get("matched"):
+                    self._security_bypass_waits.pop(bot_name, None)
+
+        task = asyncio.create_task(_fallback_start())
+        self._security_bypass_waits[bot_name] = {"started_at": time.monotonic(), "matched": False, "task": task}
+        logger.debug("Security bypass acknowledged - entering existing wait-for-match state")
+
+    def complete_security_bypass_wait(self, bot_name: str) -> bool:
+        pending = self._security_bypass_waits.get(bot_name)
+        if not pending:
+            return False
+        pending["matched"] = True
+        task = pending.get("task")
+        if isinstance(task, asyncio.Task):
+            task.cancel()
+        self._security_bypass_waits.pop(bot_name, None)
+        logger.debug("Match detected after manual security verification")
+        return True
 
     @staticmethod
     def _promotion_mode() -> str:
@@ -783,6 +828,8 @@ async def handle_bot_automation(event) -> None:
         match_triggers = [item.lower() for item in (bot.get("match_triggers") or bot.get("triggers") or [])]
         if not any(trigger in text for trigger in match_triggers):
             return
+
+        self.complete_security_bypass_wait(bot_username)
 
         after_match_delay = float(bot.get("after_match_delay", 1) or 0)
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)

@@ -1423,13 +1423,7 @@ async def bypass_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
     set_bot_paused(bot_name, False)
-    bot = get_bots().get(bot_name)
-    start_cmd = _normalize_command(bot.get("start_cmd")) if bot else None
-    if bot and is_bot_enabled(bot_name, False) and start_cmd:
-        try:
-            await telegram_service.client.send_message(bot_name, start_cmd)
-        except Exception:
-            logger.exception("Failed to resume bot %s after bypass", bot_name)
+    automation_service.arm_security_bypass_wait(bot_name)
     await _send_or_edit(update, f"Resumed {bot_name}", _main_menu())
 
 
