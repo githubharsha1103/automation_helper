@@ -54,7 +54,6 @@ class CycleMetrics:
 
 
 CURRENT_CYCLE: ContextVar[CycleMetrics | None] = ContextVar("CURRENT_CYCLE", default=None)
-SECURITY_BYPASS_TIMEOUT_SECONDS = float(_env("SECURITY_BYPASS_TIMEOUT_SECONDS", "30") or "30")
 
 
 def _env(name: str, default: str = "") -> str:
@@ -78,6 +77,7 @@ GROUP_FAILURE_THRESHOLD = int(_env("GROUP_FAILURE_THRESHOLD", "3") or "3")
 GROUP_FAILURE_COOLDOWN_MINUTES = int(_env("GROUP_FAILURE_COOLDOWN_MINUTES", "10") or "10")
 GROUP_LOOP_POLL_SECONDS = 2
 STOP_COMMAND_DELAY_SECONDS = float(_env("STOP_COMMAND_DELAY_SECONDS", "2") or "2")
+SECURITY_BYPASS_TIMEOUT_SECONDS = float(_env("SECURITY_BYPASS_TIMEOUT_SECONDS", "30") or "30")
 
 
 class TelegramService:
