@@ -38,6 +38,7 @@ from storage.db import (
     set_setting,
     update_group_runtime,
 )
+from storage.analytics import init_analytics, list_bot_documents, record_event
 
 load_dotenv()
 
@@ -293,6 +294,7 @@ class AutomationService:
         self._paused = False
         self._wake_event = asyncio.Event()
         self._security_bypass_waits: dict[str, dict[str, object]] = {}
+        self._active_cycle_count = 0
 
     @staticmethod
     def _log_timing(label: str, start: float, timings: list[tuple[str, float]]) -> None:
@@ -371,6 +373,7 @@ class AutomationService:
 
         task = asyncio.create_task(_fallback_start())
         self._security_bypass_waits[bot_name] = {"started_at": time.monotonic(), "matched": False, "task": task}
+        record_event("security_bypass_used", bot_name=bot_name)
         logger.debug("Security bypass acknowledged - entering existing wait-for-match state")
 
     def complete_security_bypass_wait(self, bot_name: str) -> bool:
@@ -384,6 +387,19 @@ class AutomationService:
         self._security_bypass_waits.pop(bot_name, None)
         logger.debug("Match detected after manual security verification")
         return True
+
+    def live_status_snapshot(self) -> dict[str, object]:
+        waiting = len(self._security_bypass_waits)
+        return {
+            "automation_running": self._running,
+            "automation_stopped": not self._running,
+            "active_bots": waiting,
+            "bots_currently_searching": 0,
+            "active_conversations": 0,
+            "bots_waiting_for_match": waiting,
+            "bots_waiting_for_security_verification": waiting,
+            "current_cycle_count": self._active_cycle_count,
+        }
 
     @staticmethod
     def _promotion_mode() -> str:
@@ -479,31 +495,41 @@ class AutomationService:
         mode = self._promotion_mode()
         if mode in {"sticker", "both"}:
             sticker_sent = await self._send_promotion_sticker(group["group_id"])
+            if sticker_sent:
+                record_event("sticker_sent")
             if mode == "sticker":
                 return
             if sticker_sent:
                 await asyncio.sleep(1)
             if group.get("special_message"):
                 await self.telegram.send_text(group["group_id"], group["special_message"])
+                record_event("promotion_sent")
             else:
                 await self.telegram.send_saved_message(group["group_id"], message)
+                record_event("promotion_sent")
             return
         if group.get("special_message"):
             await self.telegram.send_text(group["group_id"], group["special_message"])
+            record_event("promotion_sent")
         else:
             await self.telegram.send_saved_message(group["group_id"], message)
+            record_event("promotion_sent")
 
     async def _send_bot_promotion(self, bot_username: str, message: dict) -> None:
         mode = self._promotion_mode()
         if mode in {"sticker", "both"}:
             sticker_sent = await self._send_promotion_sticker(bot_username)
+            if sticker_sent:
+                record_event("sticker_sent", bot_name=bot_username)
             if mode == "sticker":
                 return
             if sticker_sent:
                 await asyncio.sleep(1)
             await self.telegram.send_saved_payload(bot_username, message)
+            record_event("promotion_sent", bot_name=bot_username)
             return
         await self.telegram.send_saved_payload(bot_username, message)
+        record_event("promotion_sent", bot_name=bot_username)
 
     def _advance_snapshot(
         self,
@@ -630,6 +656,9 @@ class AutomationService:
                         continue
 
                     due_processed = True
+                    self._active_cycle_count += 1
+                    cycle_started_at = time.monotonic()
+                    record_event("cycle_started")
 
                     if cooldown_until and now < cooldown_until:
                         scheduled_next_run = self._compute_next_run_at(group, message, now)
@@ -647,6 +676,7 @@ class AutomationService:
                             cooldown_until.isoformat(),
                         )
                         self._advance_snapshot(snapshot, len(groups), len(messages))
+                        self._active_cycle_count = max(self._active_cycle_count - 1, 0)
                         logger.info("[CYCLE COMPLETE] result=skipped_cooldown group_id=%s", group.get("group_id"))
                         continue
 
@@ -663,6 +693,7 @@ class AutomationService:
                             next_run_at=next_run_at_value,
                         )
                         self._advance_snapshot(snapshot, len(groups), len(messages))
+                        self._active_cycle_count = max(self._active_cycle_count - 1, 0)
                         logger.info("[CYCLE COMPLETE] result=inactive_time group_id=%s", group.get("group_id"))
                         continue
 
@@ -682,6 +713,7 @@ class AutomationService:
                             last_sent_at=now.isoformat(),
                         )
                         await aset_setting("automation_last_execution_time", __import__("datetime").datetime.utcnow().isoformat())
+                        record_event("cycle_completed", runtime_seconds=time.monotonic() - cycle_started_at)
                         logger.info(
                             "[SUCCESS] Group %s reset fail_count",
                             group.get("group_id"),
@@ -715,7 +747,9 @@ class AutomationService:
                             group.get("group_id"),
                             wait_seconds,
                         )
+                        record_event("cycle_failed", runtime_seconds=time.monotonic() - cycle_started_at)
                         self._advance_snapshot(snapshot, len(groups), len(messages))
+                        self._active_cycle_count = max(self._active_cycle_count - 1, 0)
                         logger.info("[CYCLE COMPLETE] result=flood_wait group_id=%s", group.get("group_id"))
                         continue
                     except Exception as exc:
@@ -748,11 +782,14 @@ class AutomationService:
                             message.get("id"),
                             exc,
                         )
+                        record_event("cycle_failed", runtime_seconds=time.monotonic() - cycle_started_at)
                         self._advance_snapshot(snapshot, len(groups), len(messages))
+                        self._active_cycle_count = max(self._active_cycle_count - 1, 0)
                         logger.info("[CYCLE COMPLETE] result=failed group_id=%s", group.get("group_id"))
                         continue
 
                     self._advance_snapshot(snapshot, len(groups), len(messages))
+                    self._active_cycle_count = max(self._active_cycle_count - 1, 0)
                     logger.info("[CYCLE COMPLETE] result=success group_id=%s", group.get("group_id"))
 
                 if not due_processed:
@@ -813,6 +850,7 @@ async def handle_bot_automation(event) -> None:
         security_triggers = [item.lower() for item in bot.get("security_triggers", [])]
         if any(trigger in text for trigger in security_triggers):
             set_bot_paused(bot_username, True)
+            record_event("security_challenge", bot_name=bot_username)
             logger.warning("Security trigger hit for %s", bot_username)
             try:
                 from controller.controller import notify_security
@@ -830,6 +868,7 @@ async def handle_bot_automation(event) -> None:
             return
 
         automation_service.complete_security_bypass_wait(bot_username)
+        record_event("match_found", bot_name=bot_username)
 
         after_match_delay = float(bot.get("after_match_delay", 1) or 0)
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
@@ -850,14 +889,18 @@ async def handle_bot_automation(event) -> None:
             try:
                 if promotion_mode == "sticker":
                     if await automation_service._send_promotion_sticker(bot_username):
+                        record_event("sticker_sent", bot_name=bot_username)
                         pass
                 elif promotion_mode == "both":
                     if await automation_service._send_promotion_sticker(bot_username):
+                        record_event("sticker_sent", bot_name=bot_username)
                         await asyncio.sleep(1)
                         await telegram_service.send_saved_payload(bot_username, selected_message)
+                        record_event("promotion_sent", bot_name=bot_username)
                         metrics.messages_sent += 1
                 else:
                     await telegram_service.send_saved_payload(bot_username, selected_message)
+                    record_event("promotion_sent", bot_name=bot_username)
                     metrics.messages_sent += 1
             except Exception:
                 logger.exception("Failed to send promotion payload to %s", bot_username)
@@ -868,6 +911,7 @@ async def handle_bot_automation(event) -> None:
                 await asyncio.sleep(STOP_COMMAND_DELAY_SECONDS)
                 logger.debug("Sending /stop after delay")
             await telegram_service.client.send_message(bot_username, stop_cmd)
+            record_event("stop_command_sent", bot_name=bot_username)
 
         if after_chat_delay:
             await asyncio.sleep(after_chat_delay)

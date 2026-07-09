@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 import traceback
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from telegram.ext import (
 )
 
 from automation.worker import automation_service, telegram_service
+from storage.analytics import get_scope_document, init_analytics, list_bot_documents
 from storage.db import (
     add_bot,
     add_group,
@@ -54,6 +56,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 STICKER_DIR = Path("stickers")
+CONTROLLER_START_MONOTONIC = time.monotonic()
 
 ADD_GROUP_CHAT_ID = 100
 ADD_MESSAGE_CONTENT = 200
@@ -175,10 +178,140 @@ def _automation_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Stop Automation", callback_data="automation:stop")],
             [InlineKeyboardButton("Pause", callback_data="automation:pause")],
             [InlineKeyboardButton("Resume", callback_data="automation:resume")],
+            [InlineKeyboardButton("📊 Analytics Dashboard", callback_data="analytics:menu")],
             [InlineKeyboardButton("Promotion Settings", callback_data="promotion:settings")],
             [InlineKeyboardButton("Back", callback_data="menu:main")],
         ]
     )
+
+
+def _analytics_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📅 Today", callback_data="analytics:today")],
+            [InlineKeyboardButton("📆 This Month", callback_data="analytics:month")],
+            [InlineKeyboardButton("🌍 Overall", callback_data="analytics:overall")],
+            [InlineKeyboardButton("🤖 Per Bot", callback_data="analytics:bot")],
+            [InlineKeyboardButton("🟢 Live Status", callback_data="analytics:live")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="menu:automation")],
+        ]
+    )
+
+
+def _refresh_back_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Refresh 🔄", callback_data=f"{prefix}:refresh")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="analytics:menu")],
+        ]
+    )
+
+
+def _fmt_date(value: object) -> str:
+    if not value:
+        return "N/A"
+    text = str(value)
+    return text.replace("T", " ")[:19]
+
+
+def _pct(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return "0%"
+    return f"{round((numerator / denominator) * 100, 1)}%"
+
+
+def _analytics_text(scope: str) -> str:
+    if scope == "today":
+        doc = get_scope_document("day", period=__import__("datetime").datetime.now().strftime("%Y-%m-%d")) or {}
+        cycles_started = int(doc.get("cycle_started", 0) or 0)
+        cycles_completed = int(doc.get("cycle_completed", 0) or 0)
+        failures = int(doc.get("cycle_failed", 0) or 0)
+        return (
+            "Today Analytics\n"
+            f"Total Cycles Started: {cycles_started}\n"
+            f"Total Cycles Completed: {cycles_completed}\n"
+            f"Matches Found: {int(doc.get('match_found', 0) or 0)}\n"
+            f"Promotion Messages Sent: {int(doc.get('promotion_sent', 0) or 0)}\n"
+            f"Promotion Stickers Sent: {int(doc.get('sticker_sent', 0) or 0)}\n"
+            f"Stop Commands Sent: {int(doc.get('stop_command_sent', 0) or 0)}\n"
+            f"Security Challenges Encountered: {int(doc.get('security_challenge', 0) or 0)}\n"
+            f"Security Bypass Used: {int(doc.get('security_bypass_used', 0) or 0)}\n"
+            f"Failed Cycles: {failures}\n"
+            f"Success Rate: {_pct(cycles_completed, cycles_started)}\n"
+            f"Runtime Today: {round(float(doc.get('runtime_seconds', 0) or 0) / 3600, 2)}h"
+        )
+    if scope == "month":
+        doc = get_scope_document("month", period=__import__("datetime").datetime.now().strftime("%Y-%m")) or {}
+        cycles_started = int(doc.get("cycle_started", 0) or 0)
+        cycles_completed = int(doc.get("cycle_completed", 0) or 0)
+        return (
+            "This Month Analytics\n"
+            f"Total Cycles Started: {cycles_started}\n"
+            f"Total Cycles Completed: {cycles_completed}\n"
+            f"Matches Found: {int(doc.get('match_found', 0) or 0)}\n"
+            f"Promotion Messages Sent: {int(doc.get('promotion_sent', 0) or 0)}\n"
+            f"Promotion Stickers Sent: {int(doc.get('sticker_sent', 0) or 0)}\n"
+            f"Stop Commands Sent: {int(doc.get('stop_command_sent', 0) or 0)}\n"
+            f"Security Challenges Encountered: {int(doc.get('security_challenge', 0) or 0)}\n"
+            f"Security Bypass Used: {int(doc.get('security_bypass_used', 0) or 0)}\n"
+            f"Failed Cycles: {int(doc.get('cycle_failed', 0) or 0)}\n"
+            f"Success Rate: {_pct(cycles_completed, cycles_started)}\n"
+            f"Runtime This Month: {round(float(doc.get('runtime_seconds', 0) or 0) / 3600, 2)}h\n"
+            f"Average Cycles Per Day: {round(cycles_started / max(1, __import__('datetime').datetime.now().day), 2)}\n"
+            f"Average Promotions Per Day: {round(int(doc.get('promotion_sent', 0) or 0) / max(1, __import__('datetime').datetime.now().day), 2)}"
+        )
+    if scope == "overall":
+        doc = get_scope_document("overall") or {}
+        return (
+            "Overall Analytics\n"
+            f"Total Cycles: {int(doc.get('cycle_started', 0) or 0)}\n"
+            f"Total Matches: {int(doc.get('match_found', 0) or 0)}\n"
+            f"Total Promotions: {int(doc.get('promotion_sent', 0) or 0)}\n"
+            f"Total Stickers: {int(doc.get('sticker_sent', 0) or 0)}\n"
+            f"Total Stop Commands: {int(doc.get('stop_command_sent', 0) or 0)}\n"
+            f"Total Security Challenges: {int(doc.get('security_challenge', 0) or 0)}\n"
+            f"Total Failed Cycles: {int(doc.get('cycle_failed', 0) or 0)}\n"
+            f"Total Runtime: {round(float(doc.get('runtime_seconds', 0) or 0) / 3600, 2)}h\n"
+            f"First Automation Start Date: {_fmt_date(doc.get('first_automation_start'))}"
+        )
+    if scope == "live":
+        live = automation_service.live_status_snapshot()
+        return (
+            "Live Status\n"
+            f"Automation Running / Stopped: {'Running' if live['automation_running'] else 'Stopped'}\n"
+            f"Number of Active Bots: {live['active_bots']}\n"
+            f"Bots Currently Searching: {live['bots_currently_searching']}\n"
+            f"Active Conversations: {live['active_conversations']}\n"
+            f"Bots Waiting for Match: {live['bots_waiting_for_match']}\n"
+            f"Bots Waiting for Security Verification: {live['bots_waiting_for_security_verification']}\n"
+            f"Current Cycle Count: {live['current_cycle_count']}\n"
+            f"Current Uptime: {round((time.monotonic() - CONTROLLER_START_MONOTONIC) / 3600, 2)}h"
+        )
+    return "Analytics"
+
+
+def _bot_analytics_text() -> str:
+    docs = list_bot_documents()
+    if not docs:
+        return "Per Bot Analytics\nNo analytics available yet."
+    lines = ["Per Bot Analytics"]
+    for doc in docs:
+        completed = int(doc.get("cycle_completed", 0) or 0)
+        started = int(doc.get("cycle_started", 0) or 0)
+        lines.extend(
+            [
+                f"Bot Name: {doc.get('bot_name', 'N/A')}",
+                f"Cycles Completed: {completed}",
+                f"Matches: {int(doc.get('match_found', 0) or 0)}",
+                f"Promotions: {int(doc.get('promotion_sent', 0) or 0)}",
+                f"Security Challenges: {int(doc.get('security_challenge', 0) or 0)}",
+                f"Failed Cycles: {int(doc.get('cycle_failed', 0) or 0)}",
+                f"Success Rate: {_pct(completed, started)}",
+                f"Last Active Time: {_fmt_date(doc.get('last_activity_at'))}",
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
 
 
 def _cancel_menu() -> InlineKeyboardMarkup:
@@ -556,6 +689,30 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _send_or_edit(update, "Message management", _messages_menu())
     elif action == "menu:automation":
         await _send_or_edit(update, _automation_status_text(), _automation_menu())
+    elif action == "analytics:menu":
+        await _send_or_edit(update, "Analytics Dashboard", _analytics_menu())
+    elif action == "analytics:today":
+        await _send_or_edit(update, _analytics_text("today"), _refresh_back_keyboard("analytics:today"))
+    elif action == "analytics:month":
+        await _send_or_edit(update, _analytics_text("month"), _refresh_back_keyboard("analytics:month"))
+    elif action == "analytics:overall":
+        await _send_or_edit(update, _analytics_text("overall"), _refresh_back_keyboard("analytics:overall"))
+    elif action == "analytics:live":
+        await _send_or_edit(update, _analytics_text("live"), _refresh_back_keyboard("analytics:live"))
+    elif action == "analytics:bot":
+        await _send_or_edit(update, _bot_analytics_text(), _refresh_back_keyboard("analytics:bot"))
+    elif action.startswith("analytics:") and action.endswith(":refresh"):
+        key = action.split(":", 2)[1]
+        if key == "today":
+            await _send_or_edit(update, _analytics_text("today"), _refresh_back_keyboard("analytics:today"))
+        elif key == "month":
+            await _send_or_edit(update, _analytics_text("month"), _refresh_back_keyboard("analytics:month"))
+        elif key == "overall":
+            await _send_or_edit(update, _analytics_text("overall"), _refresh_back_keyboard("analytics:overall"))
+        elif key == "live":
+            await _send_or_edit(update, _analytics_text("live"), _refresh_back_keyboard("analytics:live"))
+        elif key == "bot":
+            await _send_or_edit(update, _bot_analytics_text(), _refresh_back_keyboard("analytics:bot"))
 
 
 async def promotion_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1463,6 +1620,7 @@ async def start_controller() -> None:
     if not TOKEN:
         raise ValueError("CONTROL_BOT_TOKEN is required")
 
+    init_analytics()
     print("[STARTUP] Building Telegram control application...")
     logger.info("[STARTUP] Building Telegram control application...")
     _application = Application.builder().token(TOKEN).build()
