@@ -889,6 +889,33 @@ async def toggle_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await _render_bot_details(update, bot_name)
 
 
+async def _set_bot_enabled_runtime(bot_name: str, enabled: bool, bot: dict | None = None) -> None:
+    bot = bot or get_bots().get(bot_name) or {}
+    set_bot_enabled(bot_name, enabled)
+    if not enabled:
+        set_bot_paused(bot_name, False)
+        stop_cmd = _normalize_command(bot.get("stop_cmd"))
+        if stop_cmd:
+            try:
+                await telegram_service.client.send_message(bot_name, stop_cmd)
+            except Exception:
+                logger.exception("Failed to send stop command to %s", bot_name)
+    else:
+        start_cmd = _normalize_command(bot.get("start_cmd"))
+        if start_cmd:
+            try:
+                await telegram_service.client.send_message(bot_name, start_cmd)
+            except Exception:
+                logger.exception("Failed to send start command to %s", bot_name)
+
+
+async def _set_group_status_runtime(group_id: str, status: str) -> None:
+    set_group_status(group_id, status)
+    if status == "enabled":
+        automation_service.start()
+        set_setting("automation_running", True)
+
+
 async def delete_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_callback_answer(query)
@@ -1578,12 +1605,14 @@ async def automation_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def automation_toggle_bots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_callback_answer(query)
-    bot_names = list(get_bots().keys())
+    bots = get_bots()
+    bot_names = list(bots.keys())
     if not bot_names:
         await _send_or_edit(update, _automation_status_text(), _automation_menu())
         return
     should_enable = not any(is_bot_enabled(name, False) for name in bot_names)
-    set_all_bots_enabled(should_enable)
+    for bot_name, bot in bots.items():
+        await _set_bot_enabled_runtime(bot_name, should_enable, bot)
     await _send_or_edit(update, _automation_status_text(), _automation_menu())
 
 
@@ -1595,10 +1624,8 @@ async def automation_toggle_groups(update: Update, context: ContextTypes.DEFAULT
         await _send_or_edit(update, _automation_status_text(), _automation_menu())
         return
     should_enable = not any(group.get("status") == "enabled" for group in groups)
-    set_all_groups_status("enabled" if should_enable else "disabled")
-    if should_enable:
-        automation_service.start()
-        set_setting("automation_running", True)
+    for group in groups:
+        await _set_group_status_runtime(str(group.get("group_id")), "enabled" if should_enable else "disabled")
     await _send_or_edit(update, _automation_status_text(), _automation_menu())
 
 
