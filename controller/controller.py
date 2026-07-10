@@ -898,8 +898,13 @@ async def view_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def bot_promotion_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_callback_answer(query)
-    bot_name = query.data.split(":", 2)[2]
+    raw_callback = query.data
+    bot_name = raw_callback.split(":", 2)[2]
+    logger.info("RAW CALLBACK: %s", raw_callback)
+    logger.info("PARSED BOT: %s", bot_name)
+    logger.info("LOOKUP FIELD: _id via get_bot(bot_name)")
     bot = _fresh_bot(bot_name)
+    logger.info("BOT FOUND: %s", bool(bot))
     if not bot:
         await _send_or_edit(update, "Bot not found", InlineKeyboardMarkup(_bot_rows()))
         return
@@ -909,12 +914,18 @@ async def bot_promotion_mode_callback(update: Update, context: ContextTypes.DEFA
 async def bot_promotion_mode_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await _safe_callback_answer(query)
-    _, _, _, mode, bot_name = query.data.split(":", 4)
+    raw_callback = query.data
+    _, _, _, mode, bot_name = raw_callback.split(":", 4)
+    logger.info("RAW CALLBACK: %s", raw_callback)
+    logger.info("PARSED MODE: %s", mode)
+    logger.info("PARSED BOT: %s", bot_name)
+    logger.info("LOOKUP FIELD: _id via get_bot(bot_name)")
     bot = _fresh_bot(bot_name)
+    logger.info("BOT FOUND: %s", bool(bot))
     if not bot:
         await _send_or_edit(update, "Bot not found", InlineKeyboardMarkup(_bot_rows()))
         return
-    logger.info("PROMOTION MODE CALLBACK\nBot ID: %s\nSelected Mode: %s\nCallback Data: %s", bot_name, mode, query.data)
+    logger.info("PROMOTION MODE CALLBACK\nBot ID: %s\nSelected Mode: %s\nCallback Data: %s", bot_name, mode, raw_callback)
     success = update_bot(bot_name, promotion_mode=mode)
     reloaded_bot = get_bot_fresh(bot_name)
     stored_value = (reloaded_bot or {}).get("promotion_mode")
@@ -1827,7 +1838,7 @@ async def start_controller() -> None:
     _application.add_handler(CallbackQueryHandler(menu_callback, pattern="^automation:"))
     _application.add_handler(CallbackQueryHandler(list_bots_callback, pattern="^bot:list$"))
     _application.add_handler(CallbackQueryHandler(view_bot_callback, pattern="^bot:view:"))
-    _application.add_handler(CallbackQueryHandler(bot_promotion_mode_callback, pattern="^bot:promotion_mode:"))
+    _application.add_handler(CallbackQueryHandler(bot_promotion_mode_callback, pattern="^bot:promotion_mode:[^:]+$"))
     _application.add_handler(CallbackQueryHandler(bot_promotion_mode_set_callback, pattern="^bot:promotion_mode:set:"))
     _application.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^bot:toggle:"))
     _application.add_handler(CallbackQueryHandler(edit_bot_callback, pattern="^bot:edit:"))
