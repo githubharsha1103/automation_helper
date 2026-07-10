@@ -875,12 +875,15 @@ async def handle_bot_automation(event) -> None:
 
         automation_service.complete_security_bypass_wait(bot_username)
         record_event("match_found", bot_name=bot_username)
+        logger.debug("MATCH DETECTED bot=%s", bot_username)
 
         after_match_delay = float(bot.get("after_match_delay", 1) or 0)
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
         messages = await alist_messages(active_only=False)
         bot = await aget_bot(bot_username)
         promotion_mode = self._bot_promotion_mode(bot)
+        logger.debug("ENTER PROMOTION LOGIC bot=%s", bot_username)
+        logger.debug("LOADED PROMOTION MODE bot=%s mode=%s", bot_username, promotion_mode)
         logger.info(
             "PROMOTION STICKER CHECK: asset_channel=%s sticker_message_id=%s",
             get_promotion_asset_channel(),
@@ -894,32 +897,41 @@ async def handle_bot_automation(event) -> None:
         try:
             selected_message = random.choice(messages) if messages else {}
             if promotion_mode == "sticker":
+                logger.debug("PROMOTION STICKER SEND bot=%s", bot_username)
                 await automation_service._send_bot_promotion(bot_username, selected_message)
             elif promotion_mode == "both":
+                logger.debug("PROMOTION MESSAGE SEND bot=%s", bot_username)
+                logger.debug("PROMOTION STICKER SEND bot=%s", bot_username)
                 await automation_service._send_bot_promotion(bot_username, selected_message)
                 if messages:
                     metrics.messages_sent += 1
             else:
                 if messages:
+                    logger.debug("PROMOTION MESSAGE SEND bot=%s", bot_username)
                     await automation_service._send_bot_promotion(bot_username, selected_message)
                     metrics.messages_sent += 1
+            logger.debug("AFTER PROMOTION COMPLETED bot=%s", bot_username)
         except Exception:
             logger.exception("Failed to send promotion payload to %s", bot_username)
         stop_cmd = _normalize_command(bot.get("stop_cmd"))
         if stop_cmd:
+            logger.debug("BEFORE STOP COMMAND bot=%s", bot_username)
             if STOP_COMMAND_DELAY_SECONDS:
                 logger.debug("Waiting %s seconds before sending /stop", STOP_COMMAND_DELAY_SECONDS)
                 await asyncio.sleep(STOP_COMMAND_DELAY_SECONDS)
                 logger.debug("Sending /stop after delay")
             await telegram_service.client.send_message(bot_username, stop_cmd)
             record_event("stop_command_sent", bot_name=bot_username)
+            logger.debug("AFTER STOP COMMAND bot=%s", bot_username)
 
         if after_chat_delay:
             await asyncio.sleep(after_chat_delay)
         start_cmd = _normalize_command(bot.get("start_cmd"))
         if start_cmd and is_bot_enabled(bot_username, False):
+            logger.debug("BEFORE NEXT START COMMAND bot=%s", bot_username)
             await telegram_service.client.send_message(bot_username, start_cmd)
             logger.info("Automation cycled for %s", bot_username)
+        logger.debug("CYCLE COMPLETED bot=%s", bot_username)
         logger.info(
             "BOT AUTOMATION CYCLE: bot=%s dialogs=%s messages_sent=%s duration=%.2f ms",
             bot_username,
