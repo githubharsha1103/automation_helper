@@ -300,6 +300,16 @@ def set_bot_enabled(bot_name: str, enabled: bool) -> bool:
     return add_bot(bot_name, current)
 
 
+def set_all_bots_enabled(enabled: bool) -> int:
+    count = 0
+    for bot_name in get_bots().keys():
+        if set_bot_enabled(bot_name, enabled):
+            if not enabled:
+                set_bot_paused(bot_name, False)
+            count += 1
+    return count
+
+
 def is_bot_enabled(bot_name: str, default: bool = False) -> bool:
     bot = get_bot(bot_name) or {}
     if "enabled" in bot:
@@ -405,6 +415,14 @@ def set_group_status(group_id: str, status: str) -> bool:
         cached["status"] = status
         cached["updated_at"] = now
     return True
+
+
+def set_all_groups_status(status: str) -> int:
+    count = 0
+    for group in list_groups():
+        if set_group_status(str(group.get("group_id")), status):
+            count += 1
+    return count
 
 
 def update_group_runtime(group_id: str, last_status: str | None = None, last_error: str | None = None, fail_count: int | None = None, last_failed_at: str | None = None, cooldown_until: str | None | object = None, next_run_at: str | None | object = None, last_sent_at: str | None | object = None) -> bool:

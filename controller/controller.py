@@ -46,6 +46,8 @@ from storage.db import (
     set_bot_enabled,
     set_bot_paused,
     set_group_status,
+    set_all_bots_enabled,
+    set_all_groups_status,
     set_setting,
     update_group_delay,
     update_group_name,
@@ -172,13 +174,20 @@ def _messages_menu() -> InlineKeyboardMarkup:
     )
 
 
+def _automation_bot_action_label() -> str:
+    return "Disable All Bots" if any(is_bot_enabled(name, False) for name in get_bots()) else "Enable All Bots"
+
+
+def _automation_group_action_label() -> str:
+    return "Disable All Groups" if any(group.get("status") == "enabled" for group in list_groups()) else "Enable All Groups"
+
+
 def _automation_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Stop Automation", callback_data="automation:stop")],
-            [InlineKeyboardButton("Pause", callback_data="automation:pause")],
-            [InlineKeyboardButton("Resume", callback_data="automation:resume")],
-            [InlineKeyboardButton("📊 Analytics Dashboard", callback_data="analytics:menu")],
+            [InlineKeyboardButton(f"?? {_automation_bot_action_label()}", callback_data="automation:toggle_bots")],
+            [InlineKeyboardButton(f"?? {_automation_group_action_label()}", callback_data="automation:toggle_groups")],
+            [InlineKeyboardButton("?? Analytics Dashboard", callback_data="analytics:menu")],
             [InlineKeyboardButton("Promotion Settings", callback_data="promotion:settings")],
             [InlineKeyboardButton("Back", callback_data="menu:main")],
         ]
@@ -701,6 +710,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _send_or_edit(update, _analytics_text("live"), _refresh_back_keyboard("analytics:live"))
     elif action == "analytics:bot":
         await _send_or_edit(update, _bot_analytics_text(), _refresh_back_keyboard("analytics:bot"))
+    elif action == "automation:toggle_bots":
+        await automation_toggle_bots(update, context)
+    elif action == "automation:toggle_groups":
+        await automation_toggle_groups(update, context)
     elif action.startswith("analytics:") and action.endswith(":refresh"):
         key = action.split(":", 2)[1]
         if key == "today":
@@ -1562,6 +1575,33 @@ async def automation_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _send_or_edit(update, _automation_status_text(), _automation_menu())
 
 
+async def automation_toggle_bots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    bot_names = list(get_bots().keys())
+    if not bot_names:
+        await _send_or_edit(update, _automation_status_text(), _automation_menu())
+        return
+    should_enable = not any(is_bot_enabled(name, False) for name in bot_names)
+    set_all_bots_enabled(should_enable)
+    await _send_or_edit(update, _automation_status_text(), _automation_menu())
+
+
+async def automation_toggle_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    groups = list_groups()
+    if not groups:
+        await _send_or_edit(update, _automation_status_text(), _automation_menu())
+        return
+    should_enable = not any(group.get("status") == "enabled" for group in groups)
+    set_all_groups_status("enabled" if should_enable else "disabled")
+    if should_enable:
+        automation_service.start()
+        set_setting("automation_running", True)
+    await _send_or_edit(update, _automation_status_text(), _automation_menu())
+
+
 async def notify_security(bot_name: str) -> None:
     global _application
     if _application is None or ALLOWED_USER_ID == 0:
@@ -1693,6 +1733,7 @@ async def start_controller() -> None:
     _application.add_handler(conv_handler)
     _application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
     _application.add_handler(CallbackQueryHandler(menu_callback, pattern="^analytics:"))
+    _application.add_handler(CallbackQueryHandler(menu_callback, pattern="^automation:"))
     _application.add_handler(CallbackQueryHandler(list_bots_callback, pattern="^bot:list$"))
     _application.add_handler(CallbackQueryHandler(view_bot_callback, pattern="^bot:view:"))
     _application.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^bot:toggle:"))
