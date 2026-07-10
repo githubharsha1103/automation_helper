@@ -109,8 +109,16 @@ async def aget_setting(key: str, default: Any = None) -> Any:
     return await asyncio.to_thread(get_setting, key, default)
 
 
+async def aget_setting_fresh(key: str, default: Any = None) -> Any:
+    return await asyncio.to_thread(get_setting_fresh, key, default)
+
+
 async def aget_bot(bot_name: str) -> dict[str, Any] | None:
     return await asyncio.to_thread(get_bot, bot_name)
+
+
+async def aget_bot_fresh(bot_name: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(get_bot_fresh, bot_name)
 
 
 async def aget_bots() -> dict[str, dict[str, Any]]:
@@ -225,6 +233,17 @@ def get_setting(key: str, default: Any = None) -> Any:
     return value
 
 
+def get_setting_fresh(key: str, default: Any = None) -> Any:
+    start = time.monotonic()
+    doc = _mongo_db()["settings"].find_one({"_id": key})
+    value = _settings_value(doc, default)
+    _SETTING_CACHE[key] = value
+    elapsed_ms = (time.monotonic() - start) * 1000
+    _record_db_metric("get_setting", False, elapsed_ms)
+    record_operation("get_setting", elapsed_ms, True, "mongo", {"cache_hit": False, "fresh_read": True})
+    return value
+
+
 def delete_setting(key: str) -> bool:
     _mongo_db()["settings"].delete_one({"_id": key})
     _SETTING_CACHE.pop(key, None)
@@ -260,6 +279,22 @@ def get_bot(bot_name: str) -> dict[str, Any] | None:
     elapsed_ms = (time.monotonic() - start) * 1000
     _record_db_metric("get_bot", False, elapsed_ms)
     record_operation("get_bot", elapsed_ms, True, "mongo", {"cache_hit": False})
+    return bot
+
+
+def get_bot_fresh(bot_name: str) -> dict[str, Any] | None:
+    start = time.monotonic()
+    doc = _bots_collection().find_one({"_id": bot_name})
+    if not doc:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        _record_db_metric("get_bot", False, elapsed_ms)
+        record_operation("get_bot", elapsed_ms, False, "mongo", {"cache_hit": False, "fresh_read": True})
+        return None
+    bot = {k: v for k, v in doc.items() if k != "_id"}
+    _BOT_CACHE[bot_name] = dict(bot)
+    elapsed_ms = (time.monotonic() - start) * 1000
+    _record_db_metric("get_bot", False, elapsed_ms)
+    record_operation("get_bot", elapsed_ms, True, "mongo", {"cache_hit": False, "fresh_read": True})
     return bot
 
 

@@ -30,10 +30,12 @@ from storage.db import (
     delete_group,
     delete_message,
     get_bot,
+    get_bot_fresh,
     get_bots,
     get_group,
     get_message,
     get_setting,
+    get_setting_fresh,
     get_promotion_asset_channel,
     get_promotion_sticker_message_id,
     is_bot_enabled,
@@ -474,7 +476,7 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
     runtime_state = "RUNNING" if enabled and not paused else "IDLE"
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
-    promotion_mode = str(bot.get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
+    promotion_mode = str(bot.get("promotion_mode") or get_setting_fresh("promotion_mode", "message") or "message").strip().lower()
     promotion_asset_channel = get_promotion_asset_channel()
     promotion_sticker_message_id = get_promotion_sticker_message_id()
     sticker_configured = "Yes" if promotion_sticker_message_id else "No"
@@ -514,7 +516,7 @@ def _bot_details_keyboard(bot_name: str, enabled: bool) -> InlineKeyboardMarkup:
 def _bot_settings_text(bot_name: str, bot: dict) -> str:
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
-    promotion_mode = str(bot.get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
+    promotion_mode = str(bot.get("promotion_mode") or get_setting_fresh("promotion_mode", "message") or "message").strip().lower()
     return (
         f"Edit Settings: {bot_name}\n\n"
         f"Start cmd: {bot.get('start_cmd', '-')}\n"
@@ -542,7 +544,7 @@ def _bot_settings_keyboard(bot_name: str) -> InlineKeyboardMarkup:
 
 
 def _bot_promotion_mode_text(bot_name: str, bot: dict) -> str:
-    mode = str(bot.get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
+    mode = str(bot.get("promotion_mode") or get_setting_fresh("promotion_mode", "message") or "message").strip().lower()
     return (
         f"Promotion Mode: {_promotion_mode_label(mode)}\n\n"
         f"Bot: {bot_name}\n\n"
@@ -572,7 +574,7 @@ def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
     existing_enabled = bool(bot.get("enabled", is_bot_enabled(bot_name, False)))
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
-    promotion_mode = str(bot.get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
+    promotion_mode = str(bot.get("promotion_mode") or get_setting_fresh("promotion_mode", "message") or "message").strip().lower()
     return {
         "start_cmd": _normalize_command(bot.get("start_cmd", "")),
         "stop_cmd": _normalize_command(bot.get("stop_cmd", "")),
@@ -619,7 +621,7 @@ def _automation_status_text() -> str:
     messages_count = len(list_messages())
     active_bots = sum(1 for name in get_bots() if is_bot_enabled(name, False))
     last_execution_time = get_setting("automation_last_execution_time", "Never")
-    promotion_mode = get_setting("promotion_mode", "message") or "message"
+    promotion_mode = get_setting_fresh("promotion_mode", "message") or "message"
     promotion_asset_channel = get_promotion_asset_channel()
     promotion_sticker_message_id = get_promotion_sticker_message_id()
     mode_label = {
@@ -764,8 +766,18 @@ async def promotion_mode_set_callback(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     await _safe_callback_answer(query)
     mode = query.data.split(":", 2)[2]
-    set_setting("promotion_mode", mode)
+    logger.info("PROMOTION MODE CALLBACK\nBot ID: GLOBAL\nSelected Mode: %s\nCallback Data: %s", mode, query.data)
+    success = set_setting("promotion_mode", mode)
+    stored_value = get_setting("promotion_mode", "message")
+    reloaded_value = get_setting_fresh("promotion_mode", "message")
+    logger.info(
+        "Mongo Update Success: %s\nStored Value: %s\nReloaded Value: %s\nUI Refreshed: pending",
+        success,
+        stored_value,
+        reloaded_value,
+    )
     await _send_or_edit(update, _promotion_settings_text(), _promotion_settings_keyboard())
+    logger.info("UI Refreshed")
 
 
 async def promotion_asset_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -902,8 +914,18 @@ async def bot_promotion_mode_set_callback(update: Update, context: ContextTypes.
     if not bot:
         await _send_or_edit(update, "Bot not found", InlineKeyboardMarkup(_bot_rows()))
         return
-    update_bot(bot_name, promotion_mode=mode)
+    logger.info("PROMOTION MODE CALLBACK\nBot ID: %s\nSelected Mode: %s\nCallback Data: %s", bot_name, mode, query.data)
+    success = update_bot(bot_name, promotion_mode=mode)
+    reloaded_bot = get_bot_fresh(bot_name)
+    stored_value = (reloaded_bot or {}).get("promotion_mode")
+    logger.info(
+        "Mongo Update Success: %s\nStored Value: %s\nReloaded Value: %s\nUI Refreshed: pending",
+        success,
+        stored_value,
+        stored_value,
+    )
     await _render_bot_details(update, bot_name)
+    logger.info("UI Refreshed")
 
 
 async def toggle_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
