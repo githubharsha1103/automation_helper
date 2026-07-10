@@ -70,6 +70,11 @@ def _normalize_command(value: str | None) -> str | None:
     return cleaned if cleaned.startswith("/") else f"/{cleaned}"
 
 
+def _load_bot_promotion_mode(bot: dict | None) -> str:
+    mode = str((bot or {}).get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
+    return mode if mode in {"message", "sticker", "both"} else "message"
+
+
 API_ID = _env("API_ID")
 API_HASH = _env("API_HASH")
 SESSION_NAME = _env("TG_SESSION", "session")
@@ -408,8 +413,7 @@ class AutomationService:
 
     @staticmethod
     def _bot_promotion_mode(bot: dict | None) -> str:
-        mode = str((bot or {}).get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
-        return mode if mode in {"message", "sticker", "both"} else "message"
+        return _load_bot_promotion_mode(bot)
 
     @staticmethod
     def _promotion_asset_channel() -> str | None:
@@ -881,7 +885,7 @@ async def handle_bot_automation(event) -> None:
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
         messages = await alist_messages(active_only=False)
         bot = await aget_bot(bot_username)
-        promotion_mode = automation_service._bot_promotion_mode(bot)
+        promotion_mode = _load_bot_promotion_mode(bot)
         logger.debug("ENTER PROMOTION LOGIC bot=%s", bot_username)
         logger.debug("LOADED PROMOTION MODE bot=%s mode=%s", bot_username, promotion_mode)
         logger.info(
