@@ -185,9 +185,9 @@ def _automation_group_action_label() -> str:
 def _automation_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"?? {_automation_bot_action_label()}", callback_data="automation:toggle_bots")],
-            [InlineKeyboardButton(f"?? {_automation_group_action_label()}", callback_data="automation:toggle_groups")],
-            [InlineKeyboardButton("?? Analytics Dashboard", callback_data="analytics:menu")],
+            [InlineKeyboardButton(f"🤖{_automation_bot_action_label()}", callback_data="automation:toggle_bots")],
+            [InlineKeyboardButton(f"👥 {_automation_group_action_label()}", callback_data="automation:toggle_groups")],
+            [InlineKeyboardButton("📊 Analytics Dashboard", callback_data="analytics:menu")],
             [InlineKeyboardButton("Promotion Settings", callback_data="promotion:settings")],
             [InlineKeyboardButton("Back", callback_data="menu:main")],
         ]
@@ -909,7 +909,7 @@ async def _set_bot_enabled_runtime(bot_name: str, enabled: bool, bot: dict | Non
                 logger.exception("Failed to send start command to %s", bot_name)
 
 
-async def _set_group_status_runtime(group_id: str, status: str) -> None:
+async def _apply_group_status(group_id: str, status: str) -> None:
     set_group_status(group_id, status)
     if status == "enabled":
         automation_service.start()
@@ -1230,10 +1230,7 @@ async def toggle_group_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await list_groups_callback(update, context)
         return
     new_status = "disabled" if group["status"] == "enabled" else "enabled"
-    set_group_status(group_id, new_status)
-    if new_status == "enabled":
-        automation_service.start()
-        set_setting("automation_running", True)
+    await _apply_group_status(group_id, new_status)
     await _render_group_details(update, group_id)
 
 
@@ -1625,7 +1622,7 @@ async def automation_toggle_groups(update: Update, context: ContextTypes.DEFAULT
         return
     should_enable = not any(group.get("status") == "enabled" for group in groups)
     for group in groups:
-        await _set_group_status_runtime(str(group.get("group_id")), "enabled" if should_enable else "disabled")
+        await _apply_group_status(str(group.get("group_id")), "enabled" if should_enable else "disabled")
     await _send_or_edit(update, _automation_status_text(), _automation_menu())
 
 
