@@ -881,7 +881,7 @@ async def handle_bot_automation(event) -> None:
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
         messages = await alist_messages(active_only=False)
         bot = await aget_bot(bot_username)
-        promotion_mode = self._bot_promotion_mode(bot)
+        promotion_mode = automation_service._bot_promotion_mode(bot)
         logger.debug("ENTER PROMOTION LOGIC bot=%s", bot_username)
         logger.debug("LOADED PROMOTION MODE bot=%s mode=%s", bot_username, promotion_mode)
         logger.info(
