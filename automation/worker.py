@@ -407,6 +407,11 @@ class AutomationService:
         return mode if mode in {"message", "sticker", "both"} else "message"
 
     @staticmethod
+    def _bot_promotion_mode(bot: dict | None) -> str:
+        mode = str((bot or {}).get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
+        return mode if mode in {"message", "sticker", "both"} else "message"
+
+    @staticmethod
     def _promotion_asset_channel() -> str | None:
         asset_channel = get_promotion_asset_channel()
         return str(asset_channel) if asset_channel else None
@@ -516,7 +521,8 @@ class AutomationService:
             record_event("promotion_sent")
 
     async def _send_bot_promotion(self, bot_username: str, message: dict) -> None:
-        mode = self._promotion_mode()
+        bot = await aget_bot(bot_username)
+        mode = self._bot_promotion_mode(bot)
         if mode in {"sticker", "both"}:
             sticker_sent = await self._send_promotion_sticker(bot_username)
             if sticker_sent:
@@ -873,7 +879,8 @@ async def handle_bot_automation(event) -> None:
         after_match_delay = float(bot.get("after_match_delay", 1) or 0)
         after_chat_delay = float(bot.get("after_chat_delay", 10) or 0)
         messages = await alist_messages(active_only=False)
-        promotion_mode = str(await aget_setting("promotion_mode", "message") or "message").strip().lower()
+        bot = await aget_bot(bot_username)
+        promotion_mode = self._bot_promotion_mode(bot)
         logger.info(
             "PROMOTION STICKER CHECK: asset_channel=%s sticker_message_id=%s",
             get_promotion_asset_channel(),
@@ -884,26 +891,20 @@ async def handle_bot_automation(event) -> None:
 
         if after_match_delay:
             await asyncio.sleep(after_match_delay)
-        if messages:
-            selected_message = random.choice(messages)
-            try:
-                if promotion_mode == "sticker":
-                    if await automation_service._send_promotion_sticker(bot_username):
-                        record_event("sticker_sent", bot_name=bot_username)
-                        pass
-                elif promotion_mode == "both":
-                    if await automation_service._send_promotion_sticker(bot_username):
-                        record_event("sticker_sent", bot_name=bot_username)
-                        await asyncio.sleep(1)
-                        await telegram_service.send_saved_payload(bot_username, selected_message)
-                        record_event("promotion_sent", bot_name=bot_username)
-                        metrics.messages_sent += 1
-                else:
-                    await telegram_service.send_saved_payload(bot_username, selected_message)
-                    record_event("promotion_sent", bot_name=bot_username)
+        try:
+            selected_message = random.choice(messages) if messages else {}
+            if promotion_mode == "sticker":
+                await automation_service._send_bot_promotion(bot_username, selected_message)
+            elif promotion_mode == "both":
+                await automation_service._send_bot_promotion(bot_username, selected_message)
+                if messages:
                     metrics.messages_sent += 1
-            except Exception:
-                logger.exception("Failed to send promotion payload to %s", bot_username)
+            else:
+                if messages:
+                    await automation_service._send_bot_promotion(bot_username, selected_message)
+                    metrics.messages_sent += 1
+        except Exception:
+            logger.exception("Failed to send promotion payload to %s", bot_username)
         stop_cmd = _normalize_command(bot.get("stop_cmd"))
         if stop_cmd:
             if STOP_COMMAND_DELAY_SECONDS:

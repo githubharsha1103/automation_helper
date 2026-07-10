@@ -49,6 +49,7 @@ from storage.db import (
     set_all_bots_enabled,
     set_all_groups_status,
     set_setting,
+    update_bot,
     update_group_delay,
     update_group_name,
     update_group_time_window,
@@ -473,15 +474,11 @@ def _bot_details_text(bot_name: str, bot: dict) -> str:
     runtime_state = "RUNNING" if enabled and not paused else "IDLE"
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
-    promotion_mode = get_setting("promotion_mode", "message") or "message"
+    promotion_mode = str(bot.get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
     promotion_asset_channel = get_promotion_asset_channel()
     promotion_sticker_message_id = get_promotion_sticker_message_id()
     sticker_configured = "Yes" if promotion_sticker_message_id else "No"
-    mode_label = {
-        "message": "Message",
-        "sticker": "Sticker",
-        "both": "Message + Sticker",
-    }.get(str(promotion_mode), "Message")
+    mode_label = _promotion_mode_label(promotion_mode)
     return (
         f"Bot: {bot_name}\n"
         f"Status: {'ON' if enabled else 'OFF'}\n"
@@ -507,6 +504,7 @@ def _bot_details_keyboard(bot_name: str, enabled: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Disable" if enabled else "Enable", callback_data=f"bot:toggle:{bot_name}"),
                 InlineKeyboardButton("Edit Settings", callback_data=f"bot:edit:{bot_name}"),
             ],
+            [InlineKeyboardButton("🎯 Promotion Mode", callback_data=f"bot:promotion_mode:{bot_name}")],
             [InlineKeyboardButton("Delete Bot", callback_data=f"bot:delete:{bot_name}")],
             [InlineKeyboardButton("Back", callback_data="bot:list")],
         ]
@@ -516,6 +514,7 @@ def _bot_details_keyboard(bot_name: str, enabled: bool) -> InlineKeyboardMarkup:
 def _bot_settings_text(bot_name: str, bot: dict) -> str:
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
+    promotion_mode = str(bot.get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
     return (
         f"Edit Settings: {bot_name}\n\n"
         f"Start cmd: {bot.get('start_cmd', '-')}\n"
@@ -523,7 +522,8 @@ def _bot_settings_text(bot_name: str, bot: dict) -> str:
         f"Match triggers: {', '.join(match_triggers) if match_triggers else 'None'}\n"
         f"Security triggers: {', '.join(security_triggers) if security_triggers else 'None'}\n"
         f"After match delay: {bot.get('after_match_delay', 1)} sec\n"
-        f"After chat delay: {bot.get('after_chat_delay', 10)} sec"
+        f"After chat delay: {bot.get('after_chat_delay', 10)} sec\n"
+        f"Promotion Mode: {_promotion_mode_label(promotion_mode)}"
     )
 
 
@@ -541,6 +541,26 @@ def _bot_settings_keyboard(bot_name: str) -> InlineKeyboardMarkup:
     )
 
 
+def _bot_promotion_mode_text(bot_name: str, bot: dict) -> str:
+    mode = str(bot.get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
+    return (
+        f"Promotion Mode: {_promotion_mode_label(mode)}\n\n"
+        f"Bot: {bot_name}\n\n"
+        "Choose the promotion mode for this bot."
+    )
+
+
+def _bot_promotion_mode_keyboard(bot_name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💬 Message Only", callback_data=f"bot:promotion_mode:set:message:{bot_name}")],
+            [InlineKeyboardButton("🖼️ Sticker Only", callback_data=f"bot:promotion_mode:set:sticker:{bot_name}")],
+            [InlineKeyboardButton("💬🖼️ Message + Sticker", callback_data=f"bot:promotion_mode:set:both:{bot_name}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data=f"bot:view:{bot_name}")],
+        ]
+    )
+
+
 def _normalize_command(value: str) -> str:
     cleaned = value.strip()
     if not cleaned:
@@ -552,6 +572,7 @@ def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
     existing_enabled = bool(bot.get("enabled", is_bot_enabled(bot_name, False)))
     match_triggers = bot.get("match_triggers") or bot.get("triggers") or []
     security_triggers = bot.get("security_triggers") or []
+    promotion_mode = str(bot.get("promotion_mode") or get_setting("promotion_mode", "message") or "message").strip().lower()
     return {
         "start_cmd": _normalize_command(bot.get("start_cmd", "")),
         "stop_cmd": _normalize_command(bot.get("stop_cmd", "")),
@@ -560,6 +581,7 @@ def _canonical_bot_config(bot_name: str, bot: dict) -> dict:
         "security_triggers": [item.strip().lower() for item in security_triggers if str(item).strip()],
         "after_match_delay": float(bot.get("after_match_delay", 1) or 1),
         "after_chat_delay": float(bot.get("after_chat_delay", 10) or 10),
+        "promotion_mode": promotion_mode if promotion_mode in {"message", "sticker", "both"} else "message",
         "enabled": existing_enabled,
     }
 
@@ -858,6 +880,29 @@ async def view_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await _safe_callback_answer(query)
     bot_name = query.data.split(":", 2)[2]
+    await _render_bot_details(update, bot_name)
+
+
+async def bot_promotion_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    bot_name = query.data.split(":", 2)[2]
+    bot = _fresh_bot(bot_name)
+    if not bot:
+        await _send_or_edit(update, "Bot not found", InlineKeyboardMarkup(_bot_rows()))
+        return
+    await _send_or_edit(update, _bot_promotion_mode_text(bot_name, bot), _bot_promotion_mode_keyboard(bot_name))
+
+
+async def bot_promotion_mode_set_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await _safe_callback_answer(query)
+    _, _, _, mode, bot_name = query.data.split(":", 4)
+    bot = _fresh_bot(bot_name)
+    if not bot:
+        await _send_or_edit(update, "Bot not found", InlineKeyboardMarkup(_bot_rows()))
+        return
+    update_bot(bot_name, promotion_mode=mode)
     await _render_bot_details(update, bot_name)
 
 
@@ -1760,6 +1805,8 @@ async def start_controller() -> None:
     _application.add_handler(CallbackQueryHandler(menu_callback, pattern="^automation:"))
     _application.add_handler(CallbackQueryHandler(list_bots_callback, pattern="^bot:list$"))
     _application.add_handler(CallbackQueryHandler(view_bot_callback, pattern="^bot:view:"))
+    _application.add_handler(CallbackQueryHandler(bot_promotion_mode_callback, pattern="^bot:promotion_mode:"))
+    _application.add_handler(CallbackQueryHandler(bot_promotion_mode_set_callback, pattern="^bot:promotion_mode:set:"))
     _application.add_handler(CallbackQueryHandler(toggle_bot_callback, pattern="^bot:toggle:"))
     _application.add_handler(CallbackQueryHandler(edit_bot_callback, pattern="^bot:edit:"))
     _application.add_handler(CallbackQueryHandler(bypass_bot_callback, pattern="^bot:bypass:"))
